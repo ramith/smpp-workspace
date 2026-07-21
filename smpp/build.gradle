@@ -1,0 +1,29 @@
+description = 'Ballerina - SMPP'
+
+allprojects {
+    group = project.group
+    version = project.version
+
+    repositories {
+        mavenLocal()
+        mavenCentral()
+        // ballerina-runtime (needed to compile the native glue against the Ballerina
+        // Java interop API) isn't published to Maven Central, only here.
+        maven {
+            url = 'https://maven.wso2.org/nexus/content/repositories/releases/'
+        }
+        maven {
+            url = 'https://maven.wso2.org/nexus/content/groups/wso2-public/'
+        }
+    }
+}
+
+task build {
+    dependsOn(":smpp-native:build")
+    dependsOn(":smpp-ballerina:build")
+}
+
+task clean {
+    dependsOn(":smpp-native:clean")
+    dependsOn(":smpp-ballerina:clean")
+}

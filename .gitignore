@@ -5,9 +5,12 @@
 target/
 *.balo
 
-# Native glue build output (build-native.sh compiles into build/classes and packages
-# the result into libs/*.jar, which IS committed — libs/ is a build input, not output)
-smpp/build/
+# Gradle build output/cache. The wrapper itself (gradlew, gradlew.bat, gradle/wrapper/*)
+# is NOT ignored — it's committed so `./gradlew build` works with no local Gradle install.
+.gradle/
+smpp/native/build/
+smpp/ballerina/build/
+smpp/ballerina/lib/
 
 # Compiled Java classes / logs from manual test artifacts
 mock-smsc/*.class

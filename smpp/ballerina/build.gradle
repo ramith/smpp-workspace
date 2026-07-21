@@ -1,0 +1,44 @@
+// NOTE: this deliberately does NOT use the official `io.ballerina.plugin` Gradle plugin.
+// That plugin is only published to GitHub Packages under the ballerina-platform org,
+// which requires every contributor to hold a GitHub PAT with `read:packages` scope just
+// to run a build — real friction for an independent connector that isn't hosted there.
+// Since jsmpp resolves straight from Maven Central (see Ballerina.toml, no local `path`)
+// and the only local jar this package needs is smpp-native (built by the sibling
+// :smpp-native subproject), plain Exec tasks wrapping the already-installed `bal` CLI get
+// the same one-command build with no extra plugin/auth dependency.
+plugins {
+    id 'base'
+}
+
+description = 'Ballerina - SMPP Ballerina Connector'
+
+tasks.register('balBuild', Exec) {
+    dependsOn ':smpp-native:build'
+    workingDir project.projectDir
+    commandLine 'bal', 'build'
+}
+
+tasks.register('balTest', Exec) {
+    dependsOn ':smpp-native:build'
+    workingDir project.projectDir
+    commandLine 'bal', 'test'
+}
+
+tasks.register('balPack', Exec) {
+    dependsOn ':smpp-native:build'
+    workingDir project.projectDir
+    commandLine 'bal', 'pack'
+}
+
+tasks.register('balPushLocal', Exec) {
+    dependsOn 'balPack'
+    workingDir project.projectDir
+    commandLine 'bal', 'push', '--repository=local'
+}
+
+build.dependsOn 'balBuild'
+check.dependsOn 'balTest'
+
+clean {
+    delete "${project.projectDir}/target"
+}

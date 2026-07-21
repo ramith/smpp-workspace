@@ -1,0 +1,36 @@
+plugins {
+    id 'java-library'
+}
+
+description = 'Ballerina - SMPP Native'
+
+// `ballerina-runtime` isn't reliably resolvable from a public Maven repo under a version
+// matching this project's distribution, and it doesn't need to be: the native glue only
+// needs it to compile against Ballerina's Java-interop API (io.ballerina.runtime.api.*) —
+// the real classes are supplied by the Ballerina runtime itself when the connector
+// executes, so this is compileOnly and comes straight from the locally installed
+// distribution (auto-detected via `bal home`, overridable with -PballerinaHome=... or the
+// BALLERINA_HOME env var for CI images that don't have `bal` on PATH).
+def ballerinaHome = project.hasProperty('ballerinaHome')
+        ? project.property('ballerinaHome')
+        : (System.getenv('BALLERINA_HOME')
+            ?: providers.exec { commandLine 'bal', 'home' }.standardOutput.asText.get().trim())
+
+dependencies {
+    compileOnly fileTree(dir: "${ballerinaHome}/bre/lib", include: 'ballerina-rt-*.jar')
+    implementation group: 'org.jsmpp', name: 'jsmpp', version: "${jsmppVersion}"
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+}
+
+jar {
+    archiveBaseName = 'smpp-native'
+}

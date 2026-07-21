@@ -14,9 +14,10 @@ artifactId = "jsmpp"
 version = "3.0.2"
 
 # The hand-written native "glue" that bridges jsmpp callbacks into the
-# Ballerina runtime. Built by ./build-native.sh into ./libs before `bal build`.
+# Ballerina runtime. Built by the :smpp-native Gradle subproject (see ../native) —
+# `./gradlew build` from the smpp/ root builds this before the package below.
 [[platform.java21.dependency]]
 groupId = "ramith"
 artifactId = "smpp-native"
 version = "0.1.0"
-path = "./libs/smpp-native-0.1.0.jar"
+path = "../native/build/libs/smpp-native-0.1.0.jar"
