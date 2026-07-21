@@ -1,0 +1,22 @@
+[package]
+org = "ramith"
+name = "smpp"
+version = "0.1.0"
+distribution = "2201.13.0"
+
+[build-options]
+observabilityIncluded = false
+
+# The jsmpp library, resolved from Maven Central (+ its transitive deps).
+[[platform.java21.dependency]]
+groupId = "org.jsmpp"
+artifactId = "jsmpp"
+version = "3.0.2"
+
+# The hand-written native "glue" that bridges jsmpp callbacks into the
+# Ballerina runtime. Built by ./build-native.sh into ./libs before `bal build`.
+[[platform.java21.dependency]]
+groupId = "ramith"
+artifactId = "smpp-native"
+version = "0.1.0"
+path = "./libs/smpp-native-0.1.0.jar"

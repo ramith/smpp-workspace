@@ -1,0 +1,14 @@
+# Vendored third-party library source (reference checkout only, not part of this project)
+/jsmpp/
+
+# Ballerina build output/cache
+target/
+*.balo
+
+# Native glue build output (build-native.sh compiles into build/classes and packages
+# the result into libs/*.jar, which IS committed — libs/ is a build input, not output)
+smpp/build/
+
+# Compiled Java classes / logs from manual test artifacts
+mock-smsc/*.class
+*.log
