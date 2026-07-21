@@ -50,13 +50,16 @@ to enumerate exhaustively here (milliseconds per case) instead of expensively vi
 `bal test` round trip (JVM + Ballerina runtime + socket bind + jsmpp handshake, seconds
 per case).
 
-**Tooling:** this project has no Maven/Gradle — native glue is built by
-`smpp/build-native.sh` via plain `javac`/`jar`. Match that philosophy: use the JUnit
-Platform Console Standalone jar (single self-contained jar, no build-framework
-dependency) driven by a new `smpp/native-tests/run-native-tests.sh` script that compiles
-test classes against `build/classes` + the jsmpp jar + the console-standalone jar, then
-runs `java -jar junit-platform-console-standalone.jar --classpath ... --scan-classpath`.
-Java test class files stay PascalCase (`DispatcherTest.java`) — this is a Java-toolchain
+**Tooling:** native glue now builds as a proper Gradle subproject
+(`smpp/native/build.gradle`, part of the `smpp/` root multi-project build — see
+`docs/sprint-plan.md`'s build-restructuring note). Use that directly rather than a
+hand-rolled script: add JUnit 5 (`org.junit.jupiter:junit-jupiter`) as a `testImplementation`
+dependency in `native/build.gradle`, put test sources under
+`smpp/native/src/test/java/io/ballerinax/smpp/`, and run them with Gradle's own `test` task
+(`useJUnitPlatform()`) — `./gradlew :smpp-native:test` from `smpp/`, or transitively via
+`./gradlew build`. No separate console-standalone jar or shell script needed; Gradle's
+`java-library` plugin already wires JUnit discovery and reporting. Java test class files
+stay PascalCase (`DispatcherTest.java`) — this is a Java-toolchain
 naming requirement (class name must equal file name), exempt from this project's
 lowercase-filename convention the same way `Ballerina.toml`/`Module.md` are.
 
@@ -136,8 +139,10 @@ imperative API (accept-loop, configurable bind validator, PDU senders, two disti
 (PascalCase — Java convention) with `@java:Method` externs, wrapped by a thin
 `tests/mocksmsc.bal` Ballerina object (all `.bal` test-support files stay directly under
 `tests/` — Ballerina does not support subdirectories within `tests/` as separate
-compilation units), built by a new `tests/build-native-tests.sh` mirroring the style of
-`smpp/build-native.sh`. This keeps the mock in the same JVM as `bal test` itself: no IPC,
+compilation units). Build this bridge class the same way the production native glue is
+built — as part of the `smpp/native` Gradle subproject (a distinct source set or a
+second small Gradle module alongside it is fine; a one-off shell script is not needed now
+that Gradle owns the native build). This keeps the mock in the same JVM as `bal test` itself: no IPC,
 direct method-call assertions (a Java exception or return value, not parsed subprocess
 output), and no extra timing-jitter source for the lifecycle tests.
 

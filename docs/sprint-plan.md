@@ -10,6 +10,20 @@ calendar weeks. "Sprint" here means a milestone with an explicit exit gate — m
 next one only when its gate passes, however long that takes. Hour estimates are included
 for relative sizing, not as a schedule commitment.
 
+**Prerequisites (done, before Sprint 0 starts):** the project is now on GitHub at
+[ramith/smpp-workspace](https://github.com/ramith/smpp-workspace) (public; the vendored
+`jsmpp/` source checkout is excluded via `.gitignore` — it's a reference copy of the
+third-party library, not part of this project). The build itself was also broken and has
+been fixed first, since every sprint below depends on being able to actually build and test
+the connector: `smpp/build-native.sh` hardcoded machine-specific JDK/Ballerina install paths
+and the native jar plus third-party dependencies were manually vendored as committed binary
+blobs. It's now a proper Gradle multi-project build (`smpp/native/` + `smpp/ballerina/` as
+sibling subprojects, modeled on `ballerina-platform/module-ballerinax-activemq`) — a single
+`./gradlew build` from `smpp/` builds everything, verified end-to-end including
+`bal push --repository=local` and a fresh `smpp_tester` rebuild against the result. See
+[docs/development-process.md](development-process.md) for how each sprint below is actually
+run.
+
 ## How to read this document
 
 Each sprint has:
