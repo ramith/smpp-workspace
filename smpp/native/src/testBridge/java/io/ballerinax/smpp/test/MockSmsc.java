@@ -39,8 +39,11 @@ final class MockSmsc {
 
     private final SMPPServerSessionListener listener;
     private final ExecutorService acceptLoop = Executors.newSingleThreadExecutor();
-    // StressServer uses a small fixed pool for wait-bind tasks; 4 is plenty for tests.
-    private final ExecutorService waitBindPool = Executors.newFixedThreadPool(4);
+    // Churn-sized: the soak tests cycle accept-then-instant-drop rapidly, and a client
+    // whose bind timed out leaves a pre-bind session holding a pool thread until
+    // waitForBind gives up - 8 threads plus the shorter waitForBind below keep the pool
+    // recycling under that load (a 4-thread/60s combination wedged empirically).
+    private final ExecutorService waitBindPool = Executors.newFixedThreadPool(8);
     private final ConcurrentHashMap<Long, SMPPServerSession> connections = new ConcurrentHashMap<>();
     private final AtomicLong nextConnectionId = new AtomicLong(1);
     // Each entry is either a Long (connection handle, bind accepted) or a Throwable
@@ -49,6 +52,7 @@ final class MockSmsc {
     private volatile String expectedSystemId; // null = accept any (default)
     private volatile String expectedPassword;
     private volatile boolean running = true;
+    private volatile boolean closeAfterAccept = false;
 
     MockSmsc(int port) throws IOException {
         listener = new SMPPServerSessionListener(port);
@@ -78,7 +82,11 @@ final class MockSmsc {
 
     private void waitForBindAndValidate(SMPPServerSession session) {
         try {
-            BindRequest request = session.waitForBind(60_000);
+            // 3s: generous for a healthy bind (arrives within ms of accept), short enough
+            // that a pre-bind-dead session (client bind timeout under churn) releases its
+            // pool thread faster than the connector's ~3s failed-attempt cadence - a 10s
+            // hold here death-spiraled the pool empirically under the accept-drop soak.
+            BindRequest request = session.waitForBind(3_000);
             // Rejection codes per SMPPServerSimulator's WaitBindTask - the jsmpp example
             // that actually compares credentials (StressServer's own WaitBindTask doesn't).
             String sysId = expectedSystemId;
@@ -95,6 +103,16 @@ final class MockSmsc {
             }
             request.accept("mock-smsc");
             long id = nextConnectionId.getAndIncrement();
+            if (closeAfterAccept) {
+                // Accepted-then-instantly-dropped: the bound-race soak's cycle driver
+                // (docs/sprint-plan.md Sprint 2, "closes the connection immediately
+                // post-accept, looped"). Close BEFORE offering the outcome so the drop
+                // has already happened by the time the test observes the bind. Not
+                // registered in `connections` - the session is already dead.
+                session.close();
+                bindOutcomes.offer(id);
+                return;
+            }
             connections.put(id, session);
             bindOutcomes.offer(id);
         } catch (Exception e) {
@@ -186,6 +204,61 @@ final class MockSmsc {
             default -> StandardCharsets.UTF_8;
         };
         return text.getBytes(charset);
+    }
+
+    /**
+     * Abrupt severance: closes the connection's socket directly, with NO unbind exchange
+     * (jsmpp AbstractSession.close() sends nothing - docs/qa-strategy.md §3.6). From the
+     * connector's side this is indistinguishable from a network failure / crashed SMSC.
+     * Removed from the registry: the handle is dead afterwards, and close() must not
+     * later attempt unbindAndClose on it.
+     */
+    void sever(long connectionId) {
+        SMPPServerSession session = connection(connectionId);
+        connections.remove(connectionId);
+        session.close();
+    }
+
+    /**
+     * Clean, peer-initiated unbind: sends an unbind PDU and blocks awaiting unbind_resp,
+     * then closes (unbindAndClose() == unbind() + close(), per §3.6). The trailing close
+     * only makes the connector's CLOSED transition prompt and deterministic; the unbind
+     * exchange is what distinguishes this from sever() - this method returning normally
+     * proves the connector answered unbind_resp.
+     */
+    void peerUnbind(long connectionId) throws Exception {
+        SMPPServerSession session = connection(connectionId);
+        connections.remove(connectionId);
+        session.unbindAndClose();
+    }
+
+    /**
+     * Stops accepting new connections (closes the server socket) while leaving already
+     * accepted connections alive - so an exhaustion test can make every rebind attempt
+     * fail deterministically (connection refused), with no race between severing the
+     * live connection and closing the whole mock.
+     */
+    void stopAccepting() {
+        running = false;
+        try {
+            listener.close();
+        } catch (Exception ignored) {
+            // best-effort; the accept-loop exits on the resulting IOException
+        }
+    }
+
+    /** When enabled, every subsequent bind is accepted and then immediately closed. */
+    void setCloseAfterAccept(boolean enabled) {
+        this.closeAfterAccept = enabled;
+    }
+
+    /**
+     * Raises this connection's transaction timer (jsmpp default: 2000 ms) so a blocking
+     * mock-side send can outwait a deliberately slow SYNC handler without a
+     * ResponseTimeoutException (needed by the gracefulStop drain test).
+     */
+    void setTransactionTimer(long connectionId, long millis) {
+        connection(connectionId).setTransactionTimer(millis);
     }
 
     void close() {

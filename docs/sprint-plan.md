@@ -207,7 +207,29 @@ just doing it now.
 
 ---
 
-## Sprint 2 — The lifecycle state machine
+## Sprint 2 — The lifecycle state machine ✅ DONE
+
+**Phase 5 outcome:** two adversarial reviews (java-architect on concurrency correctness,
+code-reviewer on the cross-cutting/test pass). The state machine came through
+concurrency-clean — no deadlock (lock ordering proven a DAG, hinging on jsmpp releasing
+its state lock before firing listeners — now recorded as a load-bearing invariant comment
+in `bind()`), exactly-once drop reporting with the never-zero bound race genuinely closed,
+clean start/stop races, exactly-once idempotent stop/deregister. Fixes applied in-sprint:
+(1) **[Medium]** `testRestartAfterStopRejected` didn't store its started listener, so a
+failure between start and the manual stop would leak an infinite-rebinding listener onto
+the file's shared port — the guarding comment ("cleanup must not re-stop") was
+demonstrably wrong since re-stop is an idempotent no-op; now stores it and relies on
+cleanup. (2) **[Low]** the post-init native-data writes (`NATIVE_SESSION`,
+`NATIVE_REBIND_EXECUTOR`) raced the runtime's unsynchronized `HashMap` against jsmpp-thread
+reads (masked only by the map never resizing) — converted both to write-once
+`AtomicReference` holders installed at init, matching the existing `STATE` pattern, so all
+native-data writes are now single-threaded at init. (3) **[Low]** rebind backoff-timing
+assertions floored at 0.2s couldn't catch a shrunk-but-nonzero backoff their message
+claimed to catch — tightened to 0.4s. No new findings deferred; the "same-JVM churn leak"
+Phase-5 question resolved to "only leaked (never-stopped) listeners leak", i.e. finding (1),
+now fixed.
+
+
 
 **Goal:** the highest-risk, most foundational native-layer change, and the root cause of
 several other findings (double-`start()` creating duplicate sessions, `stopping` never
@@ -226,12 +248,61 @@ isolated sprint — no other lifecycle-touching work happens concurrently with i
 | **(Added by Sprint 1's Phase 5 review)** `service`/`remoteMethods` torn publication | `Dispatcher.setService` writes two separate volatiles; a PDU thread can observe the new service with the old method set (attach/detach while bound and receiving — nothing does this today, but attach is public API on a running listener). Fold into this sprint's atomicity work: a single volatile immutable holder for (service, methods). | 1h |
 | **(Added by Sprint 1's Phase 5 review)** double-`attach()` silently replaces | A second *valid* service attached to the same listener overwrites the first with no diagnostic (last-writer-wins). Sprint 1 fixed the *rejected*-service clobber (validate-before-assign); the silent replacement of a valid service by another valid one remains. Decide and enforce: either reject a second attach with a clear error (matching this sprint's one-way-lifecycle philosophy) or document single-service-per-listener loudly. | 1–2h |
 
+**Phase 1 (team review) amendments — recorded before implementation:**
+
+- **The ActiveMQ deregister claim from Sprint 1's review was wrong** — that module never
+  calls `registerListener`/`deregisterListener` at all. The deregister fix stands on the
+  runtime's own verified contract instead (`RuntimeRegistry` is a plain deque under a
+  lock; deregistering mid-invocation is a non-event). Deregister fires exactly once, on
+  the transition to `STOPPED`.
+- **Failed initial `start()` reverts `STARTING → INIT` (retryable)** — a refinement of
+  the "strict DAG": a failed bind installs nothing, so every invariant the DAG protected
+  still holds, and the user isn't told "listener stopped" for a listener they never
+  stopped. Restart-after-*stop* remains rejected.
+- **Stops are idempotent (`STOPPING`/`STOPPED` → immediate success) — mandatory, not
+  stylistic**: the runtime's shutdown path re-stops every still-registered listener, so
+  an already-stopped listener must no-op. This also means zero changes to existing test
+  cleanups (per qa-expert's audit, the only green-path conflict was `bind_test`'s
+  defensive stop of a never-started listener — idempotency absorbs it).
+- **Double-`attach()` is rejected with a clear error** (three-outcome `attach` API
+  replaces Sprint 1's boolean `setService`; validate-before-assign semantics preserved).
+  Intentional swap stays expressible via `detach(old)` then `attach(new)`.
+- **Peer-initiated unbind keeps today's treatment** (drop + rebind, same as abrupt
+  severance) — the state-machine lambda doesn't distinguish them; qa's Variant-B
+  (terminal peer-unbind) test stays as a commented-out option if this is ever revisited.
+  Post-exhaustion state stays `STARTED` (stop works normally; `start()` rejected as
+  already-started).
+- **Phase-2 test scope grew: ~26h → ~35h, 6 files not 3** (the exit gate items added
+  since qa-strategy's Phase 2 was written), plus new mock capabilities (`sever`,
+  `peerUnbind`, `stopAccepting`, `closeAfterAccept`, per-connection transaction timer)
+  and a `scripts/soak-lifecycle.sh` repeat-runner for the budgeted soak.
+
 **Exit gate:** qa-strategy.md's Phase-2 lifecycle-timing tests — double-`start()`
 rejection, restart-after-stop rejection, rebind backoff/exhaustion, `gracefulStop` vs
 `immediateStop` timing, abrupt-severance vs peer-initiated-unbind detection — all pass.
 Given java-architect's own flag that the `bound`-race fix is the hardest to test with
 confidence, budget explicit soak-test time (repeated-iteration runs, not a single pass)
 before calling this sprint done.
+
+**Implementation outcome (Phase 3/4):** state machine, Dispatcher `ServiceBinding` holder,
+double-attach rejection, `onError` inFlight-tracking, and `deregisterListener` pairing all
+landed; the full automated suite is green (20 JUnit + 21 `bal test`), and the deterministic
+drop/rebind soak (`testRepeatedSeverRebindCycles`, 15 real sever→rebind cycles) is stable
+across repeated isolated runs. Two dispositions worth recording:
+
+- **Bound-race soak is split.** The deterministic cycle test covers the drop/rebind engine
+  exactly-once and fast, and stays in the gate. The accept-then-*vanish* hammer
+  (`testAcceptThenDropCyclesRecoverWithoutWedge`) is disabled in the automated suite
+  (`enable: false`, manual-runnable) — see the finding below for why it's slow/nondeterministic.
+- **New finding → Sprint 4:** jsmpp's `connectAndBind` uses a **60s default bind timeout**,
+  and the rebind executor is single-threaded, so a half-open SMSC (accepts the TCP socket
+  then never completes the bind handshake) stalls the *entire* rebind loop for up to 60s
+  before the attempt fails and the next is scheduled. It recovers on its own — not a
+  permanent wedge — but it's an unbounded, unconfigurable stall on the resilience path.
+  Fold into Sprint 4's timer-exposure work (alongside `enquireLinkTimer`/`transactionTimer`/
+  `queueCapacity`): expose/bound the bind timeout so operators can cap it. Also open for
+  Phase 5: does sustained same-JVM rebind churn leave any connector-side resources
+  unreleased across many stopped listeners (rebind executors, `onError` virtual threads)?
 
 **Total: ~24–26h of fixes + ~26h of lifecycle tests + soak-test buffer (~4–8h) ≈ 54–60h.**
 
@@ -281,6 +352,7 @@ uncapped resource growth.
 | Item | Scope | Est. |
 |---|---|---|
 | Expose `enquireLinkTimer`/`transactionTimer`/`queueCapacity` as config | Wired to the existing `AbstractSession` setters before `connectAndBind`. Gives operators a way to tune the failure window even before the structural fix below. | 4–8h |
+| **(Added by Sprint 2's Phase 4)** Expose/bound the `connectAndBind` bind timeout | jsmpp defaults it to **60s**, and the rebind executor is single-threaded, so a half-open SMSC stalls the whole rebind loop for up to 60s per attempt (recovers, but unbounded). Pass an explicit, configurable bind timeout to `connectAndBind` on both the initial `start()` and every rebind attempt. | 2–4h |
 | Structural fix: decouple handler concurrency from keepalive capacity | Size jsmpp's `pduProcessorDegree` to `maxConcurrentDispatch + a small keepalive reserve`; gate handler entry with a connector-owned `Semaphore(maxConcurrentDispatch)` in `Dispatcher.dispatch()`, rejecting overflow immediately with `ESME_RTHROTTLED` rather than letting it consume a reserved thread. (Note, corrected during fix-planning: routing handler execution to a *separate* thread pool does **not**, by itself, fix this for SYNC mode — SYNC's whole contract is blocking the jsmpp thread until the handler returns, so the reserve-capacity approach is the actual fix, not a relocation of where the blocking happens.) | 16–24h |
 | ASYNC backpressure | A `Semaphore` sized by `maxConcurrentDispatch`, acquired before spawning each ASYNC virtual thread and released in its `finally` — bounds ASYNC to the same bounded-throughput-at-cost-of-latency behavior. Explicit decision: block (`acquireUninterruptibly`), don't drop — SMPP is at-least-once, and a dropped PDU after a positive ack is permanently lost, whereas blocking only adds ack latency. | 5–6h |
 

@@ -30,11 +30,13 @@ public isolated class Listener {
     } external;
 
     # Attaches a service to this listener. Invoked automatically by the runtime
-    # for `service ... on listener { }` declarations.
+    # for `service ... on listener { }` declarations. One service per listener:
+    # attaching a second service is rejected — `detach` the first one to swap.
     #
     # + s - the service to attach
     # + name - unused; part of the standard listener contract
-    # + return - an `Error` if `s` implements none of `onDeliverSm`, `onDataSm`, `onError`
+    # + return - an `Error` if `s` implements none of `onDeliverSm`, `onDataSm`,
+    #   `onError`, or if a service is already attached
     public isolated function attach(Service s, string[]|string? name = ()) returns error? = @java:Method {
         'class: "io.ballerinax.smpp.NativeListener",
         name: "attach"
@@ -50,22 +52,30 @@ public isolated class Listener {
         name: "detach"
     } external;
 
-    # Connects and binds to the SMSC, and begins receiving PDUs.
+    # Connects and binds to the SMSC, and begins receiving PDUs. Calling this on an
+    # already-started listener is rejected; so is calling it on a stopped listener
+    # (a stopped listener cannot be restarted — create a new one). A *failed* start
+    # (e.g. bind rejected, host unreachable) leaves the listener startable again.
+    #
+    # + return - an `Error` if already started, stopped, or the connect/bind fails
     public isolated function 'start() returns error? = @java:Method {
         'class: "io.ballerinax.smpp.NativeListener",
         name: "start"
     } external;
 
     # Cancels any pending rebind attempt, waits up to `ConnectionConfig.gracefulStopTimeout`
-    # for in-flight dispatches to the attached service to finish, then unbinds and closes
-    # the SMSC session.
+    # for in-flight dispatches (including `onError` notifications) to finish, then unbinds
+    # and closes the SMSC session. Idempotent: stopping an already-stopped (or
+    # never-started) listener is a no-op. A stopped listener cannot be restarted.
     public isolated function gracefulStop() returns error? = @java:Method {
         'class: "io.ballerinax.smpp.NativeListener",
         name: "gracefulStop"
     } external;
 
     # Cancels any pending rebind attempt and immediately unbinds and closes the SMSC
-    # session, without waiting for in-flight dispatches to finish.
+    # session, without waiting for in-flight dispatches to finish. Idempotent: stopping
+    # an already-stopped (or never-started) listener is a no-op. A stopped listener
+    # cannot be restarted.
     public isolated function immediateStop() returns error? = @java:Method {
         'class: "io.ballerinax.smpp.NativeListener",
         name: "immediateStop"

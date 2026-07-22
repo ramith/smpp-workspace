@@ -77,3 +77,63 @@ isolated function mockSmscClose(int mockId) = @java:Method {
     'class: "io.ballerinax.smpp.test.MockSmscBridge",
     name: "closeMock"
 } external;
+
+# Abruptly severs an accepted connection: closes its socket with NO unbind exchange
+# (jsmpp `AbstractSession.close()` — docs/qa-strategy.md §3.6). From the connector's side
+# this is indistinguishable from a network failure. The connection handle is dead afterwards.
+#
+# + mockId - the mock's handle
+# + connectionId - the connection handle from `mockSmscAwaitNextBind`
+# + return - an `error` only on misuse (unknown/already-severed connection handle)
+isolated function mockSmscSever(int mockId, int connectionId) returns error? = @java:Method {
+    'class: "io.ballerinax.smpp.test.MockSmscBridge",
+    name: "sever"
+} external;
+
+# Cleanly unbinds an accepted connection from the mock's (SMSC's) side: sends an unbind
+# PDU, blocks until the connector answers unbind_resp, then closes. This returning without
+# error is itself an assertion that the unbind exchange happened — the distinguishing
+# feature vs `mockSmscSever`.
+#
+# + mockId - the mock's handle
+# + connectionId - the connection handle from `mockSmscAwaitNextBind`
+# + return - an `error` if the unbind exchange fails or times out
+isolated function mockSmscPeerUnbind(int mockId, int connectionId) returns error? = @java:Method {
+    'class: "io.ballerinax.smpp.test.MockSmscBridge",
+    name: "peerUnbind"
+} external;
+
+# Stops the mock accepting new connections (closes the server socket) while leaving
+# already-accepted connections alive — so rebind attempts fail deterministically
+# (connection refused). `mockSmscClose` afterwards is still required and still safe.
+#
+# + mockId - the mock's handle
+isolated function mockSmscStopAccepting(int mockId) = @java:Method {
+    'class: "io.ballerinax.smpp.test.MockSmscBridge",
+    name: "stopAccepting"
+} external;
+
+# When enabled, every subsequent bind on this mock is accepted and the connection is then
+# immediately closed (no unbind) — the accepted-then-instantly-dropped pattern the
+# bound-race soak needs. Each such bind still produces a `mockSmscAwaitNextBind` outcome
+# (so cycles can be counted), but the returned connection handle is dead.
+#
+# + mockId - the mock's handle
+# + enabled - `true` to drop every accepted bind immediately; `false` to restore normal accepts
+isolated function mockSmscSetCloseAfterAccept(int mockId, boolean enabled) = @java:Method {
+    'class: "io.ballerinax.smpp.test.MockSmscBridge",
+    name: "setCloseAfterAccept"
+} external;
+
+# Raises the connection's jsmpp transaction timer (default 2000 ms) so a blocking
+# `mockSmscSendDeliverSm` can outwait a deliberately slow SYNC handler.
+#
+# + mockId - the mock's handle
+# + connectionId - the connection handle from `mockSmscAwaitNextBind`
+# + timeoutMillis - the new transaction timer
+# + return - an `error` only on misuse (unknown handle)
+isolated function mockSmscSetTransactionTimer(int mockId, int connectionId, int timeoutMillis)
+        returns error? = @java:Method {
+    'class: "io.ballerinax.smpp.test.MockSmscBridge",
+    name: "setTransactionTimer"
+} external;

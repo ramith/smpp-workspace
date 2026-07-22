@@ -18,6 +18,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Backs the Ballerina {@code smpp:Listener} lifecycle methods. State (the jsmpp
@@ -36,9 +37,17 @@ public final class NativeListener {
     private static final String NATIVE_SESSION = "smpp.session";
     private static final String NATIVE_DISPATCHER = "smpp.dispatcher";
     private static final String NATIVE_CONFIG = "smpp.config";
-    private static final String NATIVE_BOUND = "smpp.bound";
-    private static final String NATIVE_STOPPING = "smpp.stopping";
+    private static final String NATIVE_STATE = "smpp.state";
+    private static final String NATIVE_STATE_LOCK = "smpp.stateLock";
     private static final String NATIVE_REBIND_EXECUTOR = "smpp.rebindExecutor";
+
+    /**
+     * Listener lifecycle. One-way except {@code STARTING -> INIT} on a failed initial
+     * bind, which is safe because a failed bind installs nothing (no session, no
+     * executor, no in-flight work). {@code STOPPING}/{@code STOPPED} are terminal:
+     * restart is rejected — create a new Listener instead.
+     */
+    enum ListenerState { INIT, STARTING, STARTED, STOPPING, STOPPED }
 
     // jsmpp's StringValidator rejects systemId/password/systemType at length 16/9/13
     // respectively (StringParameter.SYSTEM_ID/PASSWORD/SYSTEM_TYPE - each C-Octet-String
@@ -52,44 +61,81 @@ public final class NativeListener {
     public static Object initListener(Environment env, BObject listener, BMap<BString, Object> config) {
         listener.addNativeData(NATIVE_CONFIG, config);
         listener.addNativeData(NATIVE_DISPATCHER, new Dispatcher(env.getRuntime()));
-        listener.addNativeData(NATIVE_BOUND, new AtomicBoolean(false));
-        listener.addNativeData(NATIVE_STOPPING, new AtomicBoolean(false));
+        listener.addNativeData(NATIVE_STATE, new AtomicReference<>(ListenerState.INIT));
+        listener.addNativeData(NATIVE_STATE_LOCK, new Object());
+        // SESSION and REBIND_EXECUTOR are mutated after jsmpp threads exist, so they go
+        // through write-once AtomicReference holders installed here at init rather than
+        // via addNativeData post-init: the runtime's native-data map is a plain HashMap
+        // with unsynchronized get/put, and a post-init put racing a jsmpp-thread get would
+        // be a data race. All native-data writes now happen once, at init, single-threaded.
+        listener.addNativeData(NATIVE_SESSION, new AtomicReference<SMPPSession>());
+        listener.addNativeData(NATIVE_REBIND_EXECUTOR, new AtomicReference<ScheduledExecutorService>());
         env.getRuntime().registerListener(listener);
         return null;
     }
 
     public static Object attach(BObject listener, BObject service, Object name) {
-        if (!dispatcher(listener).setService(service)) {
-            return ModuleUtils.createError(
+        return switch (dispatcher(listener).attach(service)) {
+            case ATTACHED -> null;
+            case ALREADY_ATTACHED -> ModuleUtils.createError(
+                    "cannot attach: a service is already attached to this listener; "
+                            + "detach it before attaching another");
+            case NO_REMOTE_METHODS -> ModuleUtils.createError(
                     "attached service does not implement any of the supported remote methods "
                             + "(onDeliverSm, onDataSm, onError)");
-        }
-        return null;
+        };
     }
 
     public static Object detach(BObject listener, BObject service) {
-        Dispatcher dispatcher = dispatcher(listener);
-        if (service == dispatcher.getService()) {
-            dispatcher.setService(null);
-        }
+        dispatcher(listener).detachIf(service);
         return null;
     }
 
     public static Object start(BObject listener) {
+        AtomicReference<ListenerState> state = state(listener);
+        synchronized (stateLock(listener)) {
+            switch (state.get()) {
+                case STARTING, STARTED -> {
+                    return ModuleUtils.createError("cannot start: the listener is already started");
+                }
+                case STOPPING, STOPPED -> {
+                    return ModuleUtils.createError("cannot start: the listener has been stopped "
+                            + "and cannot be restarted; create a new Listener instead");
+                }
+                case INIT -> state.set(ListenerState.STARTING);
+            }
+        }
         try {
-            bind(listener, config(listener));
+            if (!bind(listener, config(listener))) {
+                // A concurrent stop won the race while we were binding; bind() already
+                // closed the fresh session and the stop path owns the state from here.
+                return ModuleUtils.createError("the listener was stopped before start() completed");
+            }
             return null;
         } catch (Exception e) {
+            synchronized (stateLock(listener)) {
+                if (state.get() == ListenerState.STARTING) {
+                    // Nothing was installed - a failed start is retryable (see ListenerState doc).
+                    state.set(ListenerState.INIT);
+                }
+                // else: a concurrent stop moved us to STOPPING/STOPPED; leave its transition alone.
+            }
             return ModuleUtils.createError("failed to connect/bind to SMSC: " + e.getMessage());
         }
     }
 
     /**
-     * Connects and binds to the SMSC, (re)configures the dispatcher, and registers a session
-     * state listener to detect an unexpected drop. Used for both the initial {@code start()}
-     * and every rebind attempt.
+     * Connects and binds to the SMSC, (re)configures the dispatcher, and installs the new
+     * session - but only if the lifecycle still wants it by the time the blocking
+     * connectAndBind returns. The state lock is deliberately NOT held across
+     * connectAndBind (it can block for the full network bind timeout; holding the lock
+     * would freeze gracefulStop/immediateStop for that long).
+     *
+     * @return {@code true} if the session was installed; {@code false} if a concurrent
+     *     stop aborted the install (the fresh session is closed before returning)
+     * @throws Exception if the connect/bind itself fails
      */
-    private static void bind(BObject listener, BMap<BString, Object> config) throws Exception {
+    private static boolean bind(BObject listener, BMap<BString, Object> config) throws Exception {
         Dispatcher dispatcher = dispatcher(listener);
         SMPPSession session = new SMPPSession();
         session.setMessageReceiverListener(dispatcher);
@@ -107,19 +153,69 @@ public final class NativeListener {
         session.setPduProcessorDegree(maxConcurrentDispatch);
         dispatcher.setAsync("ASYNC".equals(str(config, "responseMode")));
 
-        AtomicBoolean bound = bound(listener);
-        bound.set(false);
+        // Per-attempt flags. `installed` gates the listener lambda: a CLOSED fired by a
+        // rejected/failed bind (jsmpp self-closes inside connectAndBind) is start()'s
+        // error, not an "unexpected drop". `dropReported` makes drop-reporting
+        // exactly-once between the lambda and the manual post-install check below -
+        // jsmpp swaps its state BEFORE running listeners (SMPPSessionContext.changeState),
+        // so neither side can assume the other has or hasn't run yet.
+        AtomicBoolean installed = new AtomicBoolean(false);
+        AtomicBoolean dropReported = new AtomicBoolean(false);
         session.addSessionStateListener((newState, oldState, source) -> {
-            if (newState == SessionState.CLOSED && bound.compareAndSet(true, false)
-                    && !stopping(listener).get()) {
-                onUnexpectedDrop(listener, oldState);
+            if (newState != SessionState.CLOSED || !installed.get()) {
+                return;
+            }
+            ListenerState st = state(listener).get();
+            if (st == ListenerState.STOPPING || st == ListenerState.STOPPED) {
+                return; // user-initiated close; never a drop
+            }
+            if (dropReported.compareAndSet(false, true)) {
+                onUnexpectedDrop(listener,
+                        "SMPP session closed unexpectedly (was " + oldState + ")");
             }
         });
 
         session.connectAndBind(host, port, bindType, systemId, password, systemType,
                 TypeOfNumber.UNKNOWN, NumberingPlanIndicator.UNKNOWN, null);
-        listener.addNativeData(NATIVE_SESSION, session);
-        bound.set(true);
+
+        // LOAD-BEARING CROSS-LIBRARY INVARIANT: this critical section holds stateLock and
+        // reads session.getSessionState() (which takes jsmpp's stateProcessorLock), while
+        // the state-listener lambda above acquires stateLock from a jsmpp thread. This is
+        // deadlock-free ONLY because jsmpp releases stateProcessorLock BEFORE firing the
+        // listener (SMPPSessionContext.changeState releases its write lock, then calls
+        // fireStateChanged) - so the lambda's stateLock acquisition never happens while a
+        // jsmpp thread holds stateProcessorLock. If a future jsmpp release moved the fire
+        // inside that lock, this becomes a hard deadlock. Re-verify against jsmpp on upgrade.
+        boolean abortedByStop = false;
+        synchronized (stateLock(listener)) {
+            ListenerState st = state(listener).get();
+            // STARTING: the initial start(). STARTED: a rebind attempt (the lifecycle
+            // stays STARTED across a drop; only sessions come and go).
+            if (st == ListenerState.STARTING || st == ListenerState.STARTED) {
+                session(listener).set(session);
+                installed.set(true);
+                state(listener).set(ListenerState.STARTED);
+                // Bound-race check: if the session died in the sliver between
+                // connectAndBind returning and installed.set(true), the lambda saw
+                // installed == false and stayed silent - detect and report it here.
+                // The CAS keeps this exactly-once against a lambda that DID see
+                // installed == true. (Reentrant: onUnexpectedDrop -> scheduleRebind
+                // re-acquires this same monitor.)
+                if (session.getSessionState() == SessionState.CLOSED
+                        && dropReported.compareAndSet(false, true)) {
+                    onUnexpectedDrop(listener,
+                            "SMPP session closed unexpectedly immediately after binding");
+                }
+            } else {
+                abortedByStop = true;
+            }
+        }
+        if (abortedByStop) {
+            // Outside the lock: this does network I/O.
+            session.unbindAndClose();
+            return false;
+        }
+        return true;
     }
 
     /**
@@ -148,16 +244,13 @@ public final class NativeListener {
         }
     }
 
-    private static void onUnexpectedDrop(BObject listener, SessionState oldState) {
-        dispatcher(listener).dispatchError("SMPP session closed unexpectedly (was " + oldState + ")");
+    private static void onUnexpectedDrop(BObject listener, String description) {
+        dispatcher(listener).dispatchError(description);
         scheduleRebind(listener, 1);
     }
 
     @SuppressWarnings("unchecked")
     private static void scheduleRebind(BObject listener, int attempt) {
-        if (stopping(listener).get()) {
-            return;
-        }
         BMap<BString, Object> policy =
                 (BMap<BString, Object>) config(listener).getMapValue(StringUtils.fromString("rebindPolicy"));
         long maxAttempts = policy.getIntValue(StringUtils.fromString("maxRebindAttempts"));
@@ -175,34 +268,80 @@ public final class NativeListener {
         double multiplier = decimalValue(policy, "backOffMultiplier");
         double delaySeconds = Math.min(initialDelay * Math.pow(multiplier, attempt - 1), maxDelay);
 
-        rebindExecutor(listener).schedule(() -> attemptRebind(listener, attempt),
-                (long) (delaySeconds * 1000), TimeUnit.MILLISECONDS);
+        synchronized (stateLock(listener)) {
+            if (state(listener).get() != ListenerState.STARTED) {
+                // A stop won: its STOPPING transition happened under this same monitor,
+                // so there is no window between this check and .schedule() below - and
+                // stop only shuts the executor down AFTER making that transition, so
+                // RejectedExecutionException is structurally unreachable here.
+                return;
+            }
+            rebindExecutor(listener).schedule(() -> {
+                try {
+                    attemptRebind(listener, attempt);
+                } catch (Throwable t) {
+                    // Belt-and-suspenders: anything a task throws inside .schedule() is
+                    // swallowed into a never-read ScheduledFuture by the JDK. If a future
+                    // refactor breaks attemptRebind's own handling, surface it via
+                    // onError instead of silently killing the rebind loop.
+                    dispatcher(listener).dispatchError(
+                            "rebind attempt " + attempt + " crashed unexpectedly: " + t);
+                }
+            }, (long) (delaySeconds * 1000), TimeUnit.MILLISECONDS);
+        }
     }
 
     private static void attemptRebind(BObject listener, int attempt) {
-        if (stopping(listener).get()) {
-            return;
+        if (state(listener).get() != ListenerState.STARTED) {
+            return; // stopped while this attempt sat in the executor queue
         }
         try {
+            // Returns false if a stop raced in mid-bind; bind() already closed the new
+            // session and the stop path owns everything from here - nothing to report.
             bind(listener, config(listener));
-            // Success - bind() already stored the new session and marked it bound.
         } catch (Exception e) {
+            ListenerState st = state(listener).get();
+            if (st == ListenerState.STOPPING || st == ListenerState.STOPPED) {
+                // shutdownNow() interrupting an in-flight connect lands here; the failure
+                // was caused by (or is moot because of) the stop - don't report it.
+                return;
+            }
             dispatcher(listener).dispatchError("rebind attempt " + attempt + " failed: " + e.getMessage());
             scheduleRebind(listener, attempt + 1);
         }
     }
 
-    public static Object gracefulStop(BObject listener) {
-        stopping(listener).set(true);
-        shutdownRebindExecutor(listener);
-        awaitDrain(listener);
-        return closeSession(listener);
+    public static Object gracefulStop(Environment env, BObject listener) {
+        return stop(env, listener, true);
     }
 
-    public static Object immediateStop(BObject listener) {
-        stopping(listener).set(true);
-        shutdownRebindExecutor(listener);
-        return closeSession(listener);
+    public static Object immediateStop(Environment env, BObject listener) {
+        return stop(env, listener, false);
+    }
+
+    private static Object stop(Environment env, BObject listener, boolean graceful) {
+        AtomicReference<ListenerState> state = state(listener);
+        synchronized (stateLock(listener)) {
+            ListenerState st = state.get();
+            if (st == ListenerState.STOPPING || st == ListenerState.STOPPED) {
+                return null; // stop is idempotent; a concurrent second stop returns immediately
+            }
+            // From INIT (never started), STARTING (stop races the initial bind - the
+            // binder will see this and discard its fresh session), or STARTED.
+            state.set(ListenerState.STOPPING);
+        }
+        shutdownRebindExecutor(listener);   // no-op if never created
+        if (graceful) {
+            awaitDrain(listener);           // also covers in-flight onError notifications
+        }
+        Object result = closeSession(listener);  // null-safe; outside the lock (network I/O)
+        synchronized (stateLock(listener)) {
+            state.set(ListenerState.STOPPED);
+        }
+        // Exactly-once: only the thread that made the STOPPING transition reaches here.
+        // Deregister even if closeSession errored - the listener is terminal either way.
+        env.getRuntime().deregisterListener(listener);
+        return result;
     }
 
     /** Waits (bounded by {@code ConnectionConfig.gracefulStopTimeout}) for in-flight dispatches to finish. */
@@ -221,7 +360,7 @@ public final class NativeListener {
     }
 
     private static Object closeSession(BObject listener) {
-        SMPPSession session = (SMPPSession) listener.getNativeData(NATIVE_SESSION);
+        SMPPSession session = session(listener).get();
         if (session != null) {
             try {
                 session.unbindAndClose();
@@ -241,28 +380,41 @@ public final class NativeListener {
         return (BMap<BString, Object>) listener.getNativeData(NATIVE_CONFIG);
     }
 
-    private static AtomicBoolean bound(BObject listener) {
-        return (AtomicBoolean) listener.getNativeData(NATIVE_BOUND);
+    @SuppressWarnings("unchecked")
+    private static AtomicReference<ListenerState> state(BObject listener) {
+        return (AtomicReference<ListenerState>) listener.getNativeData(NATIVE_STATE);
     }
 
-    private static AtomicBoolean stopping(BObject listener) {
-        return (AtomicBoolean) listener.getNativeData(NATIVE_STOPPING);
+    private static Object stateLock(BObject listener) {
+        return listener.getNativeData(NATIVE_STATE_LOCK);
     }
 
-    private static synchronized ScheduledExecutorService rebindExecutor(BObject listener) {
-        Object existing = listener.getNativeData(NATIVE_REBIND_EXECUTOR);
+    @SuppressWarnings("unchecked")
+    private static AtomicReference<SMPPSession> session(BObject listener) {
+        return (AtomicReference<SMPPSession>) listener.getNativeData(NATIVE_SESSION);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static AtomicReference<ScheduledExecutorService> rebindExecutorRef(BObject listener) {
+        return (AtomicReference<ScheduledExecutorService>) listener.getNativeData(NATIVE_REBIND_EXECUTOR);
+    }
+
+    /** Must be called while holding {@code stateLock(listener)} (sole caller: scheduleRebind). */
+    private static ScheduledExecutorService rebindExecutor(BObject listener) {
+        AtomicReference<ScheduledExecutorService> ref = rebindExecutorRef(listener);
+        ScheduledExecutorService existing = ref.get();
         if (existing != null) {
-            return (ScheduledExecutorService) existing;
+            return existing;
         }
         ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor();
-        listener.addNativeData(NATIVE_REBIND_EXECUTOR, executor);
+        ref.set(executor);
         return executor;
     }
 
     private static void shutdownRebindExecutor(BObject listener) {
-        Object existing = listener.getNativeData(NATIVE_REBIND_EXECUTOR);
+        ScheduledExecutorService existing = rebindExecutorRef(listener).get();
         if (existing != null) {
-            ((ScheduledExecutorService) existing).shutdownNow();
+            existing.shutdownNow();
         }
     }
 

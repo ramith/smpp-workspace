@@ -12,6 +12,15 @@ when you use it.
 
 ## Connection lifecycle
 
+The listener enforces an explicit one-way lifecycle
+(`INIT → STARTING → STARTED → STOPPING → STOPPED`): a second `'start()` on a running
+listener is rejected with an error, and a stopped listener cannot be restarted —
+create a new `Listener` instead. The one exception to one-way-ness: a *failed*
+`'start()` (bind rejected, host unreachable) reverts the listener to startable, since
+nothing was installed. Stops are idempotent — stopping an already-stopped or
+never-started listener is a no-op. One service per listener: attaching a second
+service is rejected (detach the first to swap).
+
 A listener goes through four phases:
 
 1. **`init`** — validates and stores your `ConnectionConfig`. No network

@@ -77,6 +77,32 @@ public final class MockSmscBridge {
         mock(mockId).sendDataSm(connectionId, payload.isEmpty() ? null : payload, dataCoding);
     }
 
+    /** Abruptly severs the connection: socket close, no unbind exchange (qa-strategy §3.6). */
+    public static void sever(long mockId, long connectionId) throws Exception {
+        mock(mockId).sever(connectionId);
+    }
+
+    /** Clean peer-initiated unbind: unbind PDU + awaited unbind_resp, then close. */
+    public static void peerUnbind(long mockId, long connectionId) throws Exception {
+        mock(mockId).peerUnbind(connectionId);
+    }
+
+    /** Stops accepting new connections; already-accepted connections stay alive. */
+    public static void stopAccepting(long mockId) {
+        mock(mockId).stopAccepting();
+    }
+
+    /** When enabled, every subsequent bind is accepted and then immediately closed. */
+    public static void setCloseAfterAccept(long mockId, boolean enabled) {
+        mock(mockId).setCloseAfterAccept(enabled);
+    }
+
+    /** Raises the connection's transaction timer (jsmpp default 2000 ms). */
+    public static void setTransactionTimer(long mockId, long connectionId, long millis)
+            throws Exception {
+        mock(mockId).setTransactionTimer(connectionId, millis);
+    }
+
     /** Closes the mock's connections, listener, and pools. Safe to call twice. */
     public static void closeMock(long mockId) {
         MockSmsc mock = MOCKS.remove(mockId);

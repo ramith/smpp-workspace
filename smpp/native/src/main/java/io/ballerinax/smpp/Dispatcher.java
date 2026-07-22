@@ -70,9 +70,17 @@ public class Dispatcher implements MessageReceiverListener {
         }
     }
 
+    /**
+     * Immutable (service, remote-method-set) pair published through a single volatile
+     * reference, so a PDU thread can never observe a torn attach/detach (the new
+     * service paired with the old method set, or vice versa).
+     */
+    private record ServiceBinding(BObject service, Set<String> remoteMethods) { }
+
+    enum AttachResult { ATTACHED, ALREADY_ATTACHED, NO_REMOTE_METHODS }
+
     private final Runtime runtime;
-    private volatile BObject service;
-    private volatile Set<String> remoteMethods = new HashSet<>();
+    private volatile ServiceBinding binding; // null = no service attached
     private volatile boolean async = false;
     private final AtomicInteger inFlight = new AtomicInteger(0);
 
@@ -94,17 +102,25 @@ public class Dispatcher implements MessageReceiverListener {
      * @param message a description of what went wrong
      */
     void dispatchError(String message) {
-        BObject svc = this.service;
+        ServiceBinding binding = this.binding;
         BError err = ModuleUtils.createError(message);
-        if (svc == null || !this.remoteMethods.contains(ON_ERROR)) {
+        if (binding == null || !binding.remoteMethods().contains(ON_ERROR)) {
             err.printStackTrace();
             return;
         }
         StrandMetadata meta = new StrandMetadata(false, null);
+        // Incremented before the virtual thread starts (same as the ASYNC dispatch path)
+        // so a gracefulStop beginning immediately after this call already sees it and
+        // its drain genuinely covers the in-flight onError notification.
+        inFlight.incrementAndGet();
         Thread.startVirtualThread(() -> {
-            Object result = runtime.callMethod(svc, ON_ERROR, meta, err);
-            if (result instanceof BError callbackErr) {
-                callbackErr.printStackTrace();
+            try {
+                Object result = runtime.callMethod(binding.service(), ON_ERROR, meta, err);
+                if (result instanceof BError callbackErr) {
+                    callbackErr.printStackTrace();
+                }
+            } finally {
+                inFlight.decrementAndGet();
             }
         });
     }
@@ -114,34 +130,40 @@ public class Dispatcher implements MessageReceiverListener {
     }
 
     BObject getService() {
-        return this.service;
+        ServiceBinding b = this.binding;
+        return b == null ? null : b.service();
     }
 
     /**
-     * Validates before assigning: a rejected service must leave any previously attached
-     * service fully intact (assigning first would silently detach a valid service and
-     * leave the rejected one installed even though attach reported failure).
-     *
-     * @return {@code true} if {@code service} is {@code null} (clearing is always
-     *     accepted), or implements at least one of {@code onDeliverSm}/{@code onDataSm}/
-     *     {@code onError}; {@code false} (with no state change) if a non-null service
-     *     implements none of them
+     * Validates before assigning (Sprint 1 semantics preserved): every rejection path
+     * returns with NO state change, so a rejected attach can never disturb a previously
+     * attached, valid service. Synchronized so two concurrent attaches can't both pass
+     * the already-attached check; the hot read path (dispatch) stays a single volatile
+     * read.
      */
-    boolean setService(BObject service) {
-        Set<String> names = new HashSet<>();
-        if (service != null) {
-            ObjectType objType = (ObjectType) TypeUtils.getReferredType(TypeUtils.getType(service));
-            for (MethodType method : objType.getMethods()) {
-                names.add(method.getName());
-            }
-            if (!names.contains(ON_DELIVER_SM) && !names.contains(ON_DATA_SM)
-                    && !names.contains(ON_ERROR)) {
-                return false;
-            }
+    synchronized AttachResult attach(BObject service) {
+        if (this.binding != null) {
+            return AttachResult.ALREADY_ATTACHED;
         }
-        this.service = service;
-        this.remoteMethods = names;
-        return true;
+        Set<String> names = new HashSet<>();
+        ObjectType objType = (ObjectType) TypeUtils.getReferredType(TypeUtils.getType(service));
+        for (MethodType method : objType.getMethods()) {
+            names.add(method.getName());
+        }
+        if (!names.contains(ON_DELIVER_SM) && !names.contains(ON_DATA_SM)
+                && !names.contains(ON_ERROR)) {
+            return AttachResult.NO_REMOTE_METHODS;
+        }
+        this.binding = new ServiceBinding(service, Set.copyOf(names));
+        return AttachResult.ATTACHED;
+    }
+
+    /** Clears the binding only if {@code expected} is the currently attached service (identity). */
+    synchronized void detachIf(BObject expected) {
+        ServiceBinding b = this.binding;
+        if (b != null && b.service() == expected) {
+            this.binding = null;
+        }
     }
 
     @Override
@@ -246,10 +268,11 @@ public class Dispatcher implements MessageReceiverListener {
     }
 
     private void dispatch(String method, BMap<BString, Object> sms) throws ProcessRequestException {
-        BObject svc = this.service;
-        if (svc == null || !this.remoteMethods.contains(method)) {
+        ServiceBinding binding = this.binding;
+        if (binding == null || !binding.remoteMethods().contains(method)) {
             return;
         }
+        BObject svc = binding.service();
         // isConcurrentSafe = false -> the runtime serializes dispatch; safe default.
         StrandMetadata meta = new StrandMetadata(false, null);
         inFlight.incrementAndGet();
