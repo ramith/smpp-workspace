@@ -39,24 +39,87 @@ work feeds into).
 
 ---
 
-## Sprint 0 — Stop the bleeding
+## Sprint 0 — Stop the bleeding ✅ DONE
 
 **Goal:** the two fully-independent, zero-dependency, high-severity items — a
 100%-reproducible crash and a live credential-leak path. Both are safe to fix and ship in
 isolation, before anything else in this plan starts.
 
-| Item | Scope | Est. |
-|---|---|---|
-| Fix `Dispatcher.onAcceptDataSm` returning `null` | Return `new DataSmResult(EMPTY_MESSAGE_ID, new OptionalParameter[0])` instead of `null`; confirmed via jsmpp's own reference listeners (`MessageReceiverListenerImpl`, `SMPPServerSimulator`, `StressServer` in `jsmpp-examples`) that none of them ever return `null` here. Also: swept every other non-`void` `MessageReceiverListener` callback in `Dispatcher.java` — confirmed this is the *only* one with this shape. | 2h |
-| Credential length pre-validation | Validate `systemId` (≤15), `password` (≤8), `systemType` (≤12) *before* `connectAndBind`, so jsmpp's own length-validator (which embeds the raw value in its exception message) is never reached with an oversized credential. Return a clean, credential-free error instead. | 3–4h |
-| Minimal mock scaffolding + a `data_sm` end-to-end test, written test-first | Enough of the MockSmsc rewrite to send one real `data_sm` PDU through a session and assert a `data_sm_resp` comes back. Write this test *before* the fix above, confirm it reproduces the NPE/timeout, then flip it green. | ~10–15h |
-| Pure-logic JUnit suite for `decodeShortMessage`/`payloadBytes` | Fully independent of the mock/session work — start in parallel. Needs a small visibility refactor (private static → package-private, or extract a `PduCodec` utility) first. | 9h |
+| Item | Scope | Est. | Status |
+|---|---|---|---|
+| Fix `Dispatcher.onAcceptDataSm` returning `null` | Returns `new DataSmResult(EMPTY_MESSAGE_ID, new OptionalParameter[0])` instead of `null`; confirmed via jsmpp's own reference listeners (`MessageReceiverListenerImpl`, `SMPPServerSimulator`, `StressServer` in `jsmpp-examples`) that none of them ever return `null` here. Also: swept every other non-`void` `MessageReceiverListener` callback in `Dispatcher.java` — confirmed this is the *only* one with this shape. | 2h | Done |
+| Credential length pre-validation | Validates `systemId` (≤15), `password` (≤8), `systemType` (≤12) *before* `connectAndBind` in `NativeListener.validateCredentials`, so jsmpp's own length-validator (which embeds the raw value in its exception message) is never reached with an oversized credential. Returns a clean, credential-free `IllegalArgumentException` instead. | 3–4h | Done |
+| `data_sm` end-to-end regression test, written test-first | See "How the `data_sm` test actually got built" below — took two false starts to land on a working design. | ~10–15h (est.); took longer in practice due to the false starts | Done |
+| Pure-logic JUnit suite for `decodeShortMessage`/`payloadBytes` | `smpp/native/src/test/java/io/ballerinax/smpp/DispatcherTest.java` (14 cases: the full `data_coding` matrix with real per-codec byte fixtures, `message_payload` precedence on both `DeliverSm`/`DataSm`, null/empty edge cases) + `NativeListenerTest.java` (6 cases: credential boundary values, confirms no credential substring leaks into any thrown message). Both methods made package-private (not the originally-considered `PduCodec` extraction) for direct testability. Wired into `native/build.gradle` (JUnit 5, `useJUnitPlatform()`). | 9h | Done — 20/20 passing |
 
-**Exit gate:** the `data_sm` test passes against the fixed code; credential boundary tests
-(7/8/9 chars password, 15/16 systemId, 12/13 systemType) pass and confirm no credential
-substring appears in any error message; JUnit decode suite passes.
+**Exit gate:** ✅ all met. `./gradlew clean build` runs the full suite: 20 JUnit cases plus
+the `data_sm` `bal test`, all green.
 
-**Total: ~25–30h.**
+**Total: ~25–30h estimated.**
+
+### How the `data_sm` test actually got built
+
+The original plan (per `docs/qa-strategy.md`) called for building the *full*
+MockSmsc-as-Ballerina-test-bridge (accept-loop, configurable bind validation, bursts) just
+to prove this one fix. Two cheaper alternatives were tried first and both failed
+instructively before landing on the right scope:
+
+1. **A bare JUnit test** driving real jsmpp sessions directly, skipping Ballerina entirely
+   (passing `new Dispatcher(null)` with no attached service). This doesn't work:
+   `Dispatcher.onAcceptDataSm` unconditionally calls `toSms()` before it returns anything,
+   and `toSms()` calls `ValueCreator.createRecordValue(module, "Sms")`, which needs the
+   `Sms` record type registered in a live Ballerina runtime's type registry — something
+   that only exists inside an actual `bal test`/`bal run` process. Priming
+   `ModuleUtils.smppModule` via reflection fixed one NPE but not this deeper one, and the
+   test failed identically whether the fix was applied or not — meaning it didn't actually
+   prove anything. Abandoned.
+2. **A minimal real `bal test`**, but scoped down to just enough native bridge code to
+   send one `data_sm` PDU — this is what shipped. Landed as:
+   - `smpp/native/src/testBridge/java/io/ballerinax/smpp/test/MockSmscBridge.java` — a
+     small, static-method-only bridge (open a listening socket, accept+bind once, send one
+     `data_sm`, close). Built as a **separate Gradle source set** (`native/build.gradle`'s
+     `testBridge` source set → `testBridgeJar` task), producing its own jar
+     (`smpp-native-test-bridge-0.1.0.jar`) that's never part of the production build.
+   - Wired into `ballerina/Ballerina.toml` as a `[[platform.java21.dependency]]` with
+     `scope = "testOnly"` — a real Ballerina.toml feature that keeps a platform dependency
+     on the `bal test` classpath without bundling it into the built package.
+   - `smpp/ballerina/tests/mocksmsc.bal` — thin `@java:Method` wrapper functions. Two
+     interop details worth recording because they cost real debugging time: Ballerina
+     `byte[]` doesn't interop-map to Java `byte[]` (Ballerina's `byte` is 0-255, Java's is
+     signed) — the bridge takes UTF-8 payload as a `string`/`BString` instead, converting
+     to bytes in Java, since exact byte-level payload fidelity is already covered by
+     `DispatcherTest`'s decode matrix. And a plain `java.lang.String` parameter doesn't
+     interop-match Ballerina's `string` either — it must be typed `BString` on the Java
+     side (`.getValue()` inside the method), matching this codebase's own established
+     pattern in `NativeListener.str(...)`.
+   - `smpp/ballerina/tests/data_sm_test.bal` — binds a real `smpp:Listener` against the
+     bridge (`start`ed concurrently with the bridge's blocking `acceptAndBind`, since both
+     sides of an SMPP bind block until the other is ready), attaches a test service
+     recording received `Sms` values, sends one `data_sm`, and asserts it was received.
+     The actual fix-discriminating assertion is the `check` on the send call itself, not
+     the delivery-count assertion after it: in SYNC mode (this connector's default), the
+     dispatch to the test service already completes *before* `onAcceptDataSm` returns, so
+     the delivery-count assertion would pass even pre-fix — it's the send call failing
+     with a timeout that the fix actually changes.
+
+The fuller MockSmsc rewrite described in `docs/qa-strategy.md` §3 is still deferred to
+Sprint 1, which needs it anyway for bind-success/rejection and SYNC/ASYNC coverage — but
+per that document's updated Phase 1 note, this is a **restructuring** of
+`MockSmscBridge.java`'s static/single-shot internals into something that can serve an
+accept-*loop*, not just an additive extension of it.
+
+**Verified failure mode (test-first, both directions confirmed):** with the fix reverted,
+the test fails with `error("org.jsmpp.extra.ResponseTimeoutException", ...)` — the mock's
+blocking `dataShortMessage` call times out after jsmpp's default 2000ms transaction timer,
+because `Dispatcher.onAcceptDataSm` returning `null` causes an **uncaught** NPE inside
+jsmpp's `AbstractGenericSMPPSessionBound.processDataSm` (a state-processor method whose own
+`catch` only handles `PDUStringException`/`ProcessRequestException`, not a bare NPE) —
+crashing a PDU-processor thread with no `data_sm_resp` ever sent. This matches the
+originally documented/predicted mechanism exactly. (An earlier, abandoned JUnit attempt at
+this same test briefly appeared to show a *different* failure — an explicit negative
+response rather than a timeout — which would have contradicted the documented mechanism;
+that turned out to be an artifact of that attempt's incomplete test environment, not a real
+finding, and was not carried into this document.)
 
 ---
 

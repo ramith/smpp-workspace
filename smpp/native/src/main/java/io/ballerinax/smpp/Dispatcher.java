@@ -14,6 +14,7 @@ import io.ballerina.runtime.api.values.BMap;
 import io.ballerina.runtime.api.values.BObject;
 import io.ballerina.runtime.api.values.BString;
 
+import org.jsmpp.PDUStringException;
 import org.jsmpp.SMPPConstant;
 import org.jsmpp.bean.AbstractSmCommand;
 import org.jsmpp.bean.AlertNotification;
@@ -24,6 +25,7 @@ import org.jsmpp.extra.ProcessRequestException;
 import org.jsmpp.session.DataSmResult;
 import org.jsmpp.session.MessageReceiverListener;
 import org.jsmpp.session.Session;
+import org.jsmpp.util.MessageId;
 
 import java.nio.charset.StandardCharsets;
 import java.util.HashSet;
@@ -47,6 +49,27 @@ public class Dispatcher implements MessageReceiverListener {
     private static final String ON_DELIVER_SM = "onDeliverSm";
     private static final String ON_DATA_SM = "onDataSm";
     private static final String ON_ERROR = "onError";
+
+    /**
+     * The {@code message_id} returned with every {@code data_sm_resp}. DATA_SM has no
+     * submit queue behind it in this connector, so there is no application-assigned id to
+     * report; an empty {@code MessageId} is used instead of {@code null} - jsmpp's own PDU
+     * sender unconditionally calls {@code getCommandStatus()}/{@code getMessageId()} on
+     * whatever {@link #onAcceptDataSm} returns, so a {@code null} result is a guaranteed NPE.
+     */
+    private static final MessageId EMPTY_MESSAGE_ID = emptyMessageId();
+
+    private static MessageId emptyMessageId() {
+        try {
+            return new MessageId("");
+        } catch (PDUStringException e) {
+            // MessageId validates against StringParameter.MESSAGE_ID, a plain max-length
+            // (65) check with no minimum - an empty string can never fail it. Unreachable
+            // in practice; only guarded because MessageId's constructor declares a checked
+            // exception.
+            throw new AssertionError("unreachable: an empty MessageId must always be valid", e);
+        }
+    }
 
     private final Runtime runtime;
     private volatile BObject service;
@@ -113,8 +136,7 @@ public class Dispatcher implements MessageReceiverListener {
         // DATA_SM has no short_message field at all (unlike DELIVER_SM) - its payload is
         // always carried in the message_payload optional parameter (TLV), if present.
         dispatch(ON_DATA_SM, toSms(dataSm, new byte[0], false));
-        // Returning null acknowledges the DATA_SM without a message id.
-        return null;
+        return new DataSmResult(EMPTY_MESSAGE_ID, new OptionalParameter[0]);
     }
 
     @Override
@@ -132,7 +154,9 @@ public class Dispatcher implements MessageReceiverListener {
      * @param fallback the bytes to use if no message_payload TLV is present
      * @return the resolved payload bytes
      */
-    private static byte[] payloadBytes(AbstractSmCommand pdu, byte[] fallback) {
+    // package-private (not private): exercised directly by DispatcherTest, a pure-logic
+    // JUnit suite that needs no jsmpp session or Ballerina runtime.
+    static byte[] payloadBytes(AbstractSmCommand pdu, byte[] fallback) {
         OptionalParameter.Message_payload payload =
                 pdu.getOptionalParameter(OptionalParameter.Message_payload.class);
         return payload != null ? payload.getValue() : fallback;
@@ -164,7 +188,9 @@ public class Dispatcher implements MessageReceiverListener {
      * @param dataCoding the PDU's {@code data_coding} value
      * @return the decoded text
      */
-    private static String decodeShortMessage(byte[] bytes, byte dataCoding) {
+    // package-private (not private): exercised directly by DispatcherTest, a pure-logic
+    // JUnit suite that needs no jsmpp session or Ballerina runtime.
+    static String decodeShortMessage(byte[] bytes, byte dataCoding) {
         if (bytes == null || bytes.length == 0) {
             return "";
         }

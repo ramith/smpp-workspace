@@ -41,6 +41,13 @@ public final class NativeListener {
     private static final String NATIVE_STOPPING = "smpp.stopping";
     private static final String NATIVE_REBIND_EXECUTOR = "smpp.rebindExecutor";
 
+    // jsmpp's StringValidator rejects systemId/password/systemType at length 16/9/13
+    // respectively (StringParameter.SYSTEM_ID/PASSWORD/SYSTEM_TYPE - each C-Octet-String
+    // max includes the wire NUL terminator), so these are the largest usable lengths.
+    private static final int MAX_SYSTEM_ID_LENGTH = 15;
+    private static final int MAX_PASSWORD_LENGTH = 8;
+    private static final int MAX_SYSTEM_TYPE_LENGTH = 12;
+
     private NativeListener() {}
 
     public static Object initListener(Environment env, BObject listener, BMap<BString, Object> config) {
@@ -87,6 +94,7 @@ public final class NativeListener {
         String systemId = str(config, "systemId");
         String password = str(config, "password");
         String systemType = str(config, "systemType");
+        validateCredentials(systemId, password, systemType);
         BindType bindType = toBindType(str(config, "bindType"));
         int maxConcurrentDispatch = (int) ((Long) config.getIntValue(
                 StringUtils.fromString("maxConcurrentDispatch"))).longValue();
@@ -107,6 +115,32 @@ public final class NativeListener {
                 TypeOfNumber.UNKNOWN, NumberingPlanIndicator.UNKNOWN, null);
         listener.addNativeData(NATIVE_SESSION, session);
         bound.set(true);
+    }
+
+    /**
+     * Rejects an oversized {@code systemId}/{@code password}/{@code systemType} before
+     * {@link #bind} ever calls {@code connectAndBind}. jsmpp's own {@code StringValidator}
+     * would catch the same violation, but its exception message embeds the raw (invalid)
+     * value verbatim - a credential-leak path via logs/error messages. The message here
+     * names the field and its limit but never echoes the value.
+     *
+     * @throws IllegalArgumentException if any of the three exceeds its limit
+     */
+    // package-private (not private): exercised directly by NativeListenerTest, a pure-logic
+    // JUnit suite that needs no jsmpp session or Ballerina runtime.
+    static void validateCredentials(String systemId, String password, String systemType) {
+        if (systemId.length() > MAX_SYSTEM_ID_LENGTH) {
+            throw new IllegalArgumentException(
+                    "systemId exceeds the maximum length of " + MAX_SYSTEM_ID_LENGTH + " characters");
+        }
+        if (password.length() > MAX_PASSWORD_LENGTH) {
+            throw new IllegalArgumentException(
+                    "password exceeds the maximum length of " + MAX_PASSWORD_LENGTH + " characters");
+        }
+        if (systemType.length() > MAX_SYSTEM_TYPE_LENGTH) {
+            throw new IllegalArgumentException(
+                    "systemType exceeds the maximum length of " + MAX_SYSTEM_TYPE_LENGTH + " characters");
+        }
     }
 
     private static void onUnexpectedDrop(BObject listener, SessionState oldState) {

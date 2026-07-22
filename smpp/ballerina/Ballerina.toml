@@ -21,3 +21,12 @@ groupId = "ramith"
 artifactId = "smpp-native"
 version = "0.1.0"
 path = "../native/build/libs/smpp-native-0.1.0.jar"
+
+# Minimal mock-SMSC bridge used only by tests/mocksmsc.bal (see docs/qa-strategy.md) —
+# testOnly so it's never bundled into the built package.
+[[platform.java21.dependency]]
+groupId = "ramith"
+artifactId = "smpp-native-test-bridge"
+version = "0.1.0"
+path = "../native/build/libs/smpp-native-test-bridge-0.1.0.jar"
+scope = "testOnly"

@@ -8,6 +8,7 @@ target/
 # Gradle build output/cache. The wrapper itself (gradlew, gradlew.bat, gradle/wrapper/*)
 # is NOT ignored — it's committed so `./gradlew build` works with no local Gradle install.
 .gradle/
+smpp/build/
 smpp/native/build/
 smpp/ballerina/build/
 smpp/ballerina/lib/

@@ -19,6 +19,15 @@ def ballerinaHome = project.hasProperty('ballerinaHome')
 dependencies {
     compileOnly fileTree(dir: "${ballerinaHome}/bre/lib", include: 'ballerina-rt-*.jar')
     implementation group: 'org.jsmpp', name: 'jsmpp', version: "${jsmppVersion}"
+
+    // DispatcherTest/NativeListenerTest only call static/package-private methods and never
+    // construct a Dispatcher or touch a Runtime directly — but the JVM still resolves *all*
+    // of a class's member types (including an unused constructor's Runtime parameter) when
+    // linking it, so loading Dispatcher.class at all requires this to be on the classpath,
+    // not just compileOnly like the main source.
+    testImplementation fileTree(dir: "${ballerinaHome}/bre/lib", include: 'ballerina-rt-*.jar')
+    testImplementation platform('org.junit:junit-bom:5.10.2')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
 }
 
 java {
@@ -31,6 +40,43 @@ tasks.withType(JavaCompile).configureEach {
     options.encoding = 'UTF-8'
 }
 
+test {
+    useJUnitPlatform()
+    testLogging {
+        events 'passed', 'skipped', 'failed'
+        exceptionFormat 'full'
+    }
+}
+
 jar {
     archiveBaseName = 'smpp-native'
 }
+
+// A minimal, test-only mock SMSC bridge (bind + send one data_sm), consumed by
+// smpp/ballerina/tests/mocksmsc.bal via `scope = "testOnly"` in Ballerina.toml — never
+// shipped in the production package. A distinct source set (not the main jar) so it
+// can't accidentally end up in what gets published.
+sourceSets {
+    testBridge {
+        java {
+            srcDirs = ['src/testBridge/java']
+        }
+    }
+}
+
+configurations {
+    testBridgeImplementation.extendsFrom implementation
+}
+
+dependencies {
+    testBridgeImplementation group: 'org.jsmpp', name: 'jsmpp', version: "${jsmppVersion}"
+    // Ballerina's `string` interops as BString, not java.lang.String directly.
+    testBridgeCompileOnly fileTree(dir: "${ballerinaHome}/bre/lib", include: 'ballerina-rt-*.jar')
+}
+
+tasks.register('testBridgeJar', Jar) {
+    archiveBaseName = 'smpp-native-test-bridge'
+    from sourceSets.testBridge.output
+}
+
+build.dependsOn testBridgeJar

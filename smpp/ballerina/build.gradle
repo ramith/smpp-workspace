@@ -19,7 +19,7 @@ tasks.register('balBuild', Exec) {
 }
 
 tasks.register('balTest', Exec) {
-    dependsOn ':smpp-native:build'
+    dependsOn ':smpp-native:build', ':smpp-native:testBridgeJar'
     workingDir project.projectDir
     commandLine 'bal', 'test'
 }

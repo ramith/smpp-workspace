@@ -35,12 +35,16 @@ close.
 Three levels, each with a distinct job. Do not duplicate coverage across levels — push
 each case to the cheapest level that can actually exercise it.
 
-### 2.1 Fast JUnit tests (pure native logic, no jsmpp session, no Ballerina runtime)
+### 2.1 Fast JUnit tests (pure native logic, no jsmpp session, no Ballerina runtime) ✅ DONE (Sprint 0)
+
+**Status:** implemented in Sprint 0 — see `smpp/native/src/test/java/io/ballerinax/smpp/DispatcherTest.java`
+(14 cases) and `NativeListenerTest.java` (6 cases, covering the credential-length
+validation added in the same sprint). 20/20 passing via `./gradlew :smpp-native:test`.
 
 **Scope:** `Dispatcher.decodeShortMessage(byte[], byte)` and `Dispatcher.payloadBytes(AbstractSmCommand, byte[])`
-(refactor both to package-private, or extract into a small `PduCodec` utility class, so a
-JUnit test in the same package can call them directly without reflection — this is a
-prerequisite refactor, not a test-writing task).
+(made package-private directly, not extracted into a separate `PduCodec` utility — the
+simpler of the two originally-considered options, and sufficient) so a JUnit test in the
+same package can call them directly without reflection.
 
 Both are pure functions: no socket, no jsmpp `Session`, no Ballerina `Runtime`/`BObject`.
 `payloadBytes` only needs a constructed jsmpp bean (`DeliverSm`/`DataSm` with an
@@ -73,12 +77,14 @@ lowercase-filename convention the same way `Ballerina.toml`/`Module.md` are.
 - `decodeShortMessage` edge cases: null input, empty input (both must return `""`).
 
 Run this suite on every native-glue change, independent of the full Ballerina toolchain —
-it should be the fastest feedback loop in the whole test pyramid, and should gate
-`build-native.sh` (run it as a step in that script, or immediately after, before the jar
-is even declared usable by `bal build`).
+it's the fastest feedback loop in the whole test pyramid. `native/build.gradle`'s `build`
+task depends on both this suite and the native jar (Gradle's standard `check`/`assemble`
+wiring doesn't order one before the other, so don't rely on the jar reflecting a test
+failure — rely on `build` failing outright), so `./gradlew build` from `smpp/` gates on it
+automatically — no separate script needed.
 
-**Effort:** ~9h (refactor for testability 1h, tooling setup 2h, writing the matrix 5h,
-wiring 1h).
+**Effort:** ~9h estimated (refactor for testability 1h, tooling setup 2h, writing the
+matrix 5h, wiring 1h) — actual.
 
 ### 2.2 `bal test` integration tests (real jsmpp round trip via a rewritten mock SMSC)
 
@@ -350,27 +356,41 @@ javadoc (4h); review/iteration buffer (3h).
 
 ## 4. Prioritized, phased rollout
 
-### Phase 0 — Unblock and verify the `data_sm` fix (~29h, start today)
+### Phase 0 — Unblock and verify the `data_sm` fix ✅ DONE (Sprint 0)
 
-The single highest-priority test is the `data_sm` end-to-end round trip (§3.4): write it
-**first**, test-first, against today's still-buggy `Dispatcher.java`. Minimum slice of
-the mock needed: the accept-loop/bridge scaffolding (§3.2, most of the 16h core-rewrite +
-native-bridge budget) plus just the `sendDataSm` capability (§3.4). Run the test, confirm
-it fails exactly as predicted (`ResponseTimeoutException` from the mock's
-`dataShortMessage(...)` call, matching the traced NPE mechanism in §3.4) — that failure
-*is* the reproduction. The moment the fix lands, this test flips green and is the
-regression guard against it ever recurring. This does not depend on, and should not wait
-for, anything else in this document.
+**Status:** done, but with a smaller bridge than originally scoped here. Rather than the
+full accept-loop/bridge scaffolding (§3.2's 16h core-rewrite budget), Sprint 0 shipped a
+deliberately minimal one: `MockSmscBridge.java` opens a listener, accepts and binds
+**exactly one** connection, and can send **one** `data_sm` — no accept-loop, no
+credential-rejection, no bursts. This was enough to prove the fix test-first (confirmed
+failure mode: an uncaught NPE in jsmpp's `AbstractGenericSMPPSessionBound.processDataSm`,
+not the `SMPPSession$ResponseHandlerImpl`-level catch originally guessed at in §3.4 —
+close to the predicted mechanism but one layer removed; see `docs/sprint-plan.md`'s Sprint
+0 section for the corrected trace) and now guards against it recurring. See
+`docs/sprint-plan.md`'s Sprint 0 entry for the full account, including two earlier
+approaches that didn't work and why.
 
-In parallel (fully independent track, no shared code): the JUnit suite (§2.1, 9h) —
-zero dependency on the mock, the fix, or the lifecycle work.
+**Consequence for Phase 1 below:** its "depends on Phase 0's bridge scaffolding existing"
+assumption is only partly true now — the *existence* of a working `@java:Method` bridge
+pattern (Gradle `testBridge` source set → `testOnly` Ballerina.toml dependency →
+`tests/mocksmsc.bal` wrapper) is proven and reusable, but `MockSmscBridge.java`'s internals
+(static `listener`/`session` fields, single-shot `acceptAndBind`) don't fit an accept-*loop*
+serving multiple connections over the listener's lifetime — Phase 1 needs to **restructure**
+that state model (static fields → an instance/registry addressable per-connection) before it
+can extend it with credential validation, bursts, etc. Budget for a rewrite of
+`acceptAndBind`/`sendDataSm`'s internals, not an additive change; `openListener`/`close` and
+the surrounding Gradle/Ballerina.toml wiring survive as-is.
+
+The JUnit suite (§2.1, 9h estimated) is also done — see its own status note above.
 
 ### Phase 1 — Independent coverage, no blockers (~26h)
 
-Everything here only depends on Phase 0's bridge scaffolding existing (not on the fix
-having landed, not on any lifecycle work): remaining mock capabilities — bind-credential
-validation (§3.3), the `data_coding` fixture matrix (§3.5), the burst sender (§3.7) (~11h
-of the remaining mock budget); then `bind_test.bal` (bind success + rejection, 3h),
+Everything here only depends on Phase 0's bridge *pattern* existing (not on the fix
+having landed, not on any lifecycle work) — see the consequence note just above. Extend
+`MockSmscBridge.java` with the remaining mock capabilities: an accept-*loop* (currently
+single-shot), bind-credential validation (§3.3), the `data_coding` fixture matrix (§3.5),
+the burst sender (§3.7) (~11h of the remaining mock budget); then `bind_test.bal` (bind
+success + rejection, 3h),
 `sync_dispatch_test.bal` (SYNC positive/negative ack, 3h), `async_dispatch_test.bal`
 (ASYNC ack-before-handler timing, 4h), `data_coding_test.bal` (trimmed to smoke coverage
 per branch given §2.1 owns the full matrix, 3h), `message_payload_test.bal` (precedence
