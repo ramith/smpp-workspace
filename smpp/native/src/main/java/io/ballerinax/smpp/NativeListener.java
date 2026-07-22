@@ -3,6 +3,7 @@ package io.ballerinax.smpp;
 
 import io.ballerina.runtime.api.Environment;
 import io.ballerina.runtime.api.utils.StringUtils;
+import io.ballerina.runtime.api.values.BArray;
 import io.ballerina.runtime.api.values.BDecimal;
 import io.ballerina.runtime.api.values.BMap;
 import io.ballerina.runtime.api.values.BObject;
@@ -37,6 +38,7 @@ public final class NativeListener {
     private static final String NATIVE_SESSION = "smpp.session";
     private static final String NATIVE_DISPATCHER = "smpp.dispatcher";
     private static final String NATIVE_CONFIG = "smpp.config";
+    private static final String NATIVE_TLS = "smpp.tls";
     private static final String NATIVE_STATE = "smpp.state";
     private static final String NATIVE_STATE_LOCK = "smpp.stateLock";
     private static final String NATIVE_REBIND_EXECUTOR = "smpp.rebindExecutor";
@@ -58,8 +60,12 @@ public final class NativeListener {
 
     private NativeListener() {}
 
-    public static Object initListener(Environment env, BObject listener, BMap<BString, Object> config) {
+    public static Object initListener(Environment env, BObject listener, BMap<BString, Object> config,
+            Object tls) {
         listener.addNativeData(NATIVE_CONFIG, config);
+        // The flat ResolvedTls record from listener.bal (null = plaintext). Stored once at
+        // init like everything else; read on every bind attempt by newSession().
+        listener.addNativeData(NATIVE_TLS, tls);
         listener.addNativeData(NATIVE_DISPATCHER, new Dispatcher(env.getRuntime()));
         listener.addNativeData(NATIVE_STATE, new AtomicReference<>(ListenerState.INIT));
         listener.addNativeData(NATIVE_STATE_LOCK, new Object());
@@ -137,7 +143,7 @@ public final class NativeListener {
      */
     private static boolean bind(BObject listener, BMap<BString, Object> config) throws Exception {
         Dispatcher dispatcher = dispatcher(listener);
-        SMPPSession session = new SMPPSession();
+        SMPPSession session = newSession(listener);
         session.setMessageReceiverListener(dispatcher);
 
         String host = str(config, "host");
@@ -416,6 +422,57 @@ public final class NativeListener {
         if (existing != null) {
             existing.shutdownNow();
         }
+    }
+
+    // Default TLS TCP-connect + handshake-read timeout; aligns with jsmpp's 60s bind
+    // default. Sprint 4's timer-exposure item owns making timeouts configurable.
+    private static final int TLS_CONNECT_TIMEOUT_MILLIS = 60_000;
+
+    /**
+     * Plain {@code new SMPPSession()} unless TLS was resolved at init, in which case a
+     * fresh per-attempt TLS factory is built. Called once per bind attempt (initial
+     * start and every rebind), so there is no factory/SSLContext shared across attempts
+     * - and rotated trust material is picked up on the next rebind for free.
+     */
+    @SuppressWarnings("unchecked")
+    private static SMPPSession newSession(BObject listener) throws Exception {
+        Object tls = listener.getNativeData(NATIVE_TLS);
+        if (tls == null) {
+            return new SMPPSession();
+        }
+        return new SMPPSession(buildSslFactory((BMap<BString, Object>) tls));
+    }
+
+    /** Field names here mirror listener.bal's internal ResolvedTls record exactly. */
+    private static SmppSslConnectionFactory buildSslFactory(BMap<BString, Object> tls)
+            throws Exception {
+        return SmppSslConnectionFactory.create(
+                str(tls, "trustStorePath"),
+                str(tls, "trustStorePassword").toCharArray(),
+                str(tls, "trustCertPath"),
+                str(tls, "keyStorePath"),
+                str(tls, "keyStorePassword").toCharArray(),
+                stringArray(tls, "protocolVersions"),
+                stringArray(tls, "ciphers"),
+                bool(tls, "trustAll"),
+                bool(tls, "verifyHostName"),
+                TLS_CONNECT_TIMEOUT_MILLIS);
+    }
+
+    private static boolean bool(BMap<BString, Object> map, String key) {
+        return Boolean.TRUE.equals(map.get(StringUtils.fromString(key)));
+    }
+
+    private static String[] stringArray(BMap<BString, Object> map, String key) {
+        BArray arr = (BArray) map.get(StringUtils.fromString(key));
+        if (arr == null || arr.size() == 0) {
+            return new String[0];
+        }
+        String[] out = new String[(int) arr.size()];
+        for (int i = 0; i < out.length; i++) {
+            out[i] = arr.getBString(i).getValue();
+        }
+        return out;
     }
 
     private static String str(BMap<BString, Object> config, String key) {

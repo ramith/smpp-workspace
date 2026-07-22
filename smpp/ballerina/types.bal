@@ -1,4 +1,5 @@
 // Copyright (c) 2026. SMPP trigger connector — public API types.
+import ballerina/crypto;
 
 # The SMPP bind mode. Reflects the full set of modes defined by the SMPP spec;
 # `ConnectionConfig.bindType` narrows this to `ListenerBindType` since this connector
@@ -91,6 +92,65 @@ public type ConnectionConfig record {|
     # Controls automatic rebinding after an unexpected session drop. Defaults to retrying
     # indefinitely with exponential backoff; set `maxRebindAttempts: 0` to disable.
     RebindPolicy rebindPolicy = {};
+    # Transport security. Absent (the default) means the SMSC connection is plaintext
+    # TCP, exactly as before this field existed — pre-TLS configs are unaffected. A
+    # `SecureSocket` yields a verified TLS connection; an `InsecureSocket` yields a TLS
+    # connection with verification disabled (dev/test only — see its docs).
+    # Network-terminated TLS in front of the SMSC remains the recommended production
+    # topology where you control that boundary; this field is for the in-band case where
+    # you don't.
+    SecureSocket|InsecureSocket secureSocket?;
+|};
+
+# Transport-layer security (TLS) for the SMSC connection. Attach this to
+# `ConnectionConfig.secureSocket` to wrap the SMPP session in TLS. Whenever a
+# `SecureSocket` is supplied, the SMSC's server certificate is verified against `cert`,
+# and (unless `verifyHostName` is turned off) its subject is matched against
+# `ConnectionConfig.host`.
+public type SecureSocket record {|
+    # Trust anchor used to verify the SMSC's server certificate. Either a
+    # `crypto:TrustStore` (a PKCS12/JKS truststore file plus its password) or a path to
+    # a PEM-encoded CA certificate. Required: a TLS connection with no way to
+    # authenticate the peer is not a supported `SecureSocket` — use `InsecureSocket` if
+    # you knowingly want an unverified dev/test connection.
+    crypto:TrustStore|string cert;
+    # Client key material for mutual TLS (mTLS), when the SMSC authenticates the ESME by
+    # client certificate: a `crypto:KeyStore` (PKCS12/JKS keystore plus password). Omit
+    # for ordinary one-way, server-authenticated TLS, which is what most SMSCs use.
+    crypto:KeyStore key?;
+    # Enabled TLS protocol versions, as JSSE protocol names. Defaults to TLS 1.3 and
+    # TLS 1.2. TLS 1.1 and below are rejected at listener init — this connector enforces
+    # a TLS 1.2 floor and will not negotiate a downgraded, known-weak protocol even if
+    # configured to.
+    string[] protocolVersions = ["TLSv1.3", "TLSv1.2"];
+    # Enabled cipher suites, as JSSE suite names. Empty (the default) uses the JDK's
+    # default suite set for the negotiated protocol, which already excludes the
+    # known-broken suites on a current JDK. Leave it empty unless your SMSC requires a
+    # specific suite.
+    string[] ciphers = [];
+    # Whether the SMSC certificate's subject must match `ConnectionConfig.host` (the
+    # CN/SAN hostname check). Leave `true` for production. Setting `false` relaxes ONLY
+    # the hostname match; the certificate chain is still fully verified against `cert`.
+    # Use it when a test SMSC presents a certificate issued for a name other than the
+    # one you dial.
+    boolean verifyHostName = true;
+|};
+
+# DEV/TEST ONLY — a TLS connection with server-certificate verification turned off
+# entirely. Supplying this in place of a `SecureSocket` still encrypts the wire, but
+# accepts ANY certificate the peer presents (self-signed, expired, wrong-host, or
+# attacker-substituted). That defeats the authentication half of TLS and leaves the
+# connection open to a man-in-the-middle, so it must never point at a production SMSC.
+# It exists only so a local or self-signed test SMSC can be exercised without minting a
+# truststore first — prefer a real `SecureSocket` with a `crypto:TrustStore` even in
+# tests where you reasonably can. A warning is logged at listener init whenever this is
+# in effect.
+public type InsecureSocket record {|
+    # Must be written explicitly as `true`; the field is required and its type admits no
+    # other value. The deliberate friction is the point: verification can never be
+    # switched off by a defaulted field or a stray `false` left in a copied config —
+    # reaching this state takes naming `InsecureSocket` and spelling the flag out.
+    true disableSslVerification;
 |};
 
 # A received short message (DELIVER_SM / DATA_SM) surfaced to the service.

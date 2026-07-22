@@ -11,6 +11,7 @@ import org.jsmpp.bean.TypeOfNumber;
 import org.jsmpp.session.BindRequest;
 import org.jsmpp.session.SMPPServerSession;
 import org.jsmpp.session.SMPPServerSessionListener;
+import org.jsmpp.session.connection.ServerConnectionFactory;
 
 import java.io.IOException;
 import java.nio.charset.Charset;
@@ -55,7 +56,16 @@ final class MockSmsc {
     private volatile boolean closeAfterAccept = false;
 
     MockSmsc(int port) throws IOException {
-        listener = new SMPPServerSessionListener(port);
+        this(new SMPPServerSessionListener(port));   // plain socket
+    }
+
+    /** TLS variant: the listener terminates TLS via the supplied server-side factory. */
+    MockSmsc(int port, ServerConnectionFactory factory) throws IOException {
+        this(new SMPPServerSessionListener(port, factory));
+    }
+
+    private MockSmsc(SMPPServerSessionListener listener) {
+        this.listener = listener;
         // Generous - the mock must never be its own bottleneck (docs/qa-strategy.md §3.7).
         listener.setPduProcessorDegree(50);
         listener.setQueueCapacity(1000);

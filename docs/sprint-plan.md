@@ -330,6 +330,47 @@ still be the *recommended* production topology, but the option must exist.
 | Item | Scope | Est. |
 |---|---|---|
 | `secureSocket` config on `ConnectionConfig` | `cert` (truststore/cert path, server verification), optional `key` (keystore, for mTLS), optional `protocol`/`ciphers`. | ~1 day (8h) |
+
+**Phase 1 (team review) refinements — recorded before implementation:**
+
+- **Config shape** (verified against the distribution's own `crypto` 2.12.0 and `tcp` module
+  source): a `SecureSocket` record — `crypto:TrustStore|string cert` (required; PEM CA path
+  or truststore), `crypto:KeyStore key?` (mTLS), `string[] protocolVersions` defaulting to
+  `["TLSv1.3","TLSv1.2"]` with a **TLS 1.2 floor enforced in `validateConfig`**,
+  `string[] ciphers`, `boolean verifyHostName = true`. Deliberate deviations from
+  `tcp:ClientSecureSocket`: no redundant `enable` boolean (presence of the field means TLS),
+  no nested protocol-family record (SMPP never negotiates SSL/DTLS families).
+- **The dev-only trust-all path is a separate `InsecureSocket` record**
+  (`true disableSslVerification` — a required field whose type admits only `true`), with
+  `secureSocket` typed `SecureSocket|InsecureSocket?`. Chosen over a peer boolean so
+  verification-off is mutually exclusive with `cert` by construction and unreachable via a
+  defaulted/copied field. An `InsecureSocket` in use logs a loud warning at init.
+- **v1 scope narrowing (free to re-widen pre-release):** `key` is `crypto:KeyStore` only —
+  the PEM `CertKey` client-key form (fiddly PKCS8 parsing, no jsmpp precedent) is deferred;
+  PEM stays supported for the trust side (`cert` as a CA-cert path). No `connectTimeout`
+  field in v1 — the native layer uses a 60s constant aligned with jsmpp's bind timeout, and
+  Sprint 4's timer-exposure item owns making timeouts configurable holistically.
+- **Boundary:** the `.bal` layer normalizes the union into a flat internal `ResolvedTls`
+  record (paths + passwords + versions + flags, no union tags) passed to `externInit`;
+  the native side builds the `SSLContext` → a custom `SmppSslConnectionFactory` fresh per
+  bind attempt (no shared TLS state across rebinds; rotated trust material picked up on the
+  next rebind for free).
+- **Hostname verification is ON by default and set explicitly**
+  (`SSLParameters.setEndpointIdentificationAlgorithm("HTTPS")`) — deliberately diverging
+  from jsmpp's own SSL factories, **none of which perform hostname verification at all**
+  (qa-expert's Finding A, confirmed at source). The handshake is forced eagerly
+  (`startHandshake()`) so a bad cert fails at `'start()`/rebind, not later on a PDU thread.
+- **Recorded open question (qa-expert's Finding B), deferred with a disabled test stub:**
+  a *permanent* TLS trust failure discovered at rebind time currently retries forever under
+  `rebindPolicy` like any transient fault. Whether cert-trust failures should be terminal
+  (one final `onError`, no retry) is a design decision for a later sprint.
+- **Test harness:** committed PKCS12 fixtures under `tests/resources/certs/` +
+  `gen-certs.sh` (server cert CN=localhost + SAN; the negative-test "wrong" truststore's
+  cert is deliberately *also* CN=localhost so chain-of-trust is the only variable);
+  TLS-terminating mock via a per-mock `TlsServerConnectionFactory` (explicit keystore, not
+  jsmpp's JVM-global-property server factory); four tests on ports 27788–27791
+  (happy-path round-trip, no-verify dev path, **negative: wrong truststore must fail the
+  handshake**, mTLS round-trip).
 | Custom `ConnectionFactory` wiring in `NativeListener.bind()` | jsmpp's stock `SSLSocketConnectionFactory` only reads a JVM-global truststore, which isn't idiomatic for per-listener Ballerina config — build a small factory wrapping an `SSLContext` constructed from the Ballerina-supplied material, passed to `new SMPPSession(factory)`. Map an explicit, clearly-labeled dev-only "disable verification" flag to `NoTrustSSLSocketConnectionFactory`. | ~0.5–1 day (4–8h) |
 | TLS integration test | Stand up a TLS-terminating mock SMSC and assert a full bind+dispatch round-trip over it. This is the real cost driver of this sprint. | ~1.5–2 days (12–16h) |
 

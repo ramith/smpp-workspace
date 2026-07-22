@@ -3,6 +3,8 @@ package io.ballerinax.smpp.test;
 
 import io.ballerina.runtime.api.values.BString;
 
+import org.jsmpp.session.connection.ServerConnectionFactory;
+
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -26,9 +28,38 @@ public final class MockSmscBridge {
 
     private MockSmscBridge() {}
 
-    /** Opens a listening socket and starts the accept-loop; returns the mock's handle. */
+    /** Opens a plaintext listening socket and starts the accept-loop; returns the handle. */
     public static long openMock(int port) throws Exception {
-        MockSmsc mock = new MockSmsc(port);
+        return register(new MockSmsc(port));
+    }
+
+    /**
+     * Opens a TLS-terminating mock presenting the given server keystore's cert (server-auth
+     * TLS; the mock verifies nothing about the client). All other mock operations work
+     * identically against the returned handle.
+     */
+    public static long openMockTls(int port, BString serverKeystorePath,
+                                   BString serverKeystorePassword) throws Exception {
+        ServerConnectionFactory factory = new TlsServerConnectionFactory(
+                serverKeystorePath.getValue(), serverKeystorePassword.getValue().toCharArray(),
+                null, null);
+        return register(new MockSmsc(port, factory));
+    }
+
+    /**
+     * Opens an mTLS mock: presents the server cert AND requires the client to present a
+     * cert trusted by the given client truststore (via SSLServerSocket setNeedClientAuth).
+     */
+    public static long openMockMutualTls(int port, BString serverKeystorePath,
+            BString serverKeystorePassword, BString clientTruststorePath,
+            BString clientTruststorePassword) throws Exception {
+        ServerConnectionFactory factory = new TlsServerConnectionFactory(
+                serverKeystorePath.getValue(), serverKeystorePassword.getValue().toCharArray(),
+                clientTruststorePath.getValue(), clientTruststorePassword.getValue().toCharArray());
+        return register(new MockSmsc(port, factory));
+    }
+
+    private static long register(MockSmsc mock) {
         mock.start();
         long id = NEXT_MOCK_ID.getAndIncrement();
         MOCKS.put(id, mock);

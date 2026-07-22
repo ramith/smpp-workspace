@@ -467,8 +467,18 @@ week with two engineers running Phase 0's two tracks and Phase 1 in parallel).**
   reassembly. Multi-segment concatenation logic (jsmpp's own examples show what this
   would take — `jsmpp-examples/.../util/Concatenation.java`) is not implemented and not
   tested here.
-- **TLS/SSL transport.** Not implemented by this connector today; no test coverage claim
-  is made for it.
+- **TLS/SSL transport — now COVERED (Sprint 3), with these bounds.** `tls_test.bal`
+  exercises a full deliver_sm round-trip over TLS (truststore and PEM-cert forms), the
+  dev-only no-verify (`InsecureSocket`) path, an mTLS round-trip, and — the load-bearing
+  one for the security claim — a **negative test where an untrusted server cert fails the
+  handshake** (the "wrong" truststore's cert is deliberately also `CN=localhost`, so
+  chain-of-trust is the only variable, never hostname). Committed PKCS12 fixtures under
+  `tests/resources/certs/` (regenerable via `gen-certs.sh`). Hostname verification **is**
+  enabled by default (JSSE endpoint identification), which the happy-path fixtures'
+  `CN=localhost`/SAN satisfy. Still out of scope: exhaustive cipher/protocol negotiation
+  matrices, real CA-signed / intermediate chains, OCSP/CRL revocation, and a dedicated
+  hostname-mismatch negative case (the current fixtures share `CN=localhost` by design) —
+  all JSSE behaviors rather than connector behaviors.
 - **Outbound `submit_sm`/transmitter-side flows.** This connector is receive-only by
   design (`ListenerBindType RECEIVER|TRANSCEIVER`, no `submit_sm` API) — nothing here
   tests sending.

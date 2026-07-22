@@ -1,6 +1,8 @@
 // Copyright (c) 2026. SMPP trigger connector — listener + service contract.
 
+import ballerina/crypto;
 import ballerina/jballerina.java;
+import ballerina/log;
 
 # The SMPP trigger listener. Owns a jsmpp `SMPPSession`, binds to the SMSC and
 # dispatches inbound PDUs to the attached service's remote methods.
@@ -21,10 +23,10 @@ public isolated class Listener {
     #   native listener setup fails
     public isolated function init(ConnectionConfig config) returns error? {
         check validateConfig(config);
-        check self.externInit(config);
+        check self.externInit(config, resolveTls(config.secureSocket));
     }
 
-    isolated function externInit(ConnectionConfig config) returns error? = @java:Method {
+    isolated function externInit(ConnectionConfig config, ResolvedTls? tls) returns error? = @java:Method {
         'class: "io.ballerinax.smpp.NativeListener",
         name: "initListener"
     } external;
@@ -104,6 +106,30 @@ isolated function validateConfig(ConnectionConfig config) returns error? {
         return error Error(string `gracefulStopTimeout must not be negative, got ${config.gracefulStopTimeout}`);
     }
     check validateRebindPolicy(config.rebindPolicy);
+    SecureSocket|InsecureSocket? secureSocket = config.secureSocket;
+    if secureSocket is SecureSocket {
+        check validateSecureSocket(secureSocket);
+    }
+    // An InsecureSocket needs no validation (its one field admits only `true`); the loud
+    // warning for it is logged at resolve time, once per listener init.
+}
+
+# Validates a `SecureSocket` against this connector's TLS floor.
+#
+# + secureSocket - the TLS configuration to validate
+# + return - an `Error` describing the first violated constraint, or `()` if valid
+isolated function validateSecureSocket(SecureSocket secureSocket) returns error? {
+    if secureSocket.protocolVersions.length() == 0 {
+        return error Error("secureSocket.protocolVersions must enable at least one TLS version");
+    }
+    foreach string v in secureSocket.protocolVersions {
+        if v != "TLSv1.2" && v != "TLSv1.3" {
+            // Rejects TLSv1.1, TLSv1, SSLv3, SSLv2Hello, and typos alike: this connector
+            // enforces a TLS 1.2 floor rather than letting the JVM maybe-negotiate a
+            // known-weak protocol.
+            return error Error(string `secureSocket.protocolVersions: '${v}' is not allowed - this connector negotiates only TLSv1.2 and TLSv1.3`);
+        }
+    }
 }
 
 # Validates a `RebindPolicy` against its documented bounds.
@@ -125,4 +151,82 @@ isolated function validateRebindPolicy(RebindPolicy policy) returns error? {
         // intending 3) and would otherwise silently behave as infinite too.
         return error Error(string `rebindPolicy.maxRebindAttempts must be -1 (infinite), 0 (disabled), or positive, got ${policy.maxRebindAttempts}`);
     }
+}
+
+# Internal, flat resolution of the `SecureSocket|InsecureSocket?` union — the native layer
+# reads fixed fields off this record with no union-tag inspection (empty string = absent).
+type ResolvedTls record {|
+    # `true` only for `InsecureSocket`: chain verification is disabled entirely.
+    boolean trustAll;
+    # Truststore file path, when `cert` was a `crypto:TrustStore`; else empty.
+    string trustStorePath;
+    # Truststore password, when `cert` was a `crypto:TrustStore`; else empty.
+    string trustStorePassword;
+    # PEM CA-certificate path, when `cert` was a plain path string; else empty.
+    string trustCertPath;
+    # Keystore file path, when mTLS `key` was supplied; else empty.
+    string keyStorePath;
+    # Keystore password, when mTLS `key` was supplied; else empty.
+    string keyStorePassword;
+    # Validated (TLS 1.2 floor) protocol versions to enable.
+    string[] protocolVersions;
+    # Cipher suites to enable; empty = JDK defaults.
+    string[] ciphers;
+    # Whether to enable JSSE endpoint identification (hostname verification).
+    boolean verifyHostName;
+|};
+
+# Collapses the public TLS union into `ResolvedTls` (or `()` for plaintext), logging the
+# loud dev-only warning when an `InsecureSocket` is in effect.
+#
+# + secureSocket - the configured union, if any
+# + return - the flat resolution, or `()` when the connection should stay plaintext
+isolated function resolveTls(SecureSocket|InsecureSocket? secureSocket) returns ResolvedTls? {
+    if secureSocket is () {
+        return ();
+    }
+    if secureSocket is InsecureSocket {
+        log:printWarn("SMPP TLS: server-certificate verification is DISABLED (InsecureSocket). "
+                + "The connection is encrypted but NOT authenticated and is open to "
+                + "man-in-the-middle. Never use this against a production SMSC.");
+        return {
+            trustAll: true,
+            trustStorePath: "",
+            trustStorePassword: "",
+            trustCertPath: "",
+            keyStorePath: "",
+            keyStorePassword: "",
+            protocolVersions: ["TLSv1.3", "TLSv1.2"],
+            ciphers: [],
+            verifyHostName: false
+        };
+    }
+    string trustStorePath = "";
+    string trustStorePassword = "";
+    string trustCertPath = "";
+    crypto:TrustStore|string cert = secureSocket.cert;
+    if cert is crypto:TrustStore {
+        trustStorePath = cert.path;
+        trustStorePassword = cert.password;
+    } else {
+        trustCertPath = cert;
+    }
+    string keyStorePath = "";
+    string keyStorePassword = "";
+    crypto:KeyStore? key = secureSocket?.key;
+    if key is crypto:KeyStore {
+        keyStorePath = key.path;
+        keyStorePassword = key.password;
+    }
+    return {
+        trustAll: false,
+        trustStorePath,
+        trustStorePassword,
+        trustCertPath,
+        keyStorePath,
+        keyStorePassword,
+        protocolVersions: secureSocket.protocolVersions,
+        ciphers: secureSocket.ciphers,
+        verifyHostName: secureSocket.verifyHostName
+    };
 }

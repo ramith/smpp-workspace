@@ -137,3 +137,34 @@ isolated function mockSmscSetTransactionTimer(int mockId, int connectionId, int 
     'class: "io.ballerinax.smpp.test.MockSmscBridge",
     name: "setTransactionTimer"
 } external;
+
+# Opens a TLS-terminating mock SMSC presenting the cert in `serverKeystorePath` (PKCS12).
+# The mock verifies nothing about the client (server-auth TLS); use `mockSmscOpenMutualTls`
+# for mTLS. All other mock operations work identically against the returned handle.
+#
+# + port - the port to listen on
+# + serverKeystorePath - path to the server PKCS12 keystore (cert + private key)
+# + serverKeystorePassword - the keystore password
+# + return - the mock's handle, or an `error` if the socket/keystore can't be opened
+isolated function mockSmscOpenTls(int port, string serverKeystorePath,
+        string serverKeystorePassword) returns int|error = @java:Method {
+    'class: "io.ballerinax.smpp.test.MockSmscBridge",
+    name: "openMockTls"
+} external;
+
+# Opens an mTLS mock: presents `serverKeystorePath`'s cert AND requires the connecting
+# client to present a cert trusted by `clientTruststorePath` (SSLServerSocket
+# setNeedClientAuth). A client presenting no/untrusted cert fails the handshake.
+#
+# + port - the port to listen on
+# + serverKeystorePath - server PKCS12 keystore (cert + key)
+# + serverKeystorePassword - server keystore password
+# + clientTruststorePath - PKCS12 truststore of client cert(s) the mock will accept
+# + clientTruststorePassword - client truststore password
+# + return - the mock's handle, or an `error`
+isolated function mockSmscOpenMutualTls(int port, string serverKeystorePath,
+        string serverKeystorePassword, string clientTruststorePath,
+        string clientTruststorePassword) returns int|error = @java:Method {
+    'class: "io.ballerinax.smpp.test.MockSmscBridge",
+    name: "openMockMutualTls"
+} external;

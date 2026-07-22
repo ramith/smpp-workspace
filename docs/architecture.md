@@ -86,6 +86,64 @@ the listener.
 | `responseMode` | `ResponseMode` | `SYNC` | See [Dispatch concurrency](#dispatch-concurrency-and-response-mode). |
 | `gracefulStopTimeout` | `decimal` | `30` (seconds) | See [Shutting down](#shutting-down). |
 | `rebindPolicy` | `RebindPolicy` | retries indefinitely | See [RebindPolicy](#rebindpolicy). |
+| `secureSocket` | `SecureSocket \| InsecureSocket` | none (plaintext) | See [Transport security (TLS)](#transport-security-tls). |
+
+### Transport security (TLS)
+
+By default the SMSC connection is **plaintext TCP** — the same behavior this connector
+has always had, and the right default only when the link to the SMSC is already protected
+out of band (a private network, a VPN, or a TLS-terminating proxy in front of the SMSC).
+Terminating TLS at that boundary, where you control it, remains the recommended production
+topology.
+
+When you don't control that boundary — a public or shared network path to the SMSC — set
+`ConnectionConfig.secureSocket` to wrap the SMPP session in TLS directly. The SMPP bind
+exchanges your `systemId`/`password` in the clear on the wire, so an unencrypted path to
+an SMSC you don't fully trust exposes those credentials; in-band TLS closes that.
+
+```ballerina
+smpp:ConnectionConfig config = {
+    host: "smsc.example.com",
+    port: 3550,
+    systemId,
+    password,
+    secureSocket: {
+        cert: { path: "./resources/truststore.p12", password: tsPass }
+    }
+};
+```
+
+Supplying a `SecureSocket` turns on full verification:
+
+- The SMSC's server certificate is verified against `cert` — either a `crypto:TrustStore`
+  (PKCS12/JKS file + password) or a path to a PEM CA certificate. `cert` is required;
+  there is no silent fallback to a system truststore.
+- The certificate's subject is matched against `host` (`verifyHostName`, default `true`).
+  Set it to `false` only to relax the hostname match against a test SMSC whose certificate
+  is issued for a different name — the chain is still fully verified. (This is stronger
+  than jsmpp's own SSL factories, which perform no hostname verification at all.)
+- Only TLS 1.2 and TLS 1.3 are negotiated. Configuring `protocolVersions` with TLS 1.1 or
+  below is rejected at listener init.
+- For mutual TLS, set `key` to a `crypto:KeyStore`. Omit it for ordinary one-way TLS.
+
+A bad or untrusted certificate fails the handshake eagerly, so it surfaces as an `error`
+from `'start()` (or drives the rebind loop, if it happens after a successful initial
+bind), never silently later.
+
+#### Disabling verification (development only)
+
+To test against a local or self-signed SMSC without minting a truststore, set
+`secureSocket` to an `InsecureSocket` instead of a `SecureSocket`:
+
+```ballerina
+secureSocket: { disableSslVerification: true }
+```
+
+This still encrypts the wire but accepts **any** certificate the peer presents, which
+defeats TLS's authentication and leaves the connection open to a man-in-the-middle. It is
+a distinct record type, and its single field is required and can only be `true`, precisely
+so verification can never be switched off by a defaulted or copy-pasted field. Never point
+it at a production SMSC; a warning is logged at startup whenever it is in effect.
 
 ### Bind modes
 
