@@ -102,6 +102,30 @@ isolated function validateConfig(ConnectionConfig config) returns error? {
     if config.maxConcurrentDispatch < 1 {
         return error Error(string `maxConcurrentDispatch must be at least 1, got ${config.maxConcurrentDispatch}`);
     }
+    if config.maxConcurrentDispatch > 1024 {
+        // In SYNC each unit is one OS worker thread (plus the keepalive reserve), so an
+        // accidental huge value would exhaust threads; cap it at a generous ceiling.
+        return error Error(string `maxConcurrentDispatch must not exceed 1024, got ${config.maxConcurrentDispatch}`);
+    }
+    if config.enquireLinkInterval < 5d {
+        // 0/negative would disable dead-link detection (jsmpp maps it to an infinite
+        // socket read timeout); sub-5s risks colliding with the internal response window
+        // and floods the SMSC with keepalives.
+        return error Error(string `enquireLinkInterval must be at least 5 seconds, got ${config.enquireLinkInterval}`);
+    }
+    if config.enquireLinkInterval > 3600d {
+        // Upper bound doubles as a unit-confusion guard: this field is SECONDS, while
+        // jsmpp's knob is milliseconds - someone typing 60000 would otherwise get ~16h.
+        return error Error(string `enquireLinkInterval must not exceed 3600 seconds - note this field is in SECONDS, not milliseconds, got ${config.enquireLinkInterval}`);
+    }
+    if config.bindTimeout < 1d {
+        // A sub-second bind timeout would time out nearly every real TLS+bind handshake.
+        return error Error(string `bindTimeout must be at least 1 second, got ${config.bindTimeout}`);
+    }
+    if config.bindTimeout > 300d {
+        // Same seconds-vs-milliseconds unit-confusion guard as enquireLinkInterval.
+        return error Error(string `bindTimeout must not exceed 300 seconds - note this field is in SECONDS, not milliseconds, got ${config.bindTimeout}`);
+    }
     if config.gracefulStopTimeout < 0d {
         return error Error(string `gracefulStopTimeout must not be negative, got ${config.gracefulStopTimeout}`);
     }

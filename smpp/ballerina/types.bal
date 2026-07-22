@@ -27,11 +27,14 @@ public enum ResponseMode {
     # `ProcessRequestException`, so the SMSC can retry. Matches jsmpp's documented
     # listener contract, and bounds concurrency to `maxConcurrentDispatch`.
     SYNC,
-    # Sends `command_status = ESME_ROK` immediately, without waiting for the service.
-    # Maximizes throughput and ignores `maxConcurrentDispatch` as a concurrency limit
-    # (dispatch is unbounded), but a later service failure is never reflected back to
-    # the SMSC — it's only printed as a stack trace on stderr, not yet routed through
-    # `ballerina/log` (tracked as backlog).
+    # Sends `command_status = ESME_ROK` immediately, without waiting for the service —
+    # maximizing throughput at the cost of never reflecting a later service failure back
+    # to the SMSC (a failure is only printed as a stack trace on stderr, not yet routed
+    # through `ballerina/log` — tracked as backlog). `maxConcurrentDispatch` still bounds
+    # concurrency here: it caps how many service invocations run at once, and PDUs
+    # arriving beyond that limit are answered with `ESME_RTHROTTLED` rather than spawning
+    # unbounded work. (This bounding is new: earlier releases documented ASYNC as ignoring
+    # `maxConcurrentDispatch` entirely.)
     ASYNC
 }
 
@@ -74,13 +77,17 @@ public type ConnectionConfig record {|
     string systemType = "";
     # The bind mode. Defaults to `RECEIVER`.
     ListenerBindType bindType = RECEIVER;
-    # Maximum number of inbound PDUs (`DELIVER_SM`/`DATA_SM`) dispatched to the
-    # attached service concurrently. Each dispatch blocks until the service's
-    # remote method returns, so this is also the concurrency limit on your
-    # service. When the SMSC sends PDUs faster than this limit drains, jsmpp
-    # queues them (up to its internal queue capacity) and signals the SMSC to
-    # throttle — inbound throughput is bounded by design, not best-effort.
-    # Must be >= 1 (validated at `Listener` init).
+    # Maximum number of inbound PDUs (`DELIVER_SM`/`DATA_SM`) dispatched to the attached
+    # service concurrently — the concurrency limit on your service, in both `SYNC` and
+    # `ASYNC` mode. When the SMSC sends PDUs faster than this limit drains, the excess is
+    # answered immediately with `ESME_RTHROTTLED` so the SMSC backs off and retains the
+    # message (SMPP is at-least-once — a NACK is not a drop). Inbound throughput is bounded
+    # by design, not best-effort. The connector guarantees the SMSC's `enquire_link`
+    # keepalive is always answered promptly even while every dispatch slot is busy — so a
+    # slow service can no longer provoke the SMSC into dropping the link (in `SYNC` mode via
+    # a reserved worker thread beyond this limit; in `ASYNC` mode handlers run on virtual
+    # threads, so pool threads never block — see `docs/architecture.md`). Must be 1-1024
+    # (validated at `Listener` init).
     int maxConcurrentDispatch = 3;
     # Controls when the `deliver_sm_resp`/`data_sm_resp` is sent back to the SMSC
     # relative to the attached service's processing of the PDU. Defaults to `SYNC`.
@@ -92,6 +99,24 @@ public type ConnectionConfig record {|
     # Controls automatic rebinding after an unexpected session drop. Defaults to retrying
     # indefinitely with exponential backoff; set `maxRebindAttempts: 0` to disable.
     RebindPolicy rebindPolicy = {};
+    # How often the connector sends an `enquire_link` to the SMSC when the session is
+    # otherwise idle, in seconds. This is the connector's own keepalive/liveness probe:
+    # it keeps NAT/firewall state alive and is how the connector detects a silently dead
+    # SMSC (an unanswered probe fails the link and drives `rebindPolicy`). It does NOT
+    # control how long the SMSC waits before dropping the connector — that is the SMSC's
+    # own policy; see `maxConcurrentDispatch` for why a busy service no longer trips it.
+    # This field is in SECONDS (jsmpp's underlying knob is milliseconds). Must be 5-3600
+    # (validated at `Listener` init); `0`/disabled is not allowed, since it would also
+    # disable dead-link detection.
+    decimal enquireLinkInterval = 60;
+    # Maximum time the connect-and-bind handshake may take, in seconds — applied to the
+    # initial `'start()` and to every automatic rebind attempt. It bounds the TCP connect
+    # and the bind-response wait *separately*, so a fully stalled attempt (a black-holed
+    # host that also never answers) can take up to ~2x this value. The rebind loop is
+    # single-threaded, so this also caps how long one stalled attempt (e.g. a half-open
+    # SMSC that accepts the TCP connection but never answers the bind) blocks the next
+    # attempt. This field is in SECONDS. Must be 1-300 (validated at `Listener` init).
+    decimal bindTimeout = 60;
     # Transport security. Absent (the default) means the SMSC connection is plaintext
     # TCP, exactly as before this field existed — pre-TLS configs are unaffected. A
     # `SecureSocket` yields a verified TLS connection; an `InsecureSocket` yields a TLS

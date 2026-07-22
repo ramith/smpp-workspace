@@ -2,6 +2,7 @@
 package io.ballerinax.smpp.test;
 
 import org.jsmpp.SMPPConstant;
+import org.jsmpp.extra.NegativeResponseException;
 import org.jsmpp.bean.ESMClass;
 import org.jsmpp.bean.NumberingPlanIndicator;
 import org.jsmpp.bean.OptionalParameter;
@@ -172,14 +173,25 @@ final class MockSmsc {
                 ? new OptionalParameter[0]
                 : new OptionalParameter[] {
                         new OptionalParameter.Message_payload(encode(messagePayload, dataCoding)) };
-        connection(connectionId).deliverShortMessage(
-                "", TypeOfNumber.INTERNATIONAL, NumberingPlanIndicator.ISDN, "12345",
-                TypeOfNumber.INTERNATIONAL, NumberingPlanIndicator.ISDN, "99999",
-                new ESMClass(), (byte) 0, (byte) 0,
-                new RegisteredDelivery(0),
-                new RawDataCoding((byte) dataCoding),
-                encode(shortMessage, dataCoding),
-                params);
+        try {
+            connection(connectionId).deliverShortMessage(
+                    "", TypeOfNumber.INTERNATIONAL, NumberingPlanIndicator.ISDN, "12345",
+                    TypeOfNumber.INTERNATIONAL, NumberingPlanIndicator.ISDN, "99999",
+                    new ESMClass(), (byte) 0, (byte) 0,
+                    new RegisteredDelivery(0),
+                    new RawDataCoding((byte) dataCoding),
+                    encode(shortMessage, dataCoding),
+                    params);
+        } catch (NegativeResponseException e) {
+            // Distinguish a throttle (ESME_RTHROTTLED, from the connector's backpressure gate)
+            // from a handler error (ESME_RSYSERR) or anything else. Ballerina interop surfaces
+            // the thrown exception's CLASS NAME as error.message(), so a throttle gets its own
+            // type; other negative responses keep the original (class name still identifies it).
+            if (e.getCommandStatus() == SMPPConstant.STAT_ESME_RTHROTTLED) {
+                throw new ThrottledException(e.getCommandStatus());
+            }
+            throw e;
+        }
     }
 
     /**
@@ -269,6 +281,16 @@ final class MockSmsc {
      */
     void setTransactionTimer(long connectionId, long millis) {
         connection(connectionId).setTransactionTimer(millis);
+    }
+
+    /**
+     * Lowers this connection's enquire_link timer (jsmpp default: 60000 ms) so the mock,
+     * acting as the SMSC, probes the connector's liveness frequently. Combined with a short
+     * transaction timer, an unanswered enquire_link makes the mock close the session - which
+     * is exactly the self-inflicted-drop path the SYNC keepalive test asserts against.
+     */
+    void setEnquireLinkTimer(long connectionId, int millis) {
+        connection(connectionId).setEnquireLinkTimer(millis);
     }
 
     void close() {

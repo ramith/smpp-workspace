@@ -44,6 +44,23 @@ public final class NativeListener {
     private static final String NATIVE_REBIND_EXECUTOR = "smpp.rebindExecutor";
 
     /**
+     * Extra jsmpp PDU-processor threads kept beyond {@code maxConcurrentDispatch} in SYNC
+     * mode, reserved so the SMSC's enquire_link keepalive is always answered even while
+     * every dispatch slot is busy. One suffices: the Dispatcher's semaphore caps blocking
+     * handlers at {@code maxConcurrentDispatch}, so this thread is never occupiable by one,
+     * and all outbound sends serialize on a single stream (a second reserve would protect
+     * nothing a stuck write doesn't already stall identically).
+     */
+    private static final int KEEPALIVE_RESERVE_THREADS = 1;
+
+    /**
+     * Fixed jsmpp PDU-processor pool size in ASYNC mode. Handlers run on virtual threads, so
+     * these platform threads only marshal each PDU and spawn - they never block, so a small
+     * pool is sufficient and one thread is always free for enquire_link regardless of load.
+     */
+    private static final int ASYNC_PDU_PROCESSOR_DEGREE = 3;
+
+    /**
      * Listener lifecycle. One-way except {@code STARTING -> INIT} on a failed initial
      * bind, which is safe because a failed bind installs nothing (no session, no
      * executor, no in-flight work). {@code STOPPING}/{@code STOPPED} are terminal:
@@ -66,7 +83,9 @@ public final class NativeListener {
         // The flat ResolvedTls record from listener.bal (null = plaintext). Stored once at
         // init like everything else; read on every bind attempt by newSession().
         listener.addNativeData(NATIVE_TLS, tls);
-        listener.addNativeData(NATIVE_DISPATCHER, new Dispatcher(env.getRuntime()));
+        int maxConcurrentDispatch = (int) ((Long) config.getIntValue(
+                StringUtils.fromString("maxConcurrentDispatch"))).longValue();
+        listener.addNativeData(NATIVE_DISPATCHER, new Dispatcher(env.getRuntime(), maxConcurrentDispatch));
         listener.addNativeData(NATIVE_STATE, new AtomicReference<>(ListenerState.INIT));
         listener.addNativeData(NATIVE_STATE_LOCK, new Object());
         // SESSION and REBIND_EXECUTOR are mutated after jsmpp threads exist, so they go
@@ -143,7 +162,10 @@ public final class NativeListener {
      */
     private static boolean bind(BObject listener, BMap<BString, Object> config) throws Exception {
         Dispatcher dispatcher = dispatcher(listener);
-        SMPPSession session = newSession(listener);
+        // Bounds both the TCP connect (via the connection factory) and the bind-response
+        // wait (via connectAndBind below), on the initial start and every rebind alike.
+        int bindTimeoutMillis = (int) (decimalValue(config, "bindTimeout") * 1000);
+        SMPPSession session = newSession(listener, bindTimeoutMillis);
         session.setMessageReceiverListener(dispatcher);
 
         String host = str(config, "host");
@@ -155,9 +177,30 @@ public final class NativeListener {
         BindType bindType = toBindType(str(config, "bindType"));
         int maxConcurrentDispatch = (int) ((Long) config.getIntValue(
                 StringUtils.fromString("maxConcurrentDispatch"))).longValue();
-        // Must be set while the session is still CLOSED (i.e. before connectAndBind).
-        session.setPduProcessorDegree(maxConcurrentDispatch);
-        dispatcher.setAsync("ASYNC".equals(str(config, "responseMode")));
+        boolean async = "ASYNC".equals(str(config, "responseMode"));
+        dispatcher.setAsync(async);
+        // pduProcessorDegree sizes jsmpp's shared PDU-processor pool, which handles ALL
+        // inbound PDUs including the SMSC's enquire_link keepalive. Actual handler
+        // concurrency is bounded by the Dispatcher's Semaphore(maxConcurrentDispatch), not
+        // by this pool size. Must be set while the session is still CLOSED (before
+        // connectAndBind). Sizing is mode-aware:
+        //  - SYNC: handlers run ON these pool threads and block for the handler's duration,
+        //    so the pool must be maxConcurrentDispatch + a reserve. The reserve (never
+        //    occupiable by a blocking handler, since the Semaphore caps that at
+        //    maxConcurrentDispatch) guarantees a thread is always free to answer
+        //    enquire_link - the fix for the self-inflicted drop. Reserve of 1 suffices: all
+        //    outbound sends serialize on one stream, so a second reserve protects nothing.
+        //  - ASYNC: handlers run on virtual threads, so pool threads only marshal each PDU
+        //    and spawn - they never block. A small fixed pool is plenty and avoids spinning
+        //    maxConcurrentDispatch *platform* threads that would only spawn vthreads.
+        int pduProcessorDegree = async
+                ? ASYNC_PDU_PROCESSOR_DEGREE
+                : maxConcurrentDispatch + KEEPALIVE_RESERVE_THREADS;
+        session.setPduProcessorDegree(pduProcessorDegree);
+
+        // Connector's own keepalive/idle-probe interval and socket read timeout (seconds ->
+        // millis). enquireLinkInterval is validated >= 5s, so it never disables detection.
+        session.setEnquireLinkTimer((int) (decimalValue(config, "enquireLinkInterval") * 1000));
 
         // Per-attempt flags. `installed` gates the listener lambda: a CLOSED fired by a
         // rejected/failed bind (jsmpp self-closes inside connectAndBind) is start()'s
@@ -182,7 +225,7 @@ public final class NativeListener {
         });
 
         session.connectAndBind(host, port, bindType, systemId, password, systemType,
-                TypeOfNumber.UNKNOWN, NumberingPlanIndicator.UNKNOWN, null);
+                TypeOfNumber.UNKNOWN, NumberingPlanIndicator.UNKNOWN, null, bindTimeoutMillis);
 
         // LOAD-BEARING CROSS-LIBRARY INVARIANT: this critical section holds stateLock and
         // reads session.getSessionState() (which takes jsmpp's stateProcessorLock), while
@@ -424,28 +467,27 @@ public final class NativeListener {
         }
     }
 
-    // Default TLS TCP-connect + handshake-read timeout; aligns with jsmpp's 60s bind
-    // default. Sprint 4's timer-exposure item owns making timeouts configurable.
-    private static final int TLS_CONNECT_TIMEOUT_MILLIS = 60_000;
-
     /**
-     * Plain {@code new SMPPSession()} unless TLS was resolved at init, in which case a
-     * fresh per-attempt TLS factory is built. Called once per bind attempt (initial
-     * start and every rebind), so there is no factory/SSLContext shared across attempts
-     * - and rotated trust material is picked up on the next rebind for free.
+     * A fresh session per bind attempt. Plaintext uses a connect-timeout-bounded factory
+     * (jsmpp's stock plaintext connect is unbounded); TLS builds a fresh per-attempt factory
+     * with the same connect bound. Called once per bind attempt (initial start and every
+     * rebind), so no factory/SSLContext is shared across attempts - and rotated TLS trust
+     * material is picked up on the next rebind for free. {@code connectTimeoutMillis} bounds
+     * the TCP connect (and, for TLS, the handshake read); the bind-response wait is bounded
+     * separately by the timeout passed to {@code connectAndBind}.
      */
     @SuppressWarnings("unchecked")
-    private static SMPPSession newSession(BObject listener) throws Exception {
+    private static SMPPSession newSession(BObject listener, int connectTimeoutMillis) throws Exception {
         Object tls = listener.getNativeData(NATIVE_TLS);
         if (tls == null) {
-            return new SMPPSession();
+            return new SMPPSession(new SmppPlainConnectionFactory(connectTimeoutMillis));
         }
-        return new SMPPSession(buildSslFactory((BMap<BString, Object>) tls));
+        return new SMPPSession(buildSslFactory((BMap<BString, Object>) tls, connectTimeoutMillis));
     }
 
     /** Field names here mirror listener.bal's internal ResolvedTls record exactly. */
-    private static SmppSslConnectionFactory buildSslFactory(BMap<BString, Object> tls)
-            throws Exception {
+    private static SmppSslConnectionFactory buildSslFactory(BMap<BString, Object> tls,
+            int connectTimeoutMillis) throws Exception {
         return SmppSslConnectionFactory.create(
                 tlsStr(tls, "trustStorePath"),
                 tlsStr(tls, "trustStorePassword").toCharArray(),
@@ -456,7 +498,7 @@ public final class NativeListener {
                 tlsStringArray(tls, "ciphers"),
                 tlsBool(tls, "trustAll"),
                 tlsBool(tls, "verifyHostName"),
-                TLS_CONNECT_TIMEOUT_MILLIS);
+                connectTimeoutMillis);
     }
 
     // The TLS readers below are STRICT: ResolvedTls (listener.bal) is a closed record with

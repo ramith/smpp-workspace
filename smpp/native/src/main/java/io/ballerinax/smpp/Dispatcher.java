@@ -29,6 +29,7 @@ import org.jsmpp.util.MessageId;
 import java.nio.charset.StandardCharsets;
 import java.util.HashSet;
 import java.util.Set;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -84,8 +85,29 @@ public class Dispatcher implements MessageReceiverListener {
     private volatile boolean async = false;
     private final AtomicInteger inFlight = new AtomicInteger(0);
 
-    public Dispatcher(Runtime runtime) {
+    /**
+     * Admission gate for service dispatch, sized to {@code maxConcurrentDispatch}. Lives on
+     * the Dispatcher, which is created once per listener and reused across every rebind
+     * (NativeListener stores it as native data at init and re-reads it in each {@code bind()}),
+     * so the concurrency bound is a property of the service/downstream, NOT of any one TCP
+     * session: handlers still running from a dropped session keep their permits, and the
+     * rebound session's total concurrent execution stays capped. Both SYNC and ASYNC gate on
+     * this with a non-blocking {@code tryAcquire}; overflow is answered with
+     * {@code ESME_RTHROTTLED} rather than blocking a jsmpp PDU-processor thread — that is what
+     * keeps the reserve thread (see NativeListener's degree sizing) free to answer enquire_link.
+     *
+     * <p>Because the bound is per-listener, a handler still running from a session that has
+     * since dropped keeps its permit, so it counts against the rebound session's budget too;
+     * a permanently stuck handler therefore throttles the rebound session until it clears (or
+     * {@code gracefulStop} times out). That is intended for a bound protecting a shared
+     * downstream, and it is the same stuck handler that would already stall the drain.
+     */
+    private final Semaphore permits;
+
+    public Dispatcher(Runtime runtime, int maxConcurrentDispatch) {
         this.runtime = runtime;
+        // Non-fair: tryAcquire never queues, so fairness is irrelevant, and non-fair is faster.
+        this.permits = new Semaphore(maxConcurrentDispatch);
     }
 
     int inFlightCount() {
@@ -113,16 +135,27 @@ public class Dispatcher implements MessageReceiverListener {
         // so a gracefulStop beginning immediately after this call already sees it and
         // its drain genuinely covers the in-flight onError notification.
         inFlight.incrementAndGet();
-        Thread.startVirtualThread(() -> {
-            try {
-                Object result = runtime.callMethod(binding.service(), ON_ERROR, meta, err);
-                if (result instanceof BError callbackErr) {
-                    callbackErr.printStackTrace();
+        boolean spawned = false;
+        try {
+            Thread.startVirtualThread(() -> {
+                try {
+                    Object result = runtime.callMethod(binding.service(), ON_ERROR, meta, err);
+                    if (result instanceof BError callbackErr) {
+                        callbackErr.printStackTrace();
+                    }
+                } finally {
+                    inFlight.decrementAndGet();
                 }
-            } finally {
+            });
+            spawned = true;
+        } finally {
+            // If startVirtualThread threw (e.g. OOM), the vthread's finally never runs, so
+            // undo the increment here - otherwise gracefulStop's drain waits out its full
+            // timeout on a decrement that can never come.
+            if (!spawned) {
                 inFlight.decrementAndGet();
             }
-        });
+        }
     }
 
     void setAsync(boolean async) {
@@ -168,16 +201,18 @@ public class Dispatcher implements MessageReceiverListener {
 
     @Override
     public void onAcceptDeliverSm(DeliverSm deliverSm) throws ProcessRequestException {
-        dispatch(ON_DELIVER_SM, toSms(deliverSm, deliverSm.getShortMessage(), deliverSm.isSmscDeliveryReceipt()));
+        dispatch(ON_DELIVER_SM, deliverSm, deliverSm.getShortMessage(), deliverSm.isSmscDeliveryReceipt());
     }
 
     @Override
     public DataSmResult onAcceptDataSm(DataSm dataSm, Session source) throws ProcessRequestException {
         // DATA_SM has no short_message field at all (unlike DELIVER_SM) - its payload is
         // always carried in the message_payload optional parameter (TLV), if present.
-        dispatch(ON_DATA_SM, toSms(dataSm, new byte[0], false));
+        dispatch(ON_DATA_SM, dataSm, EMPTY_SHORT_MESSAGE, false);
         return new DataSmResult(EMPTY_MESSAGE_ID, new OptionalParameter[0]);
     }
+
+    private static final byte[] EMPTY_SHORT_MESSAGE = new byte[0];
 
     @Override
     public void onAcceptAlertNotification(AlertNotification alertNotification) {
@@ -267,38 +302,80 @@ public class Dispatcher implements MessageReceiverListener {
         return properties;
     }
 
-    private void dispatch(String method, BMap<BString, Object> sms) throws ProcessRequestException {
+    /**
+     * The single admission-gated dispatch path for both PDU types and both response modes.
+     *
+     * <p>Order matters and is load-bearing: the binding/method check and the semaphore
+     * {@code tryAcquire} both happen BEFORE {@code toSms} builds the record. On the reject
+     * path we therefore do essentially no work (no record allocation, no charset decode), so
+     * the jsmpp PDU-processor thread frees in microseconds and the reserve thread stays
+     * available to answer enquire_link. Overflow is a NACK ({@code ESME_RTHROTTLED}), not a
+     * drop: the SMSC never got a positive ack, so it retains the message (at-least-once).
+     *
+     * <p>The only per-mode difference is the success path: SYNC runs the handler inline on
+     * the jsmpp thread (so the {@code deliver_sm_resp}/{@code data_sm_resp} reflects the real
+     * outcome) and ASYNC hands off to a virtual thread and lets jsmpp ack {@code ESME_ROK}.
+     * Every path releases the permit exactly once - the {@code handOff} flag transfers that
+     * responsibility to the virtual thread only once it has actually started.
+     */
+    private void dispatch(String method, AbstractSmCommand pdu, byte[] fallback, boolean deliveryReceipt)
+            throws ProcessRequestException {
         ServiceBinding binding = this.binding;
         if (binding == null || !binding.remoteMethods().contains(method)) {
-            return;
+            return; // no handler for this PDU type; nothing to gate or acknowledge negatively
         }
-        BObject svc = binding.service();
-        // isConcurrentSafe = false -> the runtime serializes dispatch; safe default.
-        StrandMetadata meta = new StrandMetadata(false, null);
-        inFlight.incrementAndGet();
-        if (this.async) {
-            // ASYNC: PDU is already acknowledged (ESME_ROK) by the time this callback
-            // returns; a failure here can no longer become a negative command_status.
-            // Still tracked as in-flight so gracefulStop can wait for it too.
-            Thread.startVirtualThread(() -> {
-                try {
-                    Object result = runtime.callMethod(svc, method, meta, sms);
-                    if (result instanceof BError err) {
-                        err.printStackTrace();
-                    }
-                } finally {
-                    inFlight.decrementAndGet();
-                }
-            });
-            return;
+        if (!permits.tryAcquire()) {
+            // At the maxConcurrentDispatch limit. Reject cheaply (before toSms) with the
+            // SMPP throttle status so the SMSC backs off and retains the message.
+            throw new ProcessRequestException(
+                    "dispatch throttled: maxConcurrentDispatch reached", SMPPConstant.STAT_ESME_RTHROTTLED);
         }
+        // Permit held from here. It must be released on exactly one path below.
+        boolean handOff = false;
         try {
-            Object result = runtime.callMethod(svc, method, meta, sms);
-            if (result instanceof BError err) {
-                throw new ProcessRequestException(err.getMessage(), SMPPConstant.STAT_ESME_RSYSERR, err);
+            BObject svc = binding.service();
+            // isConcurrentSafe = false -> the runtime serializes dispatch; safe default.
+            StrandMetadata meta = new StrandMetadata(false, null);
+            BMap<BString, Object> sms = toSms(pdu, fallback, deliveryReceipt);
+            inFlight.incrementAndGet();
+            if (this.async) {
+                // ASYNC: jsmpp acks ESME_ROK as soon as this callback returns; a failure in
+                // the handler can no longer become a negative command_status. Tracked as
+                // in-flight so gracefulStop drains it too.
+                try {
+                    Thread.startVirtualThread(() -> {
+                        try {
+                            Object result = runtime.callMethod(svc, method, meta, sms);
+                            if (result instanceof BError err) {
+                                err.printStackTrace();
+                            }
+                        } finally {
+                            inFlight.decrementAndGet();
+                            permits.release();
+                        }
+                    });
+                    handOff = true; // the vthread now owns the inFlight decrement and permit release
+                } finally {
+                    if (!handOff) {
+                        // startVirtualThread threw (e.g. OOM): the vthread never ran, so undo
+                        // the increment here; the permit is released by the outer finally.
+                        inFlight.decrementAndGet();
+                    }
+                }
+                return;
+            }
+            try {
+                Object result = runtime.callMethod(svc, method, meta, sms);
+                if (result instanceof BError err) {
+                    throw new ProcessRequestException(err.getMessage(), SMPPConstant.STAT_ESME_RSYSERR, err);
+                }
+            } finally {
+                inFlight.decrementAndGet();
             }
         } finally {
-            inFlight.decrementAndGet();
+            if (!handOff) {
+                permits.release();
+            }
         }
     }
 

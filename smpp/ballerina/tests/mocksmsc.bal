@@ -138,6 +138,39 @@ isolated function mockSmscSetTransactionTimer(int mockId, int connectionId, int 
     name: "setTransactionTimer"
 } external;
 
+# Lowers the connection's enquire_link timer so the mock (as SMSC) probes the connector's
+# liveness frequently. Combined with a short transaction timer, an unanswered probe makes
+# the mock close the session — the self-inflicted-drop path the SYNC keepalive test guards.
+#
+# + mockId - the mock's handle
+# + connectionId - the connection handle from `mockSmscAwaitNextBind`
+# + timeoutMillis - the new enquire_link timer (how often the mock probes when idle)
+# + return - an `error` only on misuse (unknown handle)
+isolated function mockSmscSetEnquireLinkTimer(int mockId, int connectionId, int timeoutMillis)
+        returns error? = @java:Method {
+    'class: "io.ballerinax.smpp.test.MockSmscBridge",
+    name: "setEnquireLinkTimer"
+} external;
+
+# Opens a TCP "black hole": a server that accepts connections but never answers the bind.
+# A connector pointed here completes the TCP connect yet must time out its bind-response
+# wait per `bindTimeout` (rather than jsmpp's hardcoded 60s). Returns a handle for cleanup.
+#
+# + port - the port to listen on
+# + return - the black hole's handle, or an `error` if the socket can't be opened
+isolated function mockSmscOpenBlackHole(int port) returns int|error = @java:Method {
+    'class: "io.ballerinax.smpp.test.MockSmscBridge",
+    name: "openBlackHole"
+} external;
+
+# Closes a black-hole server and drops any sockets it is holding.
+#
+# + blackHoleId - the black hole's handle from `mockSmscOpenBlackHole`
+isolated function mockSmscCloseBlackHole(int blackHoleId) = @java:Method {
+    'class: "io.ballerinax.smpp.test.MockSmscBridge",
+    name: "closeBlackHole"
+} external;
+
 # Opens a TLS-terminating mock SMSC presenting the cert in `serverKeystorePath` (PKCS12).
 # The mock verifies nothing about the client (server-auth TLS); use `mockSmscOpenMutualTls`
 # for mTLS. All other mock operations work identically against the returned handle.

@@ -86,6 +86,8 @@ the listener.
 | `responseMode` | `ResponseMode` | `SYNC` | See [Dispatch concurrency](#dispatch-concurrency-and-response-mode). |
 | `gracefulStopTimeout` | `decimal` | `30` (seconds) | See [Shutting down](#shutting-down). |
 | `rebindPolicy` | `RebindPolicy` | retries indefinitely | See [RebindPolicy](#rebindpolicy). |
+| `enquireLinkInterval` | `decimal` | `60` (seconds) | Connector's own keepalive/idle-probe interval toward the SMSC. See [Dispatch concurrency](#dispatch-concurrency-and-response-mode). |
+| `bindTimeout` | `decimal` | `60` (seconds) | Bounds the connect + bind handshake (initial and every rebind). See [RebindPolicy](#rebindpolicy). |
 | `secureSocket` | `SecureSocket \| InsecureSocket` | none (plaintext) | See [Transport security (TLS)](#transport-security-tls). |
 
 ### Transport security (TLS)
@@ -179,30 +181,68 @@ Every inbound PDU is converted to an `Sms` record (see
 `onDeliverSm` or `onDataSm` method. How and when that dispatch happens is
 controlled by `responseMode`:
 
+`maxConcurrentDispatch` (default `3`) caps how many PDUs are dispatched to
+your service concurrently — in **both** modes. Anything beyond that limit is
+answered immediately with `ESME_RTHROTTLED` (a NACK, so the SMSC backs off and
+retains the message for retry — SMPP is at-least-once), rather than being queued
+unboundedly or spawning unbounded work. The two modes differ only in *when* the
+`deliver_sm_resp`/`data_sm_resp` is sent and whether a handler failure reaches
+the SMSC:
+
 - **`SYNC`** (default) — dispatch waits for your remote method to return
-  before the connector responds to the SMSC. If your method returns
-  successfully, the SMSC gets a positive `deliver_sm_resp`/`data_sm_resp`
-  (`command_status = ESME_ROK`). If it returns an `error`, the SMSC gets a
-  *negative* response instead, so it knows the message wasn't handled and
-  can retry it. `maxConcurrentDispatch` (default `3`) caps how many PDUs can
-  be in flight to your service at once; if the SMSC sends faster than your
-  service drains, PDUs queue up and the SMSC is signaled to throttle rather
-  than being accepted at an unbounded rate.
-- **`ASYNC`** — the connector responds to the SMSC immediately, with a
-  positive `command_status`, before your remote method has even run.
-  `maxConcurrentDispatch` no longer limits handler concurrency, since dispatch
-  doesn't wait (it still sizes jsmpp's internal PDU-processing pool). This trades correctness for throughput: if your method later fails,
-  the SMSC never finds out, and — as of this writing — the failure isn't
-  routed through `ballerina/log` either; it's printed as a raw stack trace
-  on stderr (routing it through `ballerina/log` is tracked as backlog). Use
-  this if you'd rather not have a slow handler apply backpressure to the
-  SMSC connection, and you're prepared to handle failures entirely on your
-  own side (including watching stderr for them, for now).
+  before the connector responds. A successful return yields a positive
+  `deliver_sm_resp`/`data_sm_resp` (`command_status = ESME_ROK`); an `error`
+  return yields a *negative* response (`ESME_RSYSERR`), so the SMSC knows the
+  message wasn't handled and can retry it.
+- **`ASYNC`** — the connector responds immediately with `ESME_ROK`, before your
+  remote method has run. This trades correctness for latency: a later handler
+  failure never reaches the SMSC, and (as of this writing) is printed as a raw
+  stack trace on stderr rather than routed through `ballerina/log` (tracked as
+  backlog). `maxConcurrentDispatch` still bounds concurrent handler executions
+  here (earlier releases documented ASYNC as ignoring it — that is no longer the
+  case); the difference from `SYNC` is the immediate ack, not unbounded dispatch.
 
 If your remote method isn't implemented at all (e.g. a service that only
 implements `onDeliverSm`), an inbound `data_sm` is simply not dispatched
 anywhere — the SMSC still gets a positive response, since there's nothing to
 report as failed.
+
+#### Why a busy service does not stall keepalive
+
+Inbound PDUs and the SMSC's own `enquire_link` keepalive share one jsmpp
+worker pool. If that pool were sized to exactly `maxConcurrentDispatch`, then in
+`SYNC` mode `maxConcurrentDispatch` slow handlers would occupy every thread and
+the SMSC's next `enquire_link` would sit unanswered behind them — the SMSC would
+conclude the link is dead and drop it, a disconnect the connector *provoked
+itself*, which then forces a rebind. Backpressure (throttling the SMSC) is
+intended; a dropped link is not.
+
+To prevent this, the connector decouples handler concurrency from pool size. A
+`Semaphore(maxConcurrentDispatch)` — owned by the dispatcher, so the bound spans
+the listener's whole life, not one session — gates handler *entry* with a
+non-blocking `tryAcquire`; overflow is `ESME_RTHROTTLED`'d without ever blocking
+a pool thread. The pool itself is sized *mode-aware*:
+
+- `SYNC`: `maxConcurrentDispatch + 1`. Handlers run on pool threads and block for
+  the handler's duration, but the semaphore caps blocking handlers at
+  `maxConcurrentDispatch`, so the `+1` reserve thread is never occupiable by a
+  handler and is always free to answer `enquire_link`. One reserve suffices — all
+  outbound sends serialize on a single stream, so a second would protect nothing.
+- `ASYNC`: a small fixed pool. Handlers run on virtual threads, so pool threads
+  only marshal each PDU and spawn — they never block, so keepalive is never
+  starved regardless of `maxConcurrentDispatch`.
+
+Because the semaphore is per-listener, a handler still running from a *dropped*
+session keeps its permit, so it counts against the rebound session's budget too
+(the bound protects a shared downstream, not a single connection). A permanently
+stuck handler therefore throttles the rebound session until it clears or
+`gracefulStop` times out — an intended consequence of a listener-wide bound, and
+the same stuck handler that would already stall the `gracefulStop` drain.
+
+`enquireLinkInterval` is a separate knob: it controls the *connector's own*
+liveness probes toward the SMSC (and its socket read timeout, hence how fast it
+detects a silently dead SMSC and drives `rebindPolicy`) — not how the SMSC's
+probes toward the connector are answered.
 
 ### RebindPolicy
 

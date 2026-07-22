@@ -134,6 +134,15 @@ public final class MockSmscBridge {
         mock(mockId).setTransactionTimer(connectionId, millis);
     }
 
+    /**
+     * Lowers the connection's enquire_link timer so the mock (as SMSC) probes the connector
+     * frequently; with a short transaction timer an unanswered probe closes the session.
+     */
+    public static void setEnquireLinkTimer(long mockId, long connectionId, int millis)
+            throws Exception {
+        mock(mockId).setEnquireLinkTimer(connectionId, millis);
+    }
+
     /** Closes the mock's connections, listener, and pools. Safe to call twice. */
     public static void closeMock(long mockId) {
         MockSmsc mock = MOCKS.remove(mockId);
@@ -148,5 +157,31 @@ public final class MockSmscBridge {
             throw new IllegalArgumentException("no such mock handle: " + mockId);
         }
         return mock;
+    }
+
+    // ---- black-hole server: accepts TCP connections and never answers the bind ----
+
+    private static final ConcurrentHashMap<Long, BlackHole> BLACK_HOLES = new ConcurrentHashMap<>();
+
+    /**
+     * Opens a plain TCP server that accepts connections and then does nothing - it never
+     * reads the bind PDU and never responds. A connector pointed here completes the TCP
+     * connect but its bind-response wait must time out, exercising the configurable
+     * bindTimeout (vs jsmpp's hardcoded 60s default). Returns a handle for cleanup.
+     */
+    public static long openBlackHole(int port) throws Exception {
+        BlackHole hole = new BlackHole(port);
+        hole.start();
+        long id = NEXT_MOCK_ID.getAndIncrement();
+        BLACK_HOLES.put(id, hole);
+        return id;
+    }
+
+    /** Closes a black-hole server and drops any sockets it is holding. */
+    public static void closeBlackHole(long handle) {
+        BlackHole hole = BLACK_HOLES.remove(handle);
+        if (hole != null) {
+            hole.close();
+        }
     }
 }

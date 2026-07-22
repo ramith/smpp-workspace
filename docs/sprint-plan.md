@@ -422,7 +422,7 @@ retried trust failures at rebind) stays deferred with its disabled test stub.
 
 ---
 
-## Sprint 4 — Stop the connector from dropping its own connection
+## Sprint 4 — Stop the connector from dropping its own connection ✅ DONE
 
 **Goal:** the "self-inflicted drop" risk — a slow `SYNC` handler at the *default*
 `maxConcurrentDispatch` (3) can starve jsmpp's shared PDU-processing pool badly enough that
@@ -433,15 +433,33 @@ uncapped resource growth.
 
 | Item | Scope | Est. |
 |---|---|---|
-| Expose `enquireLinkTimer`/`transactionTimer`/`queueCapacity` as config | Wired to the existing `AbstractSession` setters before `connectAndBind`. Gives operators a way to tune the failure window even before the structural fix below. | 4–8h |
-| **(Added by Sprint 2's Phase 4)** Expose/bound the `connectAndBind` bind timeout | jsmpp defaults it to **60s**, and the rebind executor is single-threaded, so a half-open SMSC stalls the whole rebind loop for up to 60s per attempt (recovers, but unbounded). Pass an explicit, configurable bind timeout to `connectAndBind` on both the initial `start()` and every rebind attempt. | 2–4h |
-| Structural fix: decouple handler concurrency from keepalive capacity | Size jsmpp's `pduProcessorDegree` to `maxConcurrentDispatch + a small keepalive reserve`; gate handler entry with a connector-owned `Semaphore(maxConcurrentDispatch)` in `Dispatcher.dispatch()`, rejecting overflow immediately with `ESME_RTHROTTLED` rather than letting it consume a reserved thread. (Note, corrected during fix-planning: routing handler execution to a *separate* thread pool does **not**, by itself, fix this for SYNC mode — SYNC's whole contract is blocking the jsmpp thread until the handler returns, so the reserve-capacity approach is the actual fix, not a relocation of where the blocking happens.) | 16–24h |
-| ASYNC backpressure | A `Semaphore` sized by `maxConcurrentDispatch`, acquired before spawning each ASYNC virtual thread and released in its `finally` — bounds ASYNC to the same bounded-throughput-at-cost-of-latency behavior. Explicit decision: block (`acquireUninterruptibly`), don't drop — SMPP is at-least-once, and a dropped PDU after a positive ack is permanently lost, whereas blocking only adds ack latency. | 5–6h |
+| Expose keepalive/bind config | Two public fields on `ConnectionConfig` (decimal seconds): `enquireLinkInterval` (connector's idle-probe interval + socket read timeout) and `bindTimeout` (below). **Scope corrected during Phase 1:** the plan originally listed `enquireLinkTimer`/`transactionTimer`/`queueCapacity`; on the config-surface review, `transactionTimer` and `queueCapacity` were kept **internal** (safe fixed defaults, additive later) to keep a Central-bound public API minimal, and `enquireLinkTimer` was exposed as the clearer-named `enquireLinkInterval`. | 4–8h |
+| **(Added by Sprint 2's Phase 4)** Expose/bound the connect + bind timeout | jsmpp defaults the bind-response wait to **60s** AND its stock plaintext connect is unbounded (`new Socket(host,port)`); the rebind executor is single-threaded, so a half-open/black-holed SMSC stalls the whole rebind loop. `bindTimeout` now feeds all three sinks — the 10-arg `connectAndBind` (bind-response wait), a new connect-bounded plaintext `SmppPlainConnectionFactory`, and the (previously hardcoded) TLS connect timeout — on both the initial `start()` and every rebind. | 2–4h |
+| Structural fix: decouple handler concurrency from keepalive capacity | Size jsmpp's `pduProcessorDegree` mode-aware (`SYNC` = `maxConcurrentDispatch + 1` reserve; `ASYNC` = a small fixed pool since handlers run on virtual threads); gate handler entry with a per-listener `Semaphore(maxConcurrentDispatch)` in `Dispatcher.dispatch()` using a non-blocking `tryAcquire`, rejecting overflow immediately with `ESME_RTHROTTLED`. (Corrected during fix-planning: routing handler execution to a *separate* thread pool does **not** fix SYNC — SYNC's contract is blocking the jsmpp thread until the handler returns, so the reserve-capacity approach is the actual fix.) | 16–24h |
+| ASYNC backpressure | `maxConcurrentDispatch` now bounds ASYNC too (breaking change vs the shipped "ASYNC ignores it" contract — approved). **Mechanism reversed from the original plan during Phase 1:** the plan proposed *block* (`acquireUninterruptibly`) before spawning; both the Java and adversarial reviewers refuted that — blocking on the pool thread delays the ack (the ROK is sent *after* the callback returns, `SMPPSessionBound.java:52`) and reintroduces keepalive starvation through the ASYNC door. Built instead as the **same non-blocking `tryAcquire` + `ESME_RTHROTTLED` gate as SYNC**; the only per-mode difference is the success path. RTHROTTLED is a NACK, so the SMSC retains/retries — the at-least-once concern the plan raised is satisfied without blocking. | 5–6h |
 
 **Exit gate:** a slow-handler saturation test proving `enquire_link` is still answered
-while every handler slot is occupied; a bounded-concurrency test for ASYNC mode.
+while every handler slot is occupied; a bounded-concurrency test for ASYNC mode. **Met:**
+`testSyncKeepaliveSurvivesSaturatedHandlers` and `testAsyncBoundedConcurrency` (plus
+`testSyncOverflowThrottled`, `testBindTimeoutBoundsHalfOpenConnect`); the keepalive and
+overflow tests are **mutation-verified** (reverting the reserve makes both fail).
 
 **Total: ~25–38h.**
+
+**Phase 5 (adversarial review) disposition:** two independent reviews (Java-concurrency +
+test/doc). The permit lifecycle in `Dispatcher.dispatch()` was re-derived by hand across all
+eight control-flow paths — **exactly-once release, no double-release, no wrong-thread
+release, no `inFlight`/permit desync** that could break the `gracefulStop` drain — and the
+keepalive reserve was proven sufficient (including the TRX handler-reentrant-`submit_sm`
+case, which is moreover unreachable here since the connector is receive-only). A
+**pre-existing** `inFlight` leak (an `startVirtualThread` OOM would hang `gracefulStop` to
+its timeout) was found and fixed in passing (`spawned`-guard in both `dispatch` and
+`dispatchError`). No code-correctness defect survived. All confirmed findings were
+documentation drift, fixed in-sprint: `architecture.md`'s dispatch section (stale
+"ASYNC unbounded"/pool-sizing prose, missing reserve mechanism, missing new config fields,
+and a dangling `types.bal` cross-reference into it), this plan's reversed ASYNC decision and
+overstated config-exposure item (corrected above), and two `types.bal` phrasing nits. A
+test-hygiene gap (no `after` on the bind-timeout test) was closed. Control-byte scan clean.
 
 **Reconciliation note:** architect-reviewer's top-down estimate for the structural fix
 (2–3 engineer-days, 16–24h) and for ASYNC bounding (1–2 days, 8–16h) were both somewhat
