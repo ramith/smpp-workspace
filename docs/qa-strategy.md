@@ -383,20 +383,32 @@ the surrounding Gradle/Ballerina.toml wiring survive as-is.
 
 The JUnit suite (§2.1, 9h estimated) is also done — see its own status note above.
 
-### Phase 1 — Independent coverage, no blockers (~26h)
+### Phase 1 — Independent coverage, no blockers ✅ DONE (Sprint 1)
 
-Everything here only depends on Phase 0's bridge *pattern* existing (not on the fix
-having landed, not on any lifecycle work) — see the consequence note just above. Extend
-`MockSmscBridge.java` with the remaining mock capabilities: an accept-*loop* (currently
-single-shot), bind-credential validation (§3.3), the `data_coding` fixture matrix (§3.5),
-the burst sender (§3.7) (~11h of the remaining mock budget); then `bind_test.bal` (bind
-success + rejection, 3h),
-`sync_dispatch_test.bal` (SYNC positive/negative ack, 3h), `async_dispatch_test.bal`
-(ASYNC ack-before-handler timing, 4h), `data_coding_test.bal` (trimmed to smoke coverage
-per branch given §2.1 owns the full matrix, 3h), `message_payload_test.bal` (precedence
-on both `deliver_sm` and `data_sm`, 2h). None of these touch rebind, `gracefulStop`,
-`immediateStop`, or the abrupt-drop/peer-unbind distinction, so none are affected by
-whatever state the in-flight lifecycle work is in.
+**Status:** shipped in Sprint 1. The bridge was restructured (not just extended) per the
+consequence note above: `MockSmsc.java` is now an instance-based accept-loop server
+(wait-bind offloaded to a small pool, per `StressServer`'s blueprint) with configurable
+bind-credential validation (distinguishing `RINVSYSID`/`RINVPASWD` per
+`SMPPServerSimulator`'s `WaitBindTask`), and `MockSmscBridge.java` is a thin handle-based
+static facade (`openMock`/`awaitNextBind`/`sendDeliverSm`/`sendDataSm`/`closeMock`) — no
+shared singleton state between tests. The five test files all landed: `bind_test.bal`
+(rejection ×2), `sync_dispatch_test.bal` (positive + negative ack, incl. proof the failing
+handler ran before the negative resp), `async_dispatch_test.bal` (ack-before-handler
+ordering via a completion-marker, plus handler-failure-invisible-to-SMSC),
+`data_coding_test.bal` (one smoke case per decoder branch, fixtures verbatim from
+`DispatcherTest.java`), `message_payload_test.bal` (precedence ×4, incl. DATA_SM's
+no-TLV empty fallback). The **burst sender (§3.7) was deferred to Sprint 4** (recorded in
+sprint-plan.md's Sprint 1 scope adjustments — its only consuming test is Sprint 4's
+saturation test, and shipping an untested capability cuts against §2.3's own bar).
+
+**Known gap — fixed test ports (tracked here, referenced from the test files):** each of
+the six `bal test` files binds a hardcoded, file-unique port (27776–27781). Distinct
+ports prevent the files colliding with each other, but nothing protects against an
+unrelated process holding one of them, or against TIME_WAIT rebinding flakiness when two
+tests in one file (e.g. `bind_test.bal`) close and reopen the same port back-to-back.
+The fix (ephemeral port-0 binding + `SMPPServerSessionListener.getPort()` read-back) is
+deliberately deferred until it first flakes in practice or CI parallelism arrives,
+whichever comes first.
 
 ### Phase 2 — Lifecycle-timing coverage (~26h, gated)
 

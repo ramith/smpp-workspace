@@ -2,7 +2,6 @@
 package io.ballerinax.smpp;
 
 import io.ballerina.runtime.api.Environment;
-import io.ballerina.runtime.api.creators.ErrorCreator;
 import io.ballerina.runtime.api.utils.StringUtils;
 import io.ballerina.runtime.api.values.BDecimal;
 import io.ballerina.runtime.api.values.BMap;
@@ -60,12 +59,19 @@ public final class NativeListener {
     }
 
     public static Object attach(BObject listener, BObject service, Object name) {
-        dispatcher(listener).setService(service);
+        if (!dispatcher(listener).setService(service)) {
+            return ModuleUtils.createError(
+                    "attached service does not implement any of the supported remote methods "
+                            + "(onDeliverSm, onDataSm, onError)");
+        }
         return null;
     }
 
     public static Object detach(BObject listener, BObject service) {
-        dispatcher(listener).setService(null);
+        Dispatcher dispatcher = dispatcher(listener);
+        if (service == dispatcher.getService()) {
+            dispatcher.setService(null);
+        }
         return null;
     }
 
@@ -74,8 +80,7 @@ public final class NativeListener {
             bind(listener, config(listener));
             return null;
         } catch (Exception e) {
-            return ErrorCreator.createError(
-                    StringUtils.fromString("failed to connect/bind to SMSC: " + e.getMessage()));
+            return ModuleUtils.createError("failed to connect/bind to SMSC: " + e.getMessage());
         }
     }
 
@@ -221,8 +226,7 @@ public final class NativeListener {
             try {
                 session.unbindAndClose();
             } catch (Exception e) {
-                return ErrorCreator.createError(
-                        StringUtils.fromString("failed to unbind SMSC session: " + e.getMessage()));
+                return ModuleUtils.createError("failed to unbind SMSC session: " + e.getMessage());
             }
         }
         return null;

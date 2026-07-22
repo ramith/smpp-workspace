@@ -16,7 +16,11 @@ public isolated class Listener {
     # Creates a new SMPP listener for the given SMSC connection configuration.
     #
     # + config - the connection/bind configuration
+    # + return - an `Error` if `config` fails validation (see the field docs on
+    #   `ConnectionConfig`/`RebindPolicy` for the exact bounds checked), or if the
+    #   native listener setup fails
     public isolated function init(ConnectionConfig config) returns error? {
+        check validateConfig(config);
         check self.externInit(config);
     }
 
@@ -27,12 +31,20 @@ public isolated class Listener {
 
     # Attaches a service to this listener. Invoked automatically by the runtime
     # for `service ... on listener { }` declarations.
+    #
+    # + s - the service to attach
+    # + name - unused; part of the standard listener contract
+    # + return - an `Error` if `s` implements none of `onDeliverSm`, `onDataSm`, `onError`
     public isolated function attach(Service s, string[]|string? name = ()) returns error? = @java:Method {
         'class: "io.ballerinax.smpp.NativeListener",
         name: "attach"
     } external;
 
-    # Detaches a previously attached service.
+    # Detaches a previously attached service. A no-op if `s` is not the service
+    # currently attached to this listener.
+    #
+    # + s - the service to detach
+    # + return - never returns an error today; typed `error?` per the listener contract
     public isolated function detach(Service s) returns error? = @java:Method {
         'class: "io.ballerinax.smpp.NativeListener",
         name: "detach"
@@ -65,3 +77,42 @@ public isolated class Listener {
 # methods is delegated to the native dispatcher at runtime.
 public type Service distinct service object {
 };
+
+# Validates `config` against the bounds documented on `ConnectionConfig`/`RebindPolicy`,
+# before any native listener setup happens.
+#
+# + config - the configuration to validate
+# + return - an `Error` describing the first violated constraint, or `()` if valid
+isolated function validateConfig(ConnectionConfig config) returns error? {
+    if config.port < 1 || config.port > 65535 {
+        return error Error(string `port must be between 1 and 65535, got ${config.port}`);
+    }
+    if config.maxConcurrentDispatch < 1 {
+        return error Error(string `maxConcurrentDispatch must be at least 1, got ${config.maxConcurrentDispatch}`);
+    }
+    if config.gracefulStopTimeout < 0d {
+        return error Error(string `gracefulStopTimeout must not be negative, got ${config.gracefulStopTimeout}`);
+    }
+    check validateRebindPolicy(config.rebindPolicy);
+}
+
+# Validates a `RebindPolicy` against its documented bounds.
+#
+# + policy - the policy to validate
+# + return - an `Error` describing the first violated constraint, or `()` if valid
+isolated function validateRebindPolicy(RebindPolicy policy) returns error? {
+    if policy.initialRebindDelay < 0d {
+        return error Error(string `rebindPolicy.initialRebindDelay must not be negative, got ${policy.initialRebindDelay}`);
+    }
+    if policy.maxRebindDelay < policy.initialRebindDelay {
+        return error Error(string `rebindPolicy.maxRebindDelay (${policy.maxRebindDelay}) must be >= initialRebindDelay (${policy.initialRebindDelay})`);
+    }
+    if policy.backOffMultiplier < 1d {
+        return error Error(string `rebindPolicy.backOffMultiplier must be at least 1, got ${policy.backOffMultiplier}`);
+    }
+    if policy.maxRebindAttempts < -1 {
+        // Only -1 means "infinite"; other negatives are almost certainly typos (e.g. -3
+        // intending 3) and would otherwise silently behave as infinite too.
+        return error Error(string `rebindPolicy.maxRebindAttempts must be -1 (infinite), 0 (disabled), or positive, got ${policy.maxRebindAttempts}`);
+    }
+}

@@ -18,7 +18,9 @@ A listener goes through four phases:
    activity happens yet.
 2. **`'start()`** — opens a TCP connection to the SMSC and performs the SMPP
    bind handshake (`bind_receiver` or `bind_transceiver`, depending on
-   `bindType`). If this fails — wrong credentials, unreachable host, the SMSC
+   `bindType`). If this fails — wrong credentials, an oversized credential
+   (rejected locally before any connection is attempted; see the SMPP length
+   limits in the configuration reference), unreachable host, the SMSC
    rejects the bind — `'start()` returns an `error` and nothing further
    happens; this is not retried automatically.
 3. **Running** — once bound, the SMSC pushes `deliver_sm` and `data_sm` PDUs
@@ -36,14 +38,21 @@ SMSC closes it, a network blip severs it, and so on. When this happens (and
 only when it happens outside of your own `gracefulStop()`/`immediateStop()`
 call):
 
-- Your service's `onError` method is notified once, if you've implemented it.
+- Your service's `onError` method is notified immediately, if you've
+  implemented it (if you haven't, the error is printed as a stack trace on
+  stderr instead — same caveat as ASYNC failures below).
 - The listener then automatically attempts to rebind, governed by
   `ConnectionConfig.rebindPolicy` — see [RebindPolicy](#rebindpolicy) below.
-  By default this retries indefinitely with exponential backoff. If you'd
-  rather handle reconnection yourself, set `rebindPolicy.maxRebindAttempts`
-  to `0` to disable it; you'll still get the one `onError` notification.
+  By default this retries indefinitely with exponential backoff. **Every**
+  failed rebind attempt notifies `onError` again — not just the initial drop
+  or the final give-up — so during an extended outage `onError` can fire
+  many times in a row, once per failed attempt. If you'd rather handle
+  reconnection yourself, set `rebindPolicy.maxRebindAttempts` to `0` to
+  disable it; you'll still get the one `onError` notification for the
+  initial drop.
 - If automatic rebinding is enabled and eventually exhausts
-  `maxRebindAttempts`, `onError` is notified a final time.
+  `maxRebindAttempts`, `onError` is notified one final time reporting the
+  give-up.
 - A successful rebind resumes normal operation silently — there's no
   separate "reconnected" notification, since the next successfully
   dispatched PDU is itself evidence that things are working again.
@@ -104,12 +113,14 @@ controlled by `responseMode`:
   than being accepted at an unbounded rate.
 - **`ASYNC`** — the connector responds to the SMSC immediately, with a
   positive `command_status`, before your remote method has even run.
-  `maxConcurrentDispatch` no longer limits anything, since dispatch doesn't
-  wait. This trades correctness for throughput: if your method later fails,
-  the SMSC never finds out — the only place that failure is visible is
-  `ballerina/log`. Use this if you'd rather not have a slow handler apply
-  backpressure to the SMSC connection, and you're prepared to handle
-  failures entirely on your own side.
+  `maxConcurrentDispatch` no longer limits handler concurrency, since dispatch
+  doesn't wait (it still sizes jsmpp's internal PDU-processing pool). This trades correctness for throughput: if your method later fails,
+  the SMSC never finds out, and — as of this writing — the failure isn't
+  routed through `ballerina/log` either; it's printed as a raw stack trace
+  on stderr (routing it through `ballerina/log` is tracked as backlog). Use
+  this if you'd rather not have a slow handler apply backpressure to the
+  SMSC connection, and you're prepared to handle failures entirely on your
+  own side (including watching stderr for them, for now).
 
 If your remote method isn't implemented at all (e.g. a service that only
 implements `onDeliverSm`), an inbound `data_sm` is simply not dispatched
@@ -167,6 +178,7 @@ public type Sms record {|
     string sourceAddr;
     string destAddr;
     string shortMessage;
+    byte[] shortMessageBytes = [];
     boolean deliveryReceipt = false;
     map<anydata> properties = {};
 |};
@@ -190,8 +202,17 @@ public type Sms record {|
   as packed 7-bit septets or one byte per character over SMPP varies by
   vendor, so guessing here would risk a subtler bug than the one being
   avoided. If your SMSC sends GSM 7-bit content and the UTF-8 fallback
-  doesn't decode correctly for you, use `properties.dataCoding` to detect it
-  and decode the message yourself.
+  doesn't decode correctly for you (or anything else the UTF-8 fallback gets
+  wrong), use `properties.dataCoding` to detect it and `shortMessageBytes`
+  (below) to decode the real bytes yourself — re-decoding `shortMessage`
+  itself is not a reliable path back to the original bytes once a lossy
+  UTF-8 fallback has already been applied.
+- **`shortMessageBytes`** — the same payload as `shortMessage`, before any
+  charset decoding: the exact bytes left after resolving the
+  `message_payload`-over-`short_message` precedence rule described above,
+  but before `shortMessage`'s `data_coding`-driven decode is applied. This
+  is the actual escape hatch for GSM 7-bit default-alphabet payloads and
+  any other `data_coding` this connector doesn't decode precisely.
 - **`deliveryReceipt`** — see `onDeliverSm` above.
 - **`properties`** — protocol metadata not promoted to a typed field:
   - `dataCoding` (`int`) — the raw `data_coding` value.
@@ -199,7 +220,7 @@ public type Sms record {|
     (`int`) — type-of-number and numbering-plan-indicator for each address.
   - `esmClass` (`int`) — the raw `esm_class` byte.
   - `udhi` (`boolean`) — the User Data Header Indicator bit of `esm_class`.
-    When set, the message is part of a concatenated (multipart) or contains
+    When set, the message is part of a concatenated (multipart) message or contains
     binary user data; this connector does not reassemble multipart messages
     or parse the header — you receive each segment independently if `udhi`
     is set.

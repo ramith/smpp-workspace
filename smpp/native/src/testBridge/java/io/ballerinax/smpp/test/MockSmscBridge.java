@@ -1,86 +1,95 @@
-// Copyright (c) 2026. Minimal test-only mock SMSC bridge for bal test.
+// Copyright (c) 2026. Thin static facade exposing MockSmsc instances to bal test.
 package io.ballerinax.smpp.test;
 
 import io.ballerina.runtime.api.values.BString;
-import org.jsmpp.bean.ESMClass;
-import org.jsmpp.bean.GeneralDataCoding;
-import org.jsmpp.bean.NumberingPlanIndicator;
-import org.jsmpp.bean.OptionalParameter;
-import org.jsmpp.bean.RegisteredDelivery;
-import org.jsmpp.bean.TypeOfNumber;
-import org.jsmpp.session.BindRequest;
-import org.jsmpp.session.SMPPServerSession;
-import org.jsmpp.session.SMPPServerSessionListener;
 
-import java.nio.charset.StandardCharsets;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * A minimal, single-connection, test-only mock SMSC: open a listening socket, accept and
- * bind exactly one connection, send one {@code data_sm} PDU. Exposed to {@code bal test}
- * (see {@code tests/mocksmsc.bal}) via plain-Java-typed static methods, so no
- * Ballerina-runtime types are needed here at all.
+ * The {@code @java:Method} surface consumed by {@code tests/mocksmsc.bal}. Maps opaque
+ * {@code long} handles to {@link MockSmsc} instances (and, within each mock, to accepted
+ * connections), so multiple tests — or multiple connections within one test — never
+ * collide through shared static session state (Sprint 0's single-shot design did exactly
+ * that, deliberately, for its one test; Sprint 1's multi-test suite can't).
  *
- * <p>This is deliberately not the general-purpose mock SMSC described in
- * docs/qa-strategy.md (accept-loop, configurable bind validation, bursts, etc.) - it is
- * scoped to exactly what Sprint 0 needs to prove the {@code data_sm} fix through a real
- * {@code bal test} round trip (see docs/sprint-plan.md). The fuller rewrite is deferred to
- * when Sprint 1 needs it for bind/SYNC/ASYNC coverage.
+ * <p>The only Ballerina-runtime-typed file in this source set: Ballerina {@code string}
+ * interops as {@link BString}, not {@code java.lang.String} (and Ballerina {@code byte[]}
+ * doesn't interop-map onto Java's signed {@code byte[]} at all) — payload text crosses
+ * the boundary as {@code BString} and is charset-encoded on the Java side per the PDU's
+ * {@code data_coding}, mirroring {@code Dispatcher.decodeShortMessage}.
  */
 public final class MockSmscBridge {
 
-    private static SMPPServerSessionListener listener;
-    private static SMPPServerSession session;
+    private static final AtomicLong NEXT_MOCK_ID = new AtomicLong(1);
+    private static final ConcurrentHashMap<Long, MockSmsc> MOCKS = new ConcurrentHashMap<>();
 
     private MockSmscBridge() {}
 
-    /** Opens the listening socket. Does not block - accepting a connection is a separate step. */
-    public static void openListener(int port) throws Exception {
-        listener = new SMPPServerSessionListener(port);
+    /** Opens a listening socket and starts the accept-loop; returns the mock's handle. */
+    public static long openMock(int port) throws Exception {
+        MockSmsc mock = new MockSmsc(port);
+        mock.start();
+        long id = NEXT_MOCK_ID.getAndIncrement();
+        MOCKS.put(id, mock);
+        return id;
     }
 
     /**
-     * Blocks until a connection arrives and the bind handshake completes. Call this
-     * concurrently with the connector's own {@code 'start()} (e.g. via a Ballerina
-     * {@code start} expression) - both sides of a bind block until the other is ready.
+     * Configures the mock to only accept binds carrying exactly these credentials,
+     * rejecting others with the distinguishing SMPP status code (invalid-systemId vs
+     * invalid-password). Call before the connector's {@code 'start()}.
      */
-    public static void acceptAndBind(long bindTimeoutMillis) throws Exception {
-        session = listener.accept();
-        BindRequest bindRequest = session.waitForBind(bindTimeoutMillis);
-        bindRequest.accept("mock-smsc");
+    public static void expectCredentials(long mockId, BString systemId, BString password) {
+        mock(mockId).expectCredentials(systemId.getValue(), password.getValue());
     }
 
     /**
-     * Sends one data_sm PDU carrying {@code payload} (UTF-8 encoded) as a message_payload
-     * TLV. Takes a {@link BString} (Ballerina's interop representation of {@code string} -
-     * a plain {@code java.lang.String} parameter does not interop-match) rather than
-     * {@code byte[]} - Ballerina's {@code byte} (0-255) doesn't interop-map cleanly onto
-     * Java's signed {@code byte} either. Exact byte-level payload fidelity is already
-     * covered by the JUnit decode-matrix suite (DispatcherTest), not something this
-     * end-to-end test needs to re-prove.
+     * Blocks until the next bind attempt on this mock resolves. Returns the accepted
+     * connection's handle, or throws the rejection/failure (surfaced to Ballerina as an
+     * {@code error} per the extern's {@code returns long|error} contract).
      */
-    public static void sendDataSm(BString payload) throws Exception {
-        byte[] bytes = payload.getValue().getBytes(StandardCharsets.UTF_8);
-        session.dataShortMessage(
-                "", TypeOfNumber.INTERNATIONAL, NumberingPlanIndicator.ISDN, "12345",
-                TypeOfNumber.INTERNATIONAL, NumberingPlanIndicator.ISDN, "99999",
-                new ESMClass(), new RegisteredDelivery((byte) 0),
-                new GeneralDataCoding(),
-                new OptionalParameter.Message_payload(bytes));
+    public static long awaitNextBind(long mockId, long timeoutMillis) throws Exception {
+        return mock(mockId).awaitNextBind(timeoutMillis);
     }
 
-    /** Best-effort cleanup; safe to call even if {@link #openListener} was never called. */
-    public static void close() {
-        if (session != null) {
-            session.unbindAndClose();
-            session = null;
+    /**
+     * Sends a deliver_sm on the given connection and blocks for its deliver_sm_resp.
+     * {@code messagePayload} being an empty string means "no message_payload TLV"
+     * (Ballerina has no clean null-string interop for this direction; empty-means-absent
+     * is documented on the .bal wrapper).
+     */
+    public static void sendDeliverSm(long mockId, long connectionId, BString shortMessage,
+                                     BString messagePayload, int dataCoding) throws Exception {
+        String payload = messagePayload.getValue();
+        mock(mockId).sendDeliverSm(connectionId, shortMessage.getValue(),
+                payload.isEmpty() ? null : payload, dataCoding);
+    }
+
+    /**
+     * Sends a data_sm on the given connection and blocks for its data_sm_resp.
+     * {@code messagePayload} being an empty string means "no message_payload TLV at all"
+     * (exercises the connector's DATA_SM empty-fallback path).
+     */
+    public static void sendDataSm(long mockId, long connectionId, BString messagePayload,
+                                  int dataCoding) throws Exception {
+        String payload = messagePayload.getValue();
+        mock(mockId).sendDataSm(connectionId, payload.isEmpty() ? null : payload, dataCoding);
+    }
+
+    /** Closes the mock's connections, listener, and pools. Safe to call twice. */
+    public static void closeMock(long mockId) {
+        MockSmsc mock = MOCKS.remove(mockId);
+        if (mock != null) {
+            mock.close();
         }
-        if (listener != null) {
-            try {
-                listener.close();
-            } catch (Exception ignored) {
-                // best-effort cleanup
-            }
-            listener = null;
+    }
+
+    private static MockSmsc mock(long mockId) {
+        MockSmsc mock = MOCKS.get(mockId);
+        if (mock == null) {
+            throw new IllegalArgumentException("no such mock handle: " + mockId);
         }
+        return mock;
     }
 }

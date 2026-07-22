@@ -123,11 +123,32 @@ finding, and was not carried into this document.)
 
 ---
 
-## Sprint 1 — Make the public API fail loudly instead of silently
+## Sprint 1 — Make the public API fail loudly instead of silently ✅ DONE
 
 **Goal:** every item here is a `.bal`-layer or thin native-boundary safety net; none
 touches the lifecycle state machine, so this can proceed independently of (and before)
 Sprint 2's riskier rewrite.
+
+**Outcome:** all six items shipped, plus the mock-bridge restructure and the five Phase-1
+test files (see the scope adjustments below and qa-strategy.md's Phase 1 status). Exit
+gate passed: 20 JUnit + 11 `bal test` cases green on a clean build. Phase 5's adversarial
+review (3 reviewers) caught one real Medium bug in the sprint's own flagship guard —
+`Dispatcher.setService` assigned the new service *before* validating it, so a rejected
+`attach` silently clobbered a previously attached valid service (found independently by
+two reviewers; fixed by validating first, with no state change on rejection) — plus
+several confirmed smaller items, all fixed in-sprint: a `body.clone()` defensive copy for
+`shortMessageBytes` (the BArray wraps rather than copies, and jsmpp's getters return
+internal arrays), a `maxRebindAttempts < -1` validation floor (other negatives silently
+meant "infinite"), bounds documentation on the `ConnectionConfig`/`RebindPolicy` field
+docs that `init`'s doc pointed at, always-run mock cleanup in every test file (an erroring
+`gracefulStop` would have skipped the mock close and leaked the port into the next test),
+a defensive listener stop in `bind_test`'s cleanup (a wrongly-accepted bind would
+otherwise start an infinite rebind loop against a dead port for the rest of the suite),
+negative tests for the new config validation itself (it had shipped untested), and a
+handful of architecture.md accuracy nits. Three genuinely new, out-of-scope findings were
+appended to Sprint 2's table rather than fixed here: `deregisterListener` never being
+called, the `service`/`remoteMethods` torn two-volatile publication, and double-`attach()`
+silently replacing a valid service.
 
 | Item | Scope | Est. |
 |---|---|---|
@@ -144,6 +165,35 @@ against this sprint's code. None of these tests touch rebind/stop timing, so the
 unaffected by Sprint 2 happening after this.
 
 **Total: ~11–13h of fixes + ~26h of Phase-1 test-writing ≈ 37–39h.**
+
+**Phase 1 (team review) scope adjustments — recorded before implementation, per
+docs/development-process.md:**
+
+- **Burst-sending deferred to Sprint 4.** qa-strategy.md's Phase 1 narrative bundled the
+  burst sender into this sprint's mock work, but Sprint 1's exit gate never consumes it —
+  `maxConcurrentDispatch` saturation is Sprint 4's exit gate. Building it now would ship an
+  untested capability, against this project's own bar. Sprint 4 builds it alongside the
+  test that exercises it.
+- **Per-test `after:` instead of `@test:AfterEach`.** Verified against the Ballerina
+  distribution's own examples: `@test:BeforeEach`/`@test:AfterEach` are *suite-global*
+  (they fire around every test function in the whole module, not just their own file).
+  With six test files that would mean six suite-wide cleanup hooks firing after every
+  single test. All new test files use `@test:Config { after: <fn> }` (per-test scope),
+  and `data_sm_test.bal`'s Sprint 0 `@test:AfterEach` is retrofitted in the same pass.
+- **The bridge restructure changes `openListener`'s signature** (returns a handle — the
+  mock is no longer a singleton), so Sprint 0's `data_sm_test.bal` must be migrated onto
+  the new handle-based API (~1h, previously uncosted). The Gradle/Ballerina.toml wiring
+  survives as-is, as qa-strategy.md predicted; the "openListener/close survive as-is"
+  claim did not.
+- **Error-type coherence:** the new `.bal`-level config-validation errors construct the
+  same distinct `smpp:Error` type that the native layer is being wired to produce this
+  sprint (via Ballerina's `error Error(...)` constructor), so `err is smpp:Error` matches
+  uniformly across the whole public API. Verified `ErrorCreator.createDistinctError(
+  typeName, module, message)` exists on ballerina-rt 2201.13.4 and produces a matchable
+  distinct error, and `ValueCreator.createArrayValue(byte[])` round-trips unsigned bytes
+  correctly for `shortMessageBytes`.
+- Net effort materially unchanged: burst deferral (−3–4h) offsets the handle-registry
+  design + `data_sm_test.bal` migration (+3h).
 
 **Reconciliation note:** architect-reviewer's top-down estimate for "service-shape
 validation" was 1–1.5 engineer-days (8–12h); ballerina-developer's bottom-up estimate,
@@ -172,6 +222,9 @@ isolated sprint — no other lifecycle-touching work happens concurrently with i
 | `bound`-flag race window fix, riding the same lock | After `connectAndBind()` returns, re-acquire the lock, confirm state is still `STARTING`/`STARTED` before installing the session; if a drop is detected in the sliver before the lock is reacquired, `bind()` itself explicitly checks `session.getSessionState()` and manually invokes the drop-handling path rather than relying solely on the listener callback having fired (guarded by a per-attempt `dropReported` flag so the lambda and this manual check can't double-report). Flagged as the hardest-to-test item in this sprint — needs a socket-harness test (a fake SMSC that closes the connection immediately post-accept, looped, asserting `onError` fires exactly once, never zero), not just code inspection. | 4–5h |
 | `scheduleRebind`/`attemptRebind` TOCTOU fix | Naturally closed by doing the state check and the `.schedule()` call inside the same lock the stop path uses. Add a belt-and-suspenders `try/catch(Throwable)` around the scheduled task body regardless, so any exception (including one from a future refactor mistake) surfaces via the existing `onError` channel instead of vanishing into a discarded `ScheduledFuture`. | 2h |
 | `onError` virtual thread tracked by `inFlight` | Mirror the existing ASYNC-dispatch pattern in `dispatchError()` — increment/decrement the same `inFlight` counter around the virtual thread, so `gracefulStop`'s drain genuinely covers it. | 2–3h |
+| **(Added by Sprint 1's Phase 5 review)** `deregisterListener` never called | `initListener` registers the listener with the runtime; neither `gracefulStop` nor `immediateStop` ever deregisters. Empirically the `bal test` JVM still exits promptly, but for a `bal run` program a stopped-but-registered dynamic listener may pin the scheduler alive. Investigate and pair register/deregister as part of the stop paths (the ActiveMQ module this build is modeled on deregisters in stop). | 1–2h |
+| **(Added by Sprint 1's Phase 5 review)** `service`/`remoteMethods` torn publication | `Dispatcher.setService` writes two separate volatiles; a PDU thread can observe the new service with the old method set (attach/detach while bound and receiving — nothing does this today, but attach is public API on a running listener). Fold into this sprint's atomicity work: a single volatile immutable holder for (service, methods). | 1h |
+| **(Added by Sprint 1's Phase 5 review)** double-`attach()` silently replaces | A second *valid* service attached to the same listener overwrites the first with no diagnostic (last-writer-wins). Sprint 1 fixed the *rejected*-service clobber (validate-before-assign); the silent replacement of a valid service by another valid one remains. Decide and enforce: either reject a second attach with a clear error (matching this sprint's one-way-lifecycle philosophy) or document single-service-per-listener loudly. | 1–2h |
 
 **Exit gate:** qa-strategy.md's Phase-2 lifecycle-timing tests — double-`start()`
 rejection, restart-after-stop rejection, rebind backoff/exhaustion, `gracefulStop` vs

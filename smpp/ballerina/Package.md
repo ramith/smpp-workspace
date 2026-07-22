@@ -10,11 +10,14 @@ SMS and delivery receipts) by wrapping the Java library
 import ramith/smpp;
 import ballerina/io;
 
+configurable string systemId = ?;
+configurable string password = ?;
+
 listener smpp:Listener smsListener = check new ({
     host: "localhost",
     port: 2775,
-    systemId: "test",
-    password: "test",
+    systemId,
+    password,
     bindType: smpp:RECEIVER
 });
 
@@ -23,4 +26,12 @@ service on smsListener {
         io:println(string `SMS from ${sms.sourceAddr}: ${sms.shortMessage}`);
     }
 }
+```
+
+Supply the credentials via a `Config.toml` next to your `Ballerina.toml` (never
+hardcode them in source):
+
+```toml
+systemId = "your-system-id"
+password = "your-password"
 ```

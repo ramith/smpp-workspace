@@ -3,7 +3,6 @@ package io.ballerinax.smpp;
 
 import io.ballerina.runtime.api.Runtime;
 import io.ballerina.runtime.api.concurrent.StrandMetadata;
-import io.ballerina.runtime.api.creators.ErrorCreator;
 import io.ballerina.runtime.api.creators.ValueCreator;
 import io.ballerina.runtime.api.types.MethodType;
 import io.ballerina.runtime.api.types.ObjectType;
@@ -96,7 +95,7 @@ public class Dispatcher implements MessageReceiverListener {
      */
     void dispatchError(String message) {
         BObject svc = this.service;
-        BError err = ErrorCreator.createError(StringUtils.fromString(message));
+        BError err = ModuleUtils.createError(message);
         if (svc == null || !this.remoteMethods.contains(ON_ERROR)) {
             err.printStackTrace();
             return;
@@ -114,16 +113,35 @@ public class Dispatcher implements MessageReceiverListener {
         this.async = async;
     }
 
-    void setService(BObject service) {
-        this.service = service;
+    BObject getService() {
+        return this.service;
+    }
+
+    /**
+     * Validates before assigning: a rejected service must leave any previously attached
+     * service fully intact (assigning first would silently detach a valid service and
+     * leave the rejected one installed even though attach reported failure).
+     *
+     * @return {@code true} if {@code service} is {@code null} (clearing is always
+     *     accepted), or implements at least one of {@code onDeliverSm}/{@code onDataSm}/
+     *     {@code onError}; {@code false} (with no state change) if a non-null service
+     *     implements none of them
+     */
+    boolean setService(BObject service) {
         Set<String> names = new HashSet<>();
         if (service != null) {
             ObjectType objType = (ObjectType) TypeUtils.getReferredType(TypeUtils.getType(service));
             for (MethodType method : objType.getMethods()) {
                 names.add(method.getName());
             }
+            if (!names.contains(ON_DELIVER_SM) && !names.contains(ON_DATA_SM)
+                    && !names.contains(ON_ERROR)) {
+                return false;
+            }
         }
+        this.service = service;
         this.remoteMethods = names;
+        return true;
     }
 
     @Override
@@ -169,6 +187,10 @@ public class Dispatcher implements MessageReceiverListener {
         byte[] body = payloadBytes(pdu, shortMessage);
         sms.put(StringUtils.fromString("shortMessage"),
                 StringUtils.fromString(decodeShortMessage(body, pdu.getDataCoding())));
+        // clone(): createArrayValue wraps (doesn't copy) the array, and jsmpp's bean
+        // getters return their internal arrays - don't let the user-visible record share
+        // a buffer with jsmpp internals, even though no post-dispatch mutator exists today.
+        sms.put(StringUtils.fromString("shortMessageBytes"), ValueCreator.createArrayValue(body.clone()));
         sms.put(StringUtils.fromString("deliveryReceipt"), deliveryReceipt);
         sms.put(StringUtils.fromString("properties"), toProperties(pdu));
         return sms;
