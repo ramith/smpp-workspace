@@ -447,27 +447,42 @@ public final class NativeListener {
     private static SmppSslConnectionFactory buildSslFactory(BMap<BString, Object> tls)
             throws Exception {
         return SmppSslConnectionFactory.create(
-                str(tls, "trustStorePath"),
-                str(tls, "trustStorePassword").toCharArray(),
-                str(tls, "trustCertPath"),
-                str(tls, "keyStorePath"),
-                str(tls, "keyStorePassword").toCharArray(),
-                stringArray(tls, "protocolVersions"),
-                stringArray(tls, "ciphers"),
-                bool(tls, "trustAll"),
-                bool(tls, "verifyHostName"),
+                tlsStr(tls, "trustStorePath"),
+                tlsStr(tls, "trustStorePassword").toCharArray(),
+                tlsStr(tls, "trustCertPath"),
+                tlsStr(tls, "keyStorePath"),
+                tlsStr(tls, "keyStorePassword").toCharArray(),
+                tlsStringArray(tls, "protocolVersions"),
+                tlsStringArray(tls, "ciphers"),
+                tlsBool(tls, "trustAll"),
+                tlsBool(tls, "verifyHostName"),
                 TLS_CONNECT_TIMEOUT_MILLIS);
     }
 
-    private static boolean bool(BMap<BString, Object> map, String key) {
-        return Boolean.TRUE.equals(map.get(StringUtils.fromString(key)));
+    // The TLS readers below are STRICT: ResolvedTls (listener.bal) is a closed record with
+    // no nilable fields, so a null here means the .bal record and this native reader have
+    // drifted out of sync - a programming error, never a config value. We fail loudly
+    // rather than defaulting, because a silently-defaulted verifyHostName (false) would
+    // turn hostname verification off - a fail-open the lenient config readers must not risk.
+    private static Object tlsRequire(BMap<BString, Object> tls, String key) {
+        Object v = tls.get(StringUtils.fromString(key));
+        if (v == null) {
+            throw new IllegalStateException(
+                    "internal error: TLS field '" + key + "' missing from ResolvedTls");
+        }
+        return v;
     }
 
-    private static String[] stringArray(BMap<BString, Object> map, String key) {
-        BArray arr = (BArray) map.get(StringUtils.fromString(key));
-        if (arr == null || arr.size() == 0) {
-            return new String[0];
-        }
+    private static String tlsStr(BMap<BString, Object> tls, String key) {
+        return ((BString) tlsRequire(tls, key)).getValue();
+    }
+
+    private static boolean tlsBool(BMap<BString, Object> tls, String key) {
+        return (Boolean) tlsRequire(tls, key);
+    }
+
+    private static String[] tlsStringArray(BMap<BString, Object> tls, String key) {
+        BArray arr = (BArray) tlsRequire(tls, key);   // present-but-empty is valid (JVM defaults)
         String[] out = new String[(int) arr.size()];
         for (int i = 0; i < out.length; i++) {
             out[i] = arr.getBString(i).getValue();

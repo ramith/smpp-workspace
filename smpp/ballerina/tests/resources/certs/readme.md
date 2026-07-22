@@ -9,9 +9,12 @@ never use any of this material for anything real.** Every store's password is
 | `server-keystore.p12` | mock SMSC's cert + private key (`CN=localhost`, SAN `localhost`/`127.0.0.1`) | the mock (presents this cert) |
 | `client-truststore.p12` | only the server's public cert | connector (verifies the mock) |
 | `server.crt` | the server's public cert, PEM | connector's PEM `cert` path form |
-| `wrong-truststore.p12` | an unrelated cert — deliberately **also** `CN=localhost`, so the negative test can only fail on chain-of-trust, never on hostname | connector (negative test) |
+| `wrong-truststore.p12` | an unrelated cert — deliberately **also** `CN=localhost` (so the trust-negative test's presented leaf still passes the hostname check and chain-of-trust is the only variable) | connector (trust-negative test) |
+| `wrong.crt` | the same unrelated `CN=localhost` cert as a PEM | connector (PEM-form trust-negative test) |
 | `client-keystore.p12` | client cert + key (`CN=smpp-test-client`) | connector (mTLS identity) |
 | `server-truststore.p12` | only the client's public cert | the mock (verifies the client, mTLS) |
+| `wronghost-keystore.p12` | a cert + key with `CN=not-localhost`, SAN `not-localhost` | the mock (hostname-mismatch test: presents a trusted-but-wrong-host cert) |
+| `wronghost-truststore.p12` | only the `CN=not-localhost` cert | connector (trusts it, so the hostname check is the only thing that can fail) |
 
 Validity is 3650 days from generation (generated 2026-07-22; expires ~2036). To
 regenerate on expiry: `./gen-certs.sh` (requires `keytool` from any JDK), then commit

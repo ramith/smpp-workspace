@@ -318,7 +318,7 @@ that it doesn't, fully.
 
 ---
 
-## Sprint 3 — Transport security (TLS)
+## Sprint 3 — Transport security (TLS) ✅ DONE
 
 **Goal:** architect-reviewer's firm position, which I'm carrying into this plan as a hard
 gate rather than a nice-to-have: a public, Central-bound connector that hands real
@@ -365,17 +365,58 @@ still be the *recommended* production topology, but the option must exist.
   `rebindPolicy` like any transient fault. Whether cert-trust failures should be terminal
   (one final `onError`, no retry) is a design decision for a later sprint.
 - **Test harness:** committed PKCS12 fixtures under `tests/resources/certs/` +
-  `gen-certs.sh` (server cert CN=localhost + SAN; the negative-test "wrong" truststore's
-  cert is deliberately *also* CN=localhost so chain-of-trust is the only variable);
-  TLS-terminating mock via a per-mock `TlsServerConnectionFactory` (explicit keystore, not
-  jsmpp's JVM-global-property server factory); four tests on ports 27788–27791
-  (happy-path round-trip, no-verify dev path, **negative: wrong truststore must fail the
-  handshake**, mTLS round-trip).
+  `gen-certs.sh` (server cert CN=localhost + SAN; the trust-negative "wrong" cert is also
+  CN=localhost — the mock always presents its own CN=localhost leaf, so the hostname check
+  passes uniformly and chain-of-trust is the isolated variable; a separate
+  `CN=not-localhost` keypair drives the hostname tests); TLS-terminating mock via a
+  per-mock `TlsServerConnectionFactory` (explicit keystore, not jsmpp's JVM-global-property
+  server factory); nine tests on ports 27788–27795: happy-path round-trips (truststore +
+  PEM forms), no-verify dev path, **trust negatives in both cert forms**, mTLS round-trip
+  **plus the no-client-cert mTLS negative** (proves the server *demands* the cert), and a
+  **hostname-verification pair** (trusted-but-wrong-host cert: fails with `verifyHostName`
+  defaulted, connects with it `false`; mutation-verified against deletion of the
+  endpoint-identification code). All fixture stores keytool-verified against `gen-certs.sh`.
 | Custom `ConnectionFactory` wiring in `NativeListener.bind()` | jsmpp's stock `SSLSocketConnectionFactory` only reads a JVM-global truststore, which isn't idiomatic for per-listener Ballerina config — build a small factory wrapping an `SSLContext` constructed from the Ballerina-supplied material, passed to `new SMPPSession(factory)`. Map an explicit, clearly-labeled dev-only "disable verification" flag to `NoTrustSSLSocketConnectionFactory`. | ~0.5–1 day (4–8h) |
 | TLS integration test | Stand up a TLS-terminating mock SMSC and assert a full bind+dispatch round-trip over it. This is the real cost driver of this sprint. | ~1.5–2 days (12–16h) |
 
 **Exit gate:** the TLS round-trip test passes; the insecure/no-verification path is
 excluded from any default and clearly labeled in both code and docs.
+
+**Phase 5 (adversarial review) disposition — the gate that actually closed the sprint:**
+
+Three independent reviewers (two java/security passes + one cross-cutting pass), all
+verifying against the JSSE contract and the local jsmpp source. Verdict on the *code*:
+**fail-closed and correct — no exploitable path found.** Every producible `ResolvedTls`
+was traced (trust-all reachable only from `InsecureSocket`; no null/empty trust-manager
+path, so JSSE's silent `cacerts` fallback is unreachable); hostname verification ordering,
+socket ownership (no fd leak on any failure path), password hygiene, and per-rebind
+freshness all confirmed. The confirmed findings were **test-coverage gaps on the sprint's
+own security claims** — the round-trip suite would have stayed green if hostname
+verification or mTLS enforcement were silently deleted. Dispositioned per process 5.3(a),
+all fixed in-sprint:
+
+1. **(High) Hostname verification untested** → hostname-mismatch test pair added
+   (trusted `CN=not-localhost` cert dialed as `localhost`: must fail with `verifyHostName`
+   defaulted, must connect with it `false`). Mutation-verified: disabling the
+   endpoint-identification code makes exactly the new test fail, nothing else.
+2. **(Med-High) mTLS enforcement untested** → no-client-cert negative added (mock demands
+   a client cert, connector has no `key` ⇒ bind must fail).
+3. **(Med) PEM-path rejection untested** → wrong-PEM negative added (`wrong.crt` fixture).
+4. **(Med) Fail-open-on-refactor surface in the native boundary** → the lenient
+   `bool()`/`str()` readers (missing key ⇒ `false`/`""`) were replaced for TLS with
+   *strict* readers that throw on a missing `ResolvedTls` key — a one-sided field rename
+   can no longer silently flip `verifyHostName` off.
+5. **(Low) Empty `cert` path** reached the native layer and failed with a blank message →
+   rejected at init in `validateSecureSocket`.
+6. **(Low) Non-discriminating negative assertions** → trust negatives now also assert the
+   failure is NOT a local keystore-load error; two tests sharing port 27788 → PEM test
+   moved to its own port; doc drift (test count, `CN=localhost` rationale wording)
+   corrected; committed fixture stores keytool-verified against `gen-certs.sh`.
+
+Recorded residuals (accepted, not bugs): passwords transit as unwipeable `BString`s and
+live in the listener-lifetime `ResolvedTls` map by design (rebinds re-read trust material);
+`TLS_CONNECT_TIMEOUT_MILLIS` hardcoded 60s → Sprint 4's timer item; Finding B (terminal vs
+retried trust failures at rebind) stays deferred with its disabled test stub.
 
 **Total: ~24–32h.**
 

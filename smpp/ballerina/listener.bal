@@ -119,6 +119,14 @@ isolated function validateConfig(ConnectionConfig config) returns error? {
 # + secureSocket - the TLS configuration to validate
 # + return - an `Error` describing the first violated constraint, or `()` if valid
 isolated function validateSecureSocket(SecureSocket secureSocket) returns error? {
+    crypto:TrustStore|string cert = secureSocket.cert;
+    if cert is string {
+        if cert.trim().length() == 0 {
+            return error Error("secureSocket.cert path must not be empty");
+        }
+    } else if cert.path.trim().length() == 0 {
+        return error Error("secureSocket.cert.path (truststore path) must not be empty");
+    }
     if secureSocket.protocolVersions.length() == 0 {
         return error Error("secureSocket.protocolVersions must enable at least one TLS version");
     }

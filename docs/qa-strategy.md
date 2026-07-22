@@ -467,18 +467,21 @@ week with two engineers running Phase 0's two tracks and Phase 1 in parallel).**
   reassembly. Multi-segment concatenation logic (jsmpp's own examples show what this
   would take — `jsmpp-examples/.../util/Concatenation.java`) is not implemented and not
   tested here.
-- **TLS/SSL transport — now COVERED (Sprint 3), with these bounds.** `tls_test.bal`
-  exercises a full deliver_sm round-trip over TLS (truststore and PEM-cert forms), the
-  dev-only no-verify (`InsecureSocket`) path, an mTLS round-trip, and — the load-bearing
-  one for the security claim — a **negative test where an untrusted server cert fails the
-  handshake** (the "wrong" truststore's cert is deliberately also `CN=localhost`, so
-  chain-of-trust is the only variable, never hostname). Committed PKCS12 fixtures under
-  `tests/resources/certs/` (regenerable via `gen-certs.sh`). Hostname verification **is**
-  enabled by default (JSSE endpoint identification), which the happy-path fixtures'
-  `CN=localhost`/SAN satisfy. Still out of scope: exhaustive cipher/protocol negotiation
-  matrices, real CA-signed / intermediate chains, OCSP/CRL revocation, and a dedicated
-  hostname-mismatch negative case (the current fixtures share `CN=localhost` by design) —
-  all JSSE behaviors rather than connector behaviors.
+- **TLS/SSL transport — now COVERED (Sprint 3 + its Phase-5 review), with these bounds.**
+  `tls_test.bal` exercises: full deliver_sm round-trips over TLS (truststore and PEM-cert
+  forms); the dev-only no-verify (`InsecureSocket`) path; an mTLS round-trip **plus a
+  negative mTLS test** (no client `key` against a client-cert-requiring mock ⇒ bind fails —
+  the test that proves the server actually *demands* mutual auth); **negative trust tests
+  in both cert forms** (untrusted server cert fails the handshake via a wrong truststore
+  AND via a wrong PEM — the mock always presents its own `CN=localhost` leaf, so the
+  hostname check passes uniformly and chain-of-trust is the isolated variable); and a
+  **hostname-verification pair** (a *trusted* cert with `CN=not-localhost` dialed as
+  `localhost` ⇒ fails with `verifyHostName` defaulted, connects with `verifyHostName:
+  false` — mutation-verified: deleting the endpoint-identification code makes exactly this
+  test fail). Committed PKCS12 fixtures under `tests/resources/certs/` (regenerable via
+  `gen-certs.sh`, contents keytool-verified). Still out of scope: exhaustive
+  cipher/protocol negotiation matrices, real CA-signed / intermediate chains, and OCSP/CRL
+  revocation — all JSSE behaviors rather than connector behaviors.
 - **Outbound `submit_sm`/transmitter-side flows.** This connector is receive-only by
   design (`ListenerBindType RECEIVER|TRANSCEIVER`, no `submit_sm` API) — nothing here
   tests sending.

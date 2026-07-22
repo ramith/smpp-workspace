@@ -130,6 +130,16 @@ A bad or untrusted certificate fails the handshake eagerly, so it surfaces as an
 from `'start()` (or drives the rebind loop, if it happens after a successful initial
 bind), never silently later.
 
+Internally the `.bal` layer flattens the union into a `ResolvedTls` record handed to the
+native layer, and the native readers for it are deliberately **strict** — a missing field
+throws instead of defaulting. The general config readers are lenient, but here a silent
+default is a security downgrade (a defaulted `verifyHostName` would read as `false`,
+turning hostname verification off after a one-sided field rename), so drift between the
+two layers fails loudly at bind time rather than weakening verification. The test suite
+pins both headline guarantees with negatives: a trusted-but-wrong-hostname certificate
+must fail (`verifyHostName` default), and an mTLS mock that demands a client certificate
+must reject a connector that has no `key`.
+
 #### Disabling verification (development only)
 
 To test against a local or self-signed SMSC without minting a truststore, set
