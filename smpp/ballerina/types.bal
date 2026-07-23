@@ -92,6 +92,15 @@ public type ConnectionConfig record {|
     # Controls when the `deliver_sm_resp`/`data_sm_resp` is sent back to the SMSC
     # relative to the attached service's processing of the PDU. Defaults to `SYNC`.
     ResponseMode responseMode = SYNC;
+    # When `true`, a message with `data_coding` `0x00` (the SMSC default alphabet) is decoded
+    # as **unpacked** GSM 03.38 (the 7-bit default alphabet plus its extension table) instead
+    # of the default UTF-8 fallback. Opt-in and off by default, so it never changes decoding
+    # for anyone relying on the existing UTF-8 behavior; enable it only against an SMSC that
+    # actually sends the GSM 7-bit alphabet with one septet per octet (packed 7-bit is not
+    # handled). Other `data_coding` values (IA5, Latin-1, UCS-2, …) are unaffected. The raw
+    # `data_coding` is always available on `Sms.properties` for services that must decode a
+    # different scheme themselves.
+    boolean decodeGsm7 = false;
     # Maximum time `gracefulStop` waits for in-flight dispatches to the attached service to
     # finish before unbinding, in seconds. `immediateStop` does not wait at all.
     # Must not be negative (validated at `Listener` init).

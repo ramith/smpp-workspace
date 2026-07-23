@@ -85,7 +85,9 @@ public final class NativeListener {
         listener.addNativeData(NATIVE_TLS, tls);
         int maxConcurrentDispatch = (int) ((Long) config.getIntValue(
                 StringUtils.fromString("maxConcurrentDispatch"))).longValue();
-        listener.addNativeData(NATIVE_DISPATCHER, new Dispatcher(env.getRuntime(), maxConcurrentDispatch));
+        boolean decodeGsm7 = Boolean.TRUE.equals(config.get(StringUtils.fromString("decodeGsm7")));
+        listener.addNativeData(NATIVE_DISPATCHER,
+                new Dispatcher(env.getRuntime(), maxConcurrentDispatch, decodeGsm7));
         listener.addNativeData(NATIVE_STATE, new AtomicReference<>(ListenerState.INIT));
         listener.addNativeData(NATIVE_STATE_LOCK, new Object());
         // SESSION and REBIND_EXECUTOR are mutated after jsmpp threads exist, so they go

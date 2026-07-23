@@ -213,6 +213,17 @@ type ResolvedTls record {|
 #
 # + secureSocket - the configured union, if any
 # + return - the flat resolution, or `()` when the connection should stay plaintext
+# Routes a native-layer dispatch error through `ballerina/log`. Invoked from the Java
+# `Dispatcher` via `Runtime.callFunction` as the fallback when a service has no `onError`
+# method, when an `onError` handler itself errors, or for an ASYNC handler failure that can't
+# be reflected back to the SMSC — so these land in the application's log rather than on stderr.
+#
+# + message - a description of where/why the error occurred
+# + err - the error to log alongside `message`
+isolated function logDispatchError(string message, error err) {
+    log:printError(message, 'error = err);
+}
+
 isolated function resolveTls(SecureSocket|InsecureSocket? secureSocket) returns ResolvedTls? {
     if secureSocket is () {
         return ();

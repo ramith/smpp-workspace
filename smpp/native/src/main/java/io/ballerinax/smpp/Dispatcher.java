@@ -1,6 +1,7 @@
 // Copyright (c) 2026. Bridges jsmpp receive callbacks into the Ballerina runtime.
 package io.ballerinax.smpp;
 
+import io.ballerina.runtime.api.Module;
 import io.ballerina.runtime.api.Runtime;
 import io.ballerina.runtime.api.concurrent.StrandMetadata;
 import io.ballerina.runtime.api.creators.ValueCreator;
@@ -104,10 +105,18 @@ public class Dispatcher implements MessageReceiverListener {
      */
     private final Semaphore permits;
 
-    public Dispatcher(Runtime runtime, int maxConcurrentDispatch) {
+    /**
+     * When true, {@code data_coding 0x00} (SMSC default alphabet) is decoded as unpacked
+     * GSM 03.38 rather than the UTF-8 fallback. Opt-in ({@code ConnectionConfig.decodeGsm7}),
+     * so the default behaviour is unchanged for anyone relying on the UTF-8 fallback today.
+     */
+    private final boolean decodeGsm7;
+
+    public Dispatcher(Runtime runtime, int maxConcurrentDispatch, boolean decodeGsm7) {
         this.runtime = runtime;
         // Non-fair: tryAcquire never queues, so fairness is irrelevant, and non-fair is faster.
         this.permits = new Semaphore(maxConcurrentDispatch);
+        this.decodeGsm7 = decodeGsm7;
     }
 
     int inFlightCount() {
@@ -116,8 +125,8 @@ public class Dispatcher implements MessageReceiverListener {
 
     /**
      * Notifies the attached service's optional {@code onError} remote method, e.g. on an
-     * unexpected SMPP session drop. Falls back to a stack trace on stderr if the service
-     * doesn't implement {@code onError}. Runs on its own virtual thread: unlike PDU dispatch,
+     * unexpected SMPP session drop. Falls back to {@code ballerina/log} (via {@link #logError})
+     * if the service doesn't implement {@code onError}. Runs on its own virtual thread: unlike PDU dispatch,
      * there's no {@code deliver_sm_resp}/{@code data_sm_resp} timing contract to preserve here,
      * so there's no reason to block the caller (typically one of jsmpp's own threads).
      *
@@ -126,22 +135,26 @@ public class Dispatcher implements MessageReceiverListener {
     void dispatchError(String message) {
         ServiceBinding binding = this.binding;
         BError err = ModuleUtils.createError(message);
-        if (binding == null || !binding.remoteMethods().contains(ON_ERROR)) {
-            err.printStackTrace();
-            return;
-        }
+        boolean hasOnError = binding != null && binding.remoteMethods().contains(ON_ERROR);
         StrandMetadata meta = new StrandMetadata(false, null);
-        // Incremented before the virtual thread starts (same as the ASYNC dispatch path)
-        // so a gracefulStop beginning immediately after this call already sees it and
-        // its drain genuinely covers the in-flight onError notification.
+        // ALWAYS run on a virtual thread - BOTH the onError callback and the no-handler log
+        // fallback. Both cross into the Ballerina runtime (callMethod / callFunction), and this
+        // method is called from a jsmpp state-listener thread during a CLOSED transition, with
+        // scheduleRebind running immediately after it returns; doing the runtime call inline on
+        // that thread derails the rebind. Incremented before the thread starts (same as the
+        // ASYNC dispatch path) so a gracefulStop starting right after already covers it.
         inFlight.incrementAndGet();
         boolean spawned = false;
         try {
             Thread.startVirtualThread(() -> {
                 try {
-                    Object result = runtime.callMethod(binding.service(), ON_ERROR, meta, err);
-                    if (result instanceof BError callbackErr) {
-                        callbackErr.printStackTrace();
+                    if (hasOnError) {
+                        Object result = runtime.callMethod(binding.service(), ON_ERROR, meta, err);
+                        if (result instanceof BError callbackErr) {
+                            logError("the service's onError handler itself returned an error", callbackErr);
+                        }
+                    } else {
+                        logError("SMPP session error and no onError handler is attached to the service", err);
                     }
                 } finally {
                     inFlight.decrementAndGet();
@@ -156,6 +169,26 @@ public class Dispatcher implements MessageReceiverListener {
                 inFlight.decrementAndGet();
             }
         }
+    }
+
+    // The ramith/smpp module-level function (listener.bal) that routes a native-side failure
+    // through ballerina/log:printError. Called via Runtime.callFunction so these failures land
+    // in the application's configured log output rather than a raw stderr stack trace.
+    private static final String LOG_FN = "logDispatchError";
+
+    /**
+     * Routes a native-side error through {@code ballerina/log} instead of {@code stderr}.
+     * Runs the Ballerina log function synchronously on the calling thread (a log write is
+     * cheap); safe from a jsmpp PDU thread or a dispatch virtual thread, same as
+     * {@link Runtime#callMethod}.
+     *
+     * @param context a human description of where/why the error occurred
+     * @param err the Ballerina error to log alongside {@code context}
+     */
+    private void logError(String context, BError err) {
+        Module module = ModuleUtils.getModule();
+        runtime.callFunction(module, LOG_FN, new StrandMetadata(false, null),
+                StringUtils.fromString(context), err);
     }
 
     void setAsync(boolean async) {
@@ -243,7 +276,7 @@ public class Dispatcher implements MessageReceiverListener {
         sms.put(StringUtils.fromString("destAddr"), StringUtils.fromString(nullSafe(pdu.getDestAddress())));
         byte[] body = payloadBytes(pdu, shortMessage);
         sms.put(StringUtils.fromString("shortMessage"),
-                StringUtils.fromString(decodeShortMessage(body, pdu.getDataCoding())));
+                StringUtils.fromString(decodeShortMessage(body, pdu.getDataCoding(), this.decodeGsm7)));
         // clone(): createArrayValue wraps (doesn't copy) the array, and jsmpp's bean
         // getters return their internal arrays - don't let the user-visible record share
         // a buffer with jsmpp internals, even though no post-dispatch mutator exists today.
@@ -256,29 +289,117 @@ public class Dispatcher implements MessageReceiverListener {
     /**
      * Decodes {@code short_message}/{@code message_payload} bytes according to the PDU's
      * {@code data_coding}. Only the unambiguous single-byte-per-character encodings are
-     * decoded precisely; GSM 7-bit default alphabet (data_coding 0x00) and any other/unknown
-     * value fall back to UTF-8, since jsmpp's main library ships no GSM 03.38 codec and
+     * decoded precisely; the GSM 7-bit default alphabet (data_coding 0x00) falls back to
+     * UTF-8 <em>unless</em> {@code decodeGsm7} is enabled (see the 3-arg overload), because
      * whether an SMSC sends packed 7-bit septets or one byte per character over SMPP varies
-     * by vendor — guessing risks a different, subtler bug than the one being fixed here. The
-     * raw {@code dataCoding} value is always surfaced via {@code Sms.properties} so a service
-     * can decode it itself when the default doesn't match its SMSC.
+     * by vendor. Any other/unknown value falls back to UTF-8. The raw {@code dataCoding} value
+     * is always surfaced via {@code Sms.properties} so a service can decode it itself.
      *
      * @param bytes the raw PDU payload bytes
      * @param dataCoding the PDU's {@code data_coding} value
      * @return the decoded text
      */
     // package-private (not private): exercised directly by DispatcherTest, a pure-logic
-    // JUnit suite that needs no jsmpp session or Ballerina runtime.
+    // JUnit suite that needs no jsmpp session or Ballerina runtime. This 2-arg overload keeps
+    // the historical default behaviour (GSM-7 off) for its callers/tests.
     static String decodeShortMessage(byte[] bytes, byte dataCoding) {
+        return decodeShortMessage(bytes, dataCoding, false);
+    }
+
+    /**
+     * As {@link #decodeShortMessage(byte[], byte)}, but when {@code decodeGsm7} is true a
+     * {@code data_coding} of {@code 0x00} is decoded as unpacked GSM 03.38 (the 7-bit default
+     * alphabet plus its extension table) instead of the UTF-8 fallback.
+     *
+     * @param bytes the raw PDU payload bytes
+     * @param dataCoding the PDU's {@code data_coding} value
+     * @param decodeGsm7 whether data_coding 0x00 should be decoded as unpacked GSM 03.38
+     * @return the decoded text
+     */
+    static String decodeShortMessage(byte[] bytes, byte dataCoding, boolean decodeGsm7) {
         if (bytes == null || bytes.length == 0) {
             return "";
         }
         return switch (dataCoding & 0xFF) {
+            case 0x00 -> decodeGsm7 ? decodeGsm0338Unpacked(bytes)
+                                    : new String(bytes, StandardCharsets.UTF_8);
             case 0x01 -> new String(bytes, StandardCharsets.US_ASCII);   // IA5/ASCII
             case 0x03 -> new String(bytes, StandardCharsets.ISO_8859_1); // Latin-1
             case 0x08 -> new String(bytes, StandardCharsets.UTF_16BE);   // UCS2
             default -> new String(bytes, StandardCharsets.UTF_8);
         };
+    }
+
+    // --- GSM 03.38 (3GPP TS 23.038) default alphabet, unpacked (one septet per octet) ---
+
+    /**
+     * The 128-entry GSM 03.38 default alphabet as Unicode code points, index = septet value.
+     * Position 0x1B (27) is the ESC to the extension table and has no character of its own;
+     * it is handled specially by {@link #decodeGsm0338Unpacked} (never read from this array).
+     * Written with explicit {@code \\uXXXX} escapes so the source file stays pure ASCII (no
+     * raw high bytes, matching this repo's control-byte-safety discipline).
+     */
+    private static final char[] GSM_DEFAULT_ALPHABET = (
+            "@\u00A3$\u00A5\u00E8\u00E9\u00F9\u00EC\u00F2\u00C7\n\u00D8\u00F8\r\u00C5\u00E5"
+          + "\u0394_\u03A6\u0393\u039B\u03A9\u03A0\u03A8\u03A3\u0398\u039E\uFFFF\u00C6\u00E6\u00DF\u00C9"
+          + " !\"#\u00A4%&'()*+,-./"
+          + "0123456789:;<=>?"
+          + "\u00A1ABCDEFGHIJKLMNO"
+          + "PQRSTUVWXYZ\u00C4\u00D6\u00D1\u00DC\u00A7"
+          + "\u00BFabcdefghijklmno"
+          + "pqrstuvwxyz\u00E4\u00F6\u00F1\u00FC\u00E0").toCharArray();
+
+    private static final int GSM_ESCAPE = 0x1B;
+
+    /**
+     * Maps a byte following the GSM ESC (0x1B) to its extension-table character, or
+     * {@code '\0'} if the pair is not a defined extension. Kept as a switch rather than a map:
+     * only ten entries, and this stays allocation-free on the hot decode path.
+     */
+    private static char gsmExtension(int b) {
+        return switch (b) {
+            case 0x0a -> '\f';     // form feed
+            case 0x14 -> '^';
+            case 0x28 -> '{';
+            case 0x29 -> '}';
+            case 0x2f -> '\\';
+            case 0x3c -> '[';
+            case 0x3d -> '~';
+            case 0x3e -> ']';
+            case 0x40 -> '|';
+            case 0x65 -> '\u20AC'; // euro sign
+            default -> '\0';
+        };
+    }
+
+    /**
+     * Decodes unpacked GSM 03.38: each octet carries one 7-bit septet in its low bits. An ESC
+     * (0x1B) followed by a defined extension byte yields the extension character (and consumes
+     * that byte); an ESC not forming a defined extension is rendered as a space, with the next
+     * byte processed normally on the following iteration — per 3GPP TS 23.038. This does NOT
+     * handle packed 7-bit (septets bit-packed across octet boundaries), which is a distinct
+     * on-wire format the connector does not claim to decode.
+     *
+     * @param bytes the unpacked GSM-7 payload
+     * @return the decoded text
+     */
+    static String decodeGsm0338Unpacked(byte[] bytes) {
+        StringBuilder sb = new StringBuilder(bytes.length);
+        for (int i = 0; i < bytes.length; i++) {
+            int b = bytes[i] & 0x7F;   // low 7 bits; a stray high bit is treated as padding
+            if (b == GSM_ESCAPE) {
+                char ext = (i + 1 < bytes.length) ? gsmExtension(bytes[i + 1] & 0x7F) : '\0';
+                if (ext != '\0') {
+                    sb.append(ext);
+                    i++;               // consume the extension byte
+                } else {
+                    sb.append(' ');    // lone/undefined ESC -> space; next byte handled normally
+                }
+            } else {
+                sb.append(GSM_DEFAULT_ALPHABET[b]);
+            }
+        }
+        return sb.toString();
     }
 
     /**
@@ -347,7 +468,8 @@ public class Dispatcher implements MessageReceiverListener {
                         try {
                             Object result = runtime.callMethod(svc, method, meta, sms);
                             if (result instanceof BError err) {
-                                err.printStackTrace();
+                                logError("error from " + method
+                                        + " (ASYNC mode: not reflected back to the SMSC)", err);
                             }
                         } finally {
                             inFlight.decrementAndGet();

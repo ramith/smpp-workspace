@@ -470,15 +470,42 @@ scoped that one at code level.
 
 ---
 
-## Sprint 5 — Polish / fast-follow
+## Sprint 5 — Polish / fast-follow ✅ DONE
 
 **Goal:** real improvements that are safe to defer — nothing here is a correctness or
 security gap, just quality-of-life.
 
 | Item | Scope | Est. |
 |---|---|---|
-| Route stderr fallback (`printStackTrace`) through `ballerina/log` | Small new plumbing (a Ballerina-side `log:printError` helper invoked from Java via `Runtime.callFunction`) so the doc's existing claim becomes true instead of being fixed by lowering the claim. | 2–3h |
-| GSM 03.38 opt-in decoder | A default+extension-table decoder for the unpacked case, shipped **opt-in** (not changing the `data_coding 0x00` default) so it can't break anyone currently relying on the UTF-8 fallback. | 8–16h |
+| Route stderr fallback (`printStackTrace`) through `ballerina/log` | The three `Dispatcher` `printStackTrace` sites now call a `logDispatchError(string, error)` module function (listener.bal → `log:printError`) via `Runtime.callFunction`. Fixed a latent hazard uncovered by this: `dispatchError`'s no-`onError` fallback ran synchronously on the jsmpp state-listener thread — inert as a `printStackTrace`, but a real runtime call there derailed the subsequent `scheduleRebind`; `dispatchError` now always runs on a virtual thread (both paths). | 2–3h |
+| GSM 03.38 opt-in decoder | `boolean decodeGsm7 = false` on `ConnectionConfig`; when enabled, `data_coding 0x00` decodes as **unpacked** GSM 03.38 (default alphabet + extension table) instead of the UTF-8 fallback. Opt-in and off by default, so the `data_coding 0x00` default is unchanged. Packed 7-bit is out of scope. | 8–16h |
+
+**Exit gate:** the log routing works without regressing rebind/drop-reporting; the GSM-7
+decoder is correct and opt-in. **Met:** 38 bal + 30 JUnit green.
+
+**Phase 5 (adversarial review) disposition.** The two review subagents (decoder-correctness +
+threading lenses) both terminated on **infrastructure errors** (connection-closed / stall
+watchdog) without returning findings, across three attempts — an environment issue, not a
+signal about the code. The two load-bearing checks were therefore completed in the main agent
+against ground truth:
+
+1. **GSM table vs 3GPP TS 23.038 — verified.** The `\uXXXX` table was extracted from source,
+   every entry decoded and compared to the canonical GSM 7-bit default alphabet: all 127
+   non-ESC entries match, the ESC slot (0x1B) is a `￿` placeholder (never read — ESC is
+   handled before indexing), and all 10 extension-table entries match exactly. A JUnit
+   regression guard pins the ESC-placeholder alignment (Æ at 0x1C … É at 0x1F).
+2. **Log-routing threading — verified by trace + test.** `dispatchError`→always-vthread does
+   not derail `scheduleRebind` (returns immediately) and introduces no new ordering issue
+   (the `onError` path was already async; the no-`onError` path is a log with no ordering
+   contract); the exactly-once drop-reporting CAS is untouched; `inFlight` stays exactly-once
+   via the `spawned`-guard and is covered by the `gracefulStop` drain; `logError`/`callFunction`
+   runs only from vthread contexts (never synchronously on a raw jsmpp thread); and in
+   `dispatch()`'s ASYNC branch `logError` sits inside the `try` whose `finally` releases the
+   permit, so it cannot skip release (Sprint 4 invariant intact). The drop-with-no-`onError`
+   rebind test is effectively a mutation check: it failed before the vthread fix, passes after.
+
+Control-byte scan clean (two authoring hazards were caught and fixed pre-commit: a raw 0x1B
+ESC byte in a char literal, and raw 0x01/0x02 bytes in a test string — both now `\uXXXX`).
 
 **Total: ~10–19h.**
 

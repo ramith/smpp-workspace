@@ -1,6 +1,7 @@
 // Copyright (c) 2026. Thin static facade exposing MockSmsc instances to bal test.
 package io.ballerinax.smpp.test;
 
+import io.ballerina.runtime.api.values.BArray;
 import io.ballerina.runtime.api.values.BString;
 
 import org.jsmpp.session.connection.ServerConnectionFactory;
@@ -106,6 +107,16 @@ public final class MockSmscBridge {
                                   int dataCoding) throws Exception {
         String payload = messagePayload.getValue();
         mock(mockId).sendDataSm(connectionId, payload.isEmpty() ? null : payload, dataCoding);
+    }
+
+    /**
+     * Sends a deliver_sm with exactly these raw short_message bytes (no charset encoding on
+     * the mock side), so a test can hand the connector's decoder a precise on-wire sequence
+     * such as unpacked GSM 03.38.
+     */
+    public static void sendDeliverSmRaw(long mockId, long connectionId, BArray shortMessage,
+                                        int dataCoding) throws Exception {
+        mock(mockId).sendDeliverSmRaw(connectionId, shortMessage.getBytes(), dataCoding);
     }
 
     /** Abruptly severs the connection: socket close, no unbind exchange (qa-strategy §3.6). */

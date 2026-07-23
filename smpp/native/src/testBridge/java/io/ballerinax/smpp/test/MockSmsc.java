@@ -195,6 +195,22 @@ final class MockSmsc {
     }
 
     /**
+     * Sends a {@code deliver_sm} carrying exactly the given raw {@code short_message} bytes
+     * (no charset encoding on the mock side), so a test can put a precise on-wire byte
+     * sequence — e.g. unpacked GSM 03.38 — in front of the connector's decoder.
+     */
+    void sendDeliverSmRaw(long connectionId, byte[] shortMessage, int dataCoding) throws Exception {
+        connection(connectionId).deliverShortMessage(
+                "", TypeOfNumber.INTERNATIONAL, NumberingPlanIndicator.ISDN, "12345",
+                TypeOfNumber.INTERNATIONAL, NumberingPlanIndicator.ISDN, "99999",
+                new ESMClass(), (byte) 0, (byte) 0,
+                new RegisteredDelivery(0),
+                new RawDataCoding((byte) dataCoding),
+                shortMessage,
+                new OptionalParameter[0]);
+    }
+
+    /**
      * Sends a {@code data_sm} on the given connection. {@code messagePayload} being null
      * sends no {@code message_payload} TLV at all (DATA_SM has no short_message field, so
      * that exercises the connector's empty-fallback path).

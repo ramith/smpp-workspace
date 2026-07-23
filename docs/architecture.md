@@ -48,8 +48,8 @@ only when it happens outside of your own `gracefulStop()`/`immediateStop()`
 call):
 
 - Your service's `onError` method is notified immediately, if you've
-  implemented it (if you haven't, the error is printed as a stack trace on
-  stderr instead — same caveat as ASYNC failures below).
+  implemented it (if you haven't, the drop is written to `ballerina/log` at
+  error level instead — as are ASYNC handler failures below).
 - The listener then automatically attempts to rebind, governed by
   `ConnectionConfig.rebindPolicy` — see [RebindPolicy](#rebindpolicy) below.
   By default this retries indefinitely with exponential backoff. **Every**
@@ -84,6 +84,7 @@ the listener.
 | `bindType` | `ListenerBindType` | `RECEIVER` | See [Bind modes](#bind-modes). |
 | `maxConcurrentDispatch` | `int` | `3` | See [Dispatch concurrency](#dispatch-concurrency-and-response-mode). |
 | `responseMode` | `ResponseMode` | `SYNC` | See [Dispatch concurrency](#dispatch-concurrency-and-response-mode). |
+| `decodeGsm7` | `boolean` | `false` | Opt-in: decode `data_coding` `0x00` as unpacked GSM 03.38 instead of the UTF-8 fallback. See [The Sms record](#the-sms-record). |
 | `gracefulStopTimeout` | `decimal` | `30` (seconds) | See [Shutting down](#shutting-down). |
 | `rebindPolicy` | `RebindPolicy` | retries indefinitely | See [RebindPolicy](#rebindpolicy). |
 | `enquireLinkInterval` | `decimal` | `60` (seconds) | Connector's own keepalive/idle-probe interval toward the SMSC. See [Dispatch concurrency](#dispatch-concurrency-and-response-mode). |
@@ -196,9 +197,9 @@ the SMSC:
   message wasn't handled and can retry it.
 - **`ASYNC`** — the connector responds immediately with `ESME_ROK`, before your
   remote method has run. This trades correctness for latency: a later handler
-  failure never reaches the SMSC, and (as of this writing) is printed as a raw
-  stack trace on stderr rather than routed through `ballerina/log` (tracked as
-  backlog). `maxConcurrentDispatch` still bounds concurrent handler executions
+  failure never reaches the SMSC — it is written to `ballerina/log` at error
+  level (there is no negative response to send once `ESME_ROK` has gone out).
+  `maxConcurrentDispatch` still bounds concurrent handler executions
   here (earlier releases documented ASYNC as ignoring it — that is no longer the
   case); the difference from `SYNC` is the immediate ack, not unbounded dispatch.
 
@@ -313,17 +314,17 @@ public type Sms record {|
   `message_payload`), then decodes those bytes according to the PDU's
   `data_coding`. Only the unambiguous single-byte-per-character encodings are
   decoded precisely: IA5/ASCII, Latin-1 (ISO-8859-1), and UCS2 (as UTF-16BE).
-  GSM 7-bit default alphabet and any other/unrecognized `data_coding` value
-  fall back to UTF-8 — this is a deliberate choice, not an oversight: the raw
-  GSM 03.38 alphabet requires a dedicated codec, and whether an SMSC sends it
-  as packed 7-bit septets or one byte per character over SMPP varies by
-  vendor, so guessing here would risk a subtler bug than the one being
-  avoided. If your SMSC sends GSM 7-bit content and the UTF-8 fallback
-  doesn't decode correctly for you (or anything else the UTF-8 fallback gets
-  wrong), use `properties.dataCoding` to detect it and `shortMessageBytes`
-  (below) to decode the real bytes yourself — re-decoding `shortMessage`
-  itself is not a reliable path back to the original bytes once a lossy
-  UTF-8 fallback has already been applied.
+  The GSM 7-bit default alphabet (`data_coding` `0x00`) and any other/unrecognized
+  value fall back to UTF-8 by default — because whether an SMSC sends GSM 7-bit
+  as packed septets or one byte per octet over SMPP varies by vendor, so guessing
+  would risk a subtler bug. If your SMSC sends the **unpacked** GSM 7-bit default
+  alphabet, set `decodeGsm7: true` (see below): `data_coding` `0x00` is then decoded
+  via the GSM 03.38 default alphabet and its extension table instead of UTF-8. It is
+  opt-in and off by default so existing deployments are unaffected, and it does not
+  attempt packed 7-bit. For anything the built-in decoding still gets wrong, use
+  `properties.dataCoding` to detect the scheme and `shortMessageBytes` (below) to
+  decode the raw bytes yourself — re-decoding `shortMessage` is not a reliable path
+  back to the original bytes once a lossy fallback has been applied.
 - **`shortMessageBytes`** — the same payload as `shortMessage`, before any
   charset decoding: the exact bytes left after resolving the
   `message_payload`-over-`short_message` precedence rule described above,

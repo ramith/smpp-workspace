@@ -55,6 +55,20 @@ isolated function mockSmscSendDeliverSm(int mockId, int connectionId, string sho
     name: "sendDeliverSm"
 } external;
 
+# Sends one deliver_sm carrying exactly `shortMessage` as raw short_message bytes (no
+# charset encoding mock-side), so a test can put a precise on-wire byte sequence — e.g.
+# unpacked GSM 03.38 — in front of the connector's decoder.
+#
+# + mockId - the mock's handle
+# + connectionId - the connection handle from `mockSmscAwaitNextBind`
+# + shortMessage - the exact short_message bytes to put on the wire
+# + dataCoding - the raw data_coding byte value to stamp on the PDU
+isolated function mockSmscSendDeliverSmRaw(int mockId, int connectionId, byte[] shortMessage,
+        int dataCoding) returns error? = @java:Method {
+    'class: "io.ballerinax.smpp.test.MockSmscBridge",
+    name: "sendDeliverSmRaw"
+} external;
+
 # Sends one data_sm on the given connection, blocking until its data_sm_resp arrives.
 # `messagePayload` empty means "no message_payload TLV at all" (DATA_SM has no
 # short_message field, so that exercises the connector's empty-payload fallback).
