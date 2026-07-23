@@ -184,7 +184,7 @@ final class MockSmsc {
                     params);
         } catch (NegativeResponseException e) {
             // Distinguish a throttle (ESME_RTHROTTLED, from the connector's backpressure gate)
-            // from a handler error (ESME_RSYSERR) or anything else. Ballerina interop surfaces
+            // from a handler error (ESME_RX_T_APPN) or anything else. Ballerina interop surfaces
             // the thrown exception's CLASS NAME as error.message(), so a throttle gets its own
             // type; other negative responses keep the original (class name still identifies it).
             if (e.getCommandStatus() == SMPPConstant.STAT_ESME_RTHROTTLED) {

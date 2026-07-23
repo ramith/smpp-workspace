@@ -193,8 +193,11 @@ the SMSC:
 - **`SYNC`** (default) — dispatch waits for your remote method to return
   before the connector responds. A successful return yields a positive
   `deliver_sm_resp`/`data_sm_resp` (`command_status = ESME_ROK`); an `error`
-  return yields a *negative* response (`ESME_RSYSERR`), so the SMSC knows the
-  message wasn't handled and can retry it.
+  return yields a *negative* response with `ESME_RX_T_APPN` (the SMPP v3.4
+  receiver "temporary app error" code, 0x64), telling the SMSC the message
+  wasn't handled. SMPP v3.4 doesn't mandate the SMSC's reaction, but most treat
+  a temporary error as a signal to redeliver — so a permanently-failing handler
+  will keep receiving the message until the SMSC's own retry/validity limit.
 - **`ASYNC`** — the connector responds immediately with `ESME_ROK`, before your
   remote method has run. This trades correctness for latency: a later handler
   failure never reaches the SMSC — it is written to `ballerina/log` at error

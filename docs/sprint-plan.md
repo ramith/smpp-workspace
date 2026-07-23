@@ -511,6 +511,52 @@ ESC byte in a char literal, and raw 0x01/0x02 bytes in a test string — both no
 
 ---
 
+## Sprint 6 — Protocol-conformance audit + documentation ✅ DONE
+
+**Goal:** audit the listener against the actual SMPP specification jsmpp implements, fix any
+non-conformance, and bring the user-facing documentation (the listener README + code docs)
+up to release quality.
+
+**Spec:** the connector binds `interface_version 0x34`, so the governing spec is **SMPP
+v3.4 (Issue 1.2)** — downloaded from smpp.org and audited page-by-page against the code
+(command_status table §5.1.3, data_coding §5.2.19, esm_class §5.2.12, deliver_sm_resp
+§4.6.2, data_sm/data_sm_resp §4.7, sequence_number §5.1.4, interface_version §5.2.4).
+
+**Conformance verdict: conforms.** Verified against the spec: PDU header + sequence_number
+(jsmpp-managed, echoed on responses); `deliver_sm_resp.message_id` = NULL; `data_sm` carries
+no `short_message` (payload via `message_payload` TLV) and its resp `message_id` is the empty
+neutral value for an SMSC-originated data_sm; all command_status values used
+(`ESME_ROK`=0x0, `ESME_RTHROTTLED`=0x58, `ESME_RINVSYSID`=0xF, `ESME_RINVPASWD`=0xE); the
+`data_coding` decode table (0x01 IA5/ASCII, 0x03 Latin-1, 0x08 UCS2, 0x00 SMSC-default
+GSM/UTF-8); and `esm_class` → `deliveryReceipt` (message-type bits 5-2 = 0001) + `udhi`
+(bit 6). enquire_link (Sprint 4) and unbind (Sprint 2) conformance were already established.
+
+**One conformance improvement made:** a SYNC handler `error` returned the generic
+`ESME_RSYSERR` (0x08, "System Error"). SMPP v3.4 defines receiver-specific application error
+codes (Table 5-2): `ESME_RX_T_APPN` (0x64, temporary), `ESME_RX_P_APPN` (0x65, permanent),
+`ESME_RX_R_APPN` (0x66, reject). Changed the SYNC handler-error response to **`ESME_RX_T_APPN`**
+— the code purpose-built for "receiver application failed to process a delivered message,"
+and its "temporary" semantics signal the SMSC to redeliver, matching the connector's
+at-least-once intent (whereas RX_P/R_APPN would tell the SMSC to drop the message). This is
+an observable wire-value change (0x08 → 0x64); `testSyncNegativeAck` updated to assert it.
+
+**Documentation:** rewrote `Package.md` into a full listener README (what it is, quickstart,
+the `onDeliverSm`/`onDataSm`/`onError` service contract, `Sms` record, bind modes,
+resilience, character encoding, TLS, and a **protocol-conformance + limitations** section);
+`Module.md` refreshed as the concise module landing; `types.bal`/`architecture.md` updated
+for the RX_T_APPN change; the `Error` type doc expanded. Public API doc comments were audited
+for spec-accuracy (data_coding/esm_class/deliveryReceipt all match) and left intact where
+already correct (no churn).
+
+**Known limitations (documented, deferred to backlog):** concatenated/multipart messages are
+not reassembled (the `udhi` flag + `shortMessageBytes` are surfaced instead); delivery-receipt
+bodies are delivered as-is, not parsed into typed fields; packed GSM 7-bit is not decoded.
+
+**Exit gate:** listener conforms to SMPP v3.4; README/docs accurate. **Met:** 38 bal + 30
+JUnit green.
+
+---
+
 ## Explicit backlog (scoped, not scheduled)
 
 | Item | Why it's backlog | Rough size |

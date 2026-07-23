@@ -23,14 +23,19 @@ public type ListenerBindType RECEIVER|TRANSCEIVER;
 # Controls the timing of the `deliver_sm_resp`/`data_sm_resp` sent back to the SMSC.
 public enum ResponseMode {
     # Waits for the service's remote method to return before responding. A returned
-    # error becomes a negative `command_status` (`ESME_RSYSERR`) via jsmpp's
-    # `ProcessRequestException`, so the SMSC can retry. Matches jsmpp's documented
-    # listener contract, and bounds concurrency to `maxConcurrentDispatch`.
+    # error becomes a negative `command_status` — `ESME_RX_T_APPN` (the SMPP v3.4
+    # receiver "temporary app error" code) — telling the SMSC the message was not
+    # handled; most SMSCs treat this as a signal to redeliver, so a transient failure
+    # doesn't lose the message. (SMPP v3.4 does not itself mandate the SMSC's reaction
+    # to a negative response.) A handler that fails *permanently* will therefore keep
+    # being redelivered until the SMSC's own retry/validity limit — return successfully,
+    # or dead-letter such messages yourself, rather than always erroring. Matches jsmpp's
+    # documented listener contract, and bounds concurrency to `maxConcurrentDispatch`.
     SYNC,
     # Sends `command_status = ESME_ROK` immediately, without waiting for the service —
     # maximizing throughput at the cost of never reflecting a later service failure back
-    # to the SMSC (a failure is only printed as a stack trace on stderr, not yet routed
-    # through `ballerina/log` — tracked as backlog). `maxConcurrentDispatch` still bounds
+    # to the SMSC (the positive ack has already gone out); such a failure is instead
+    # logged via `ballerina/log` at error level. `maxConcurrentDispatch` still bounds
     # concurrency here: it caps how many service invocations run at once, and PDUs
     # arriving beyond that limit are answered with `ESME_RTHROTTLED` rather than spawning
     # unbounded work. (This bounding is new: earlier releases documented ASYNC as ignoring
@@ -215,5 +220,8 @@ public type Sms record {|
     map<anydata> properties = {};
 |};
 
-# The distinct error type raised by the SMPP connector.
+# The distinct error type raised by the SMPP connector. Returned from `Listener` init on
+# invalid configuration, from `'start()` on a failed connect/bind, and passed to a service's
+# `onError` method on an unexpected session drop. Match it with `err is smpp:Error` to
+# distinguish connector errors from other errors in your handler.
 public type Error distinct error;

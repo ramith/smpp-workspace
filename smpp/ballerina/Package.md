@@ -1,10 +1,15 @@
-# SMPP Trigger Connector (jsmpp wrapper)
+# SMPP listener (trigger) connector
 
-A Ballerina trigger/listener that receives inbound SMPP PDUs (mobile-originated
-SMS and delivery receipts) by wrapping the Java library
-[`org.jsmpp:jsmpp`](https://jsmpp.org/) via Ballerina's Java interoperability.
+A Ballerina **listener/trigger** that receives inbound SMPP PDUs — mobile-originated
+(MO) SMS and delivery receipts — from a Short Message Service Centre (SMSC). It binds
+to the SMSC as an **ESME** in receiver or transceiver mode and dispatches each inbound
+message to your service, wrapping the Java library [`org.jsmpp:jsmpp`](https://jsmpp.org/)
+through Ballerina's Java interoperability.
 
-## Usage
+The connector speaks **SMPP v3.4** (it binds with `interface_version` `0x34`). It is
+receive-only by design: there is no `submit_sm`/transmit API.
+
+## Quickstart
 
 ```ballerina
 import ramith/smpp;
@@ -36,10 +41,63 @@ systemId = "your-system-id"
 password = "your-password"
 ```
 
+## The service contract
+
+Attach one service implementing at least one of these remote methods:
+
+- `remote function onDeliverSm(smpp:Sms sms) returns error?` — an inbound `deliver_sm`
+  (an MO short message, or a delivery receipt when `sms.deliveryReceipt` is `true`).
+- `remote function onDataSm(smpp:Sms sms) returns error?` — an inbound `data_sm` (the
+  alternative MO transfer PDU; its payload always arrives in `message_payload`).
+- `remote function onError(error err) returns error?` — an unexpected session drop
+  (see **Resilience**). If you don't implement it, drops are logged via `ballerina/log`.
+
+**Response mode** (`responseMode`, default `SYNC`) controls *when* the connector answers
+the SMSC:
+
+- `SYNC` — the connector waits for your method to return, then answers. A successful
+  return acks `ESME_ROK`; a returned `error` acks `ESME_RX_T_APPN` (the SMPP v3.4
+  receiver "temporary app error" code), which tells the SMSC the message wasn't handled
+  — most SMSCs then redeliver, so a permanently-failing handler will loop until the
+  SMSC's retry limit (return successfully, or dead-letter such messages yourself).
+- `ASYNC` — the connector acks `ESME_ROK` immediately and runs your method on a
+  virtual thread; a later failure can't be reflected to the SMSC and is logged instead.
+
+`maxConcurrentDispatch` (default 3) bounds how many messages run in your service at once,
+in both modes; excess is answered with `ESME_RTHROTTLED` so the SMSC backs off. A slow
+service can never stall the SMSC's `enquire_link` keepalive — see the design doc.
+
+## The `Sms` record
+
+`sourceAddr`, `destAddr`, `shortMessage` (decoded text — see **Character encoding**),
+`shortMessageBytes` (the raw payload bytes, before decoding), `deliveryReceipt`, and
+`properties` (raw protocol metadata: `dataCoding`, TON/NPI for each address, `esmClass`,
+and the `udhi` User-Data-Header flag).
+
+## Bind modes
+
+`bindType` is `smpp:RECEIVER` (default) or `smpp:TRANSCEIVER`. Only receiver- and
+transceiver-bound sessions are sent `deliver_sm`/`data_sm` by the SMSC.
+
+## Resilience
+
+After an unexpected drop the connector notifies `onError` and rebinds automatically with
+exponential backoff (`rebindPolicy`, retries indefinitely by default). `enquireLinkInterval`
+(default 60s) is the connector's own keepalive/idle-probe interval, and `bindTimeout`
+(default 60s) bounds each connect + bind attempt (initial and rebind).
+
+## Character encoding
+
+`shortMessage` is decoded from the PDU's `data_coding`: IA5/ASCII (`0x01`), Latin-1
+(`0x03`), and UCS2 (`0x08`, as UTF-16BE) are decoded precisely; everything else — including
+the GSM 7-bit default alphabet (`0x00`) — falls back to UTF-8. Set `decodeGsm7: true` to
+decode `data_coding 0x00` as **unpacked** GSM 03.38 instead. When the built-in decoding
+doesn't fit your SMSC, read `properties.dataCoding` and decode `shortMessageBytes` yourself.
+
 ## TLS
 
-SMPP binds send the `systemId`/`password` in cleartext unless the transport is
-encrypted. For an SMSC that terminates TLS in-band, add `secureSocket`:
+SMPP binds send the `systemId`/`password` in cleartext unless the transport is encrypted.
+For an SMSC that terminates TLS in-band, add `secureSocket`:
 
 ```ballerina
 listener smpp:Listener smsListener = check new ({
@@ -54,7 +112,22 @@ listener smpp:Listener smsListener = check new ({
 ```
 
 `cert` (required) verifies the server against a PKCS12/JKS truststore or a PEM CA
-certificate path; hostname verification is on by default; only TLS 1.2/1.3 are
-negotiated; set `key` (a `crypto:KeyStore`) for mutual TLS. See the module docs on
-`SecureSocket` for the full surface, including the loudly-labeled development-only
-`InsecureSocket` escape hatch.
+certificate path; hostname verification is on by default; only TLS 1.2/1.3 are negotiated;
+set `key` (a `crypto:KeyStore`) for mutual TLS. See the module docs on `SecureSocket` for
+the full surface, including the loudly-labeled development-only `InsecureSocket` escape hatch.
+
+## Protocol conformance and limitations
+
+Conforms to **SMPP v3.4** (Issue 1.2) for the receiver/transceiver ESME role: bind
+(`interface_version 0x34`), `deliver_sm`/`data_sm` with `deliver_sm_resp`/`data_sm_resp`,
+`enquire_link` keepalive (answered even under a saturated service), and `unbind`.
+Response `command_status` codes used: `ESME_ROK`, `ESME_RX_T_APPN` (SYNC handler error),
+and `ESME_RTHROTTLED` (backpressure).
+
+Known limitations (raw fields are always surfaced so an application can handle these
+itself): concatenated/multipart messages are **not** reassembled — the `udhi` flag and
+`shortMessageBytes` are exposed instead; delivery-receipt bodies are delivered as-is
+(the receipt text is not parsed into typed fields); and packed GSM 7-bit is not decoded.
+
+The full design rationale, concurrency model, and lifecycle state machine are documented
+in `docs/architecture.md` in the source repository.

@@ -489,7 +489,16 @@ public class Dispatcher implements MessageReceiverListener {
             try {
                 Object result = runtime.callMethod(svc, method, meta, sms);
                 if (result instanceof BError err) {
-                    throw new ProcessRequestException(err.getMessage(), SMPPConstant.STAT_ESME_RSYSERR, err);
+                    // A SYNC handler returning an error becomes the deliver_sm_resp/data_sm_resp
+                    // command_status. SMPP v3.4 (Table 5-2) defines a receiver-specific code for
+                    // exactly this - the ESME's application failing to process a delivered
+                    // message - so we use ESME_RX_T_APPN (0x64, "ESME Receiver Temporary App
+                    // Error") rather than the generic ESME_RSYSERR (0x08). The spec does not
+                    // mandate the SMSC's reaction, but "temporary" conventionally invites
+                    // redelivery, matching this connector's at-least-once intent: a handler error
+                    // means the message was not handled and should be retried, not permanently
+                    // rejected (which RX_P_APPN/RX_R_APPN would imply, telling the SMSC to drop it).
+                    throw new ProcessRequestException(err.getMessage(), SMPPConstant.STAT_ESME_RX_T_APPN, err);
                 }
             } finally {
                 inFlight.decrementAndGet();

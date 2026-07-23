@@ -4,7 +4,7 @@ import ballerina/test;
 const int SYNC_TEST_PORT = 27778;
 
 # A deliver_sm handler that records, then fails - for proving a handler error becomes a
-# negative deliver_sm_resp (ESME_RSYSERR, 0x00000008) in SYNC mode.
+# negative deliver_sm_resp (ESME_RX_T_APPN, 0x00000064) in SYNC mode.
 service class SyncFailingService {
     *Service;
 
@@ -82,13 +82,13 @@ function testSyncNegativeAck() returns error? {
     test:assertTrue(sendResult is error,
             "a handler error in SYNC mode must surface as a negative deliver_sm_resp");
     if sendResult is error {
-        // Dispatcher.dispatch converts the handler's error into ProcessRequestException
-        // with STAT_ESME_RSYSERR (0x00000008); jsmpp reports it back as "System Error".
-        // A Java exception crossing the interop boundary puts the class name in
-        // `message()` and the real text in the error detail - assert on toString(),
-        // which includes both.
-        test:assertTrue(sendResult.toString().includes("00000008"),
-                string `expected an ESME_RSYSERR (0x00000008) negative response, got: ${sendResult.toString()}`);
+        // Dispatcher.dispatch converts the handler's error into ProcessRequestException with
+        // STAT_ESME_RX_T_APPN (0x00000064) - the SMPP v3.4 receiver-specific "temporary app
+        // error" code, signalling the SMSC to redeliver. A Java exception crossing the interop
+        // boundary puts the class name in `message()` and the real text in the error detail -
+        // assert on toString(), which includes both.
+        test:assertTrue(sendResult.toString().includes("00000064"),
+                string `expected an ESME_RX_T_APPN (0x00000064) negative response, got: ${sendResult.toString()}`);
     }
 
     // SYNC ordering: the negative ack reflects a handler that already ran - the direct
