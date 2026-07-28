@@ -821,17 +821,70 @@ only method in that class **not** wrapped in `synchronized (os)`. It cannot affe
 present as a connector concurrency failure — hence the per-mock `pduProcessorDegree` knob in item 10,
 pinned to 1 in the concurrency test, with the reason in a comment so nobody "fixes" it back.
 
-**Three claims rest on the conformance audit's authority and must be re-verified against the spec
-PDF before the code is written** (no local copy was available): the 254/255 `sm_length` boundary
-*(the jsmpp side is confirmed — `StringParameter.java:62` caps `SHORT_MESSAGE` at 254)*; that
-`registered_delivery` `0x03` is reserved on IF_34 *(jsmpp's own javadoc corroborates — `SUCCESS`
-is annotated "Introduced in SMPP 5.0", which is why the enum ships **three** members, not four)*;
-and `esm_class`'s NPE-on-null. One further item **must be probed in Phase 2 before item 3's
-validation is written**: whether `Runtime.callMethod` tolerates a defaulted extra parameter. It
-decides whether attach-time validation could turn a program that is legal at 1.0.1 into one that
-**fails to start** at 1.1.0 — a runtime break in a minor release, worse than a compile break because
-it ships. Scope the validation to exactly `onDeliverSm`/`onDataSm`/`onError` and reject only shapes
-that genuinely cannot be dispatched.
+**Phase 1 spec verification — DONE (2026-07-29), all claims CONFIRMED verbatim.** The red team
+flagged three rulings as resting on the conformance audit's authority because no local spec copy was
+available. The PDF was fetched from smpp.org and all three hold, so **no design change is needed**:
+
+- **§5.2.21 `sm_length`:** "0 — no user data in short message field / **1-254 allowed** / **255 not
+  allowed**", and §5.2.22: "A maximum of **254 octets** can be sent." §3.2.3 repeats it. So the
+  report's 140 was the GSM air-interface budget, as diagnosed; the connector's reject threshold is
+  254, with the lower coding-dependent guard layered above it.
+- **§5.2.17 `registered_delivery`:** `xxxxxx00` none (default) / `xxxxxx01` success-or-failure /
+  `xxxxxx10` failure-only / **`xxxxxx11` reserved**, and "The default setting of the
+  registered_delivery parameter is 0x00." So the enum ships **three** members. jsmpp's fourth
+  (`SUCCESS` = 0x03) is javadoc'd "Introduced in SMPP 5.0" — confirmed in the pinned jar.
+- **§5.2.12 `esm_class`:** "The default setting of the esm_class parameter is 0x00", and the
+  ESME→SMSC table gives `xxxxxx00` = Default SMSC Mode (Store and Forward), `xx0000xx` = default
+  message type, `00xxxxxx` = no GSM features. So 0x00 is exactly a plain MT, and UDHI is
+  `01xxxxxx` = 0x40. *(The NPE-on-null half of that finding is a jsmpp fact, already verified at
+  `DefaultPDUSender.java:240`, not a spec claim.)*
+
+Three further claims pinned in the same pass, all CONFIRMED verbatim: §5.2.12's notes make UDHI
+**mandatory** — "it must set the UDHI flag in the esm_class field" — which is what forces
+reject-oversize rather than merely recommending it; §5.2.16 defines `validity_period` in "absolute
+time format or relative time format" per §7.1.1, so it is definitively not a number of seconds; and
+the item-9 honesty argument is the spec's own wording — §5.2.23: `message_id` "is an **opaque value**
+and is set according to SMSC implementation", versus §5.3.2.12 `receipted_message_id`: "the opaque
+SMSC message identifier **that was returned in the message_id parameter of the SMPP response PDU**
+that acknowledged the submission of the original message." The TLV is the guaranteed key; `id:` is
+not.
+
+**Bonus finding, and it strengthens an exclusion.** §5.2.17's own footnote reads: "Support for
+Intermediate Notification Functionality is specific to the SMSC implementation and is **beyond the
+scope of the SMPP Protocol Specification**." So intermediate notification (bit 4) fails the owner's
+*first* filter outright — not in the spec — independently of jsmpp's bug where
+`IntermediateNotification.NOT_REQUESTED` and `REQUESTED` are **both declared `0x00`** (verified in
+the checkout), making that setter a no-op. Two independent reasons to leave it out; record both so
+it is not revisited. Also confirmed: the spec's "Intermediate Notification (bit 5)" heading sits
+over the pattern `xxx1xxxx`, which is bit **4** — an internal spec inconsistency, and jsmpp follows
+the bit pattern (`MASK_BYTE = 0x10`), which is the correct reading.
+
+**`Runtime.callMethod` and defaulted parameters — RESOLVED (2026-07-29). The red team's concern was
+real, and the answer gives item 3 a sharper rule than "validate narrowly".**
+
+Traced through the pinned runtime (`ballerina-rt-2201.13.4.jar`): `BalRuntime.callMethod` calls
+`validateArgs(BObject, String)` — which takes only the object and the method *name*, so it does not
+check arity — then `Scheduler.callMethod`, whose private overload calls
+**`getArgsWithDefaultValues(ObjectType, MethodType, Strand, Object...)`** before
+`ObjectValue.call`. That method reads `FunctionType.getParameters()`, `System.arraycopy`s the
+supplied arguments into a wider array, and then consults **`Parameter.isDefault`** and
+**`Parameter.defaultFunctionName`** to compute and store the missing ones.
+
+So **the runtime pads defaulted trailing parameters automatically**, and
+`onDeliverSm(smpp:Sms sms, string extra = "x")` is a **legal, working program at 1.0.1 today** —
+`attach` matches on name alone and the runtime fills `extra` in. Validation that rejected any
+2-parameter `onDeliverSm` whose second parameter is not a `Caller` would therefore break a shipped
+program at startup: exactly the minor-release runtime break the red team warned about.
+
+**The rule for item 3, precisely:** bind by parameter **type**; **skip trailing parameters where
+`Parameter.isDefault` is true** — the runtime already handles those and they are none of our
+business; and reject only when a **required** parameter exists that the dispatcher cannot supply.
+That is narrower than "reject unknown 2-param shapes", it preserves every 1.0.1-legal program by
+construction rather than by enumeration, and it uses a public field the runtime hands us instead of
+a heuristic. `Parameter` exposes `name`, `isDefault`, `defaultFunctionName` and `type` as public
+members, so all of this is a plain read. *(The runtime does raise an error inside that method for the
+genuinely-unsatisfiable case; the connector should still reject at attach so the failure names the
+method and the two legal signatures rather than surfacing per-PDU.)*
 
 **The biggest remaining risk is not placement, encoding, or concurrency — it is that the shipped
 defaults make duplicate MTs the likely outcome rather than the exotic one.** Every link is verified
