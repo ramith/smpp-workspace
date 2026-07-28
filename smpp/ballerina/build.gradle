@@ -1,44 +1,88 @@
-// NOTE: this deliberately does NOT use the official `io.ballerina.plugin` Gradle plugin.
-// That plugin is only published to GitHub Packages under the ballerina-platform org,
-// which requires every contributor to hold a GitHub PAT with `read:packages` scope just
-// to run a build — real friction for an independent connector that isn't hosted there.
-// Since jsmpp resolves straight from Maven Central (see Ballerina.toml, no local `path`)
-// and the only local jar this package needs is smpp-native (built by the sibling
-// :smpp-native subproject), plain Exec tasks wrapping the already-installed `bal` CLI get
-// the same one-command build with no extra plugin/auth dependency.
+// Uses the official io.ballerina.plugin Gradle harness, matching how ballerinax connectors
+// are packaged. The plugin resolves from ballerina-platform GitHub Packages and therefore
+// requires a read:packages PAT (packageUser / packagePAT) to build — see settings.gradle.
+import org.apache.tools.ant.taskdefs.condition.Os
+
 plugins {
-    id 'base'
+    id 'io.ballerina.plugin'
 }
 
 description = 'Ballerina - SMPP Ballerina Connector'
 
-tasks.register('balBuild', Exec) {
-    dependsOn ':smpp-native:build'
-    workingDir project.projectDir
-    commandLine 'bal', 'build'
+def packageName = "smpp"
+def packageOrg = "ramith"
+def tomlVersion = stripBallerinaExtensionVersion("${project.version}")
+def ballerinaTomlFilePlaceHolder = new File("${project.rootDir}/build-config/resources/Ballerina.toml")
+def ballerinaTomlFile = new File("$project.projectDir/Ballerina.toml")
+
+def stripBallerinaExtensionVersion(String extVersion) {
+    if (extVersion.matches(project.ext.timestampedVersionRegex)) {
+        def splitVersion = extVersion.split('-')
+        if (splitVersion.length > 3) {
+            def strippedValues = splitVersion[0..-4]
+            return strippedValues.join('-')
+        } else {
+            return extVersion
+        }
+    } else {
+        return extVersion.replace("${project.ext.snapshotVersion}", "")
+    }
 }
 
-tasks.register('balTest', Exec) {
-    dependsOn ':smpp-native:build', ':smpp-native:testBridgeJar'
-    workingDir project.projectDir
-    commandLine 'bal', 'test'
+ballerina {
+    packageOrganization = packageOrg
+    module = packageName
+    testCoverageParam = "--code-coverage --coverage-format=xml"
+    isConnector = true
+    platform = "java21"
 }
 
-tasks.register('balPack', Exec) {
-    dependsOn ':smpp-native:build'
-    workingDir project.projectDir
-    commandLine 'bal', 'pack'
+configurations {
+    externalJars
 }
 
-tasks.register('balPushLocal', Exec) {
-    dependsOn 'balPack'
-    workingDir project.projectDir
-    commandLine 'bal', 'push', '--repository=local'
+dependencies {
+    // Bundle only jsmpp. Its one runtime dependency, slf4j-api, is already on the classpath
+    // via the Ballerina runtime (ballerina-rt); bundling it too duplicates slf4j and triggers
+    // a jar-conflict warning — so transitive = false. This matches ballerinax (activemq bundles
+    // its client but not slf4j). copyToLib copies the externalJars configuration into ./lib,
+    // which Ballerina.toml references by path (self-contained package).
+    externalJars(group: 'org.jsmpp', name: 'jsmpp', version: "${jsmppVersion}") {
+        transitive = false
+    }
 }
 
-build.dependsOn 'balBuild'
-check.dependsOn 'balTest'
-
-clean {
-    delete "${project.projectDir}/target"
+// Regenerate ballerina/Ballerina.toml from the build-config template, stamping in versions.
+// Run in the release pipeline; the concrete Ballerina.toml is committed so a plain build works.
+tasks.register('updateTomlFiles') {
+    doLast {
+        def newBallerinaToml = ballerinaTomlFilePlaceHolder.text.replace("@project.version@", project.version)
+        newBallerinaToml = newBallerinaToml.replace("@toml.version@", tomlVersion)
+        newBallerinaToml = newBallerinaToml.replace("@jsmpp.version@", jsmppVersion)
+        ballerinaTomlFile.text = newBallerinaToml
+    }
 }
+
+// Required by io.ballerina.plugin's build wiring (the plugin references this task by name);
+// also used by the release pipeline to commit the version-stamped toml files.
+tasks.register('commitTomlFiles') {
+    doLast {
+        project.exec {
+            ignoreExitValue true
+            if (Os.isFamily(Os.FAMILY_WINDOWS)) {
+                commandLine 'cmd', '/c', "git commit -m \"[Automated] Update the toml files\" Ballerina.toml Dependencies.toml"
+            } else {
+                commandLine 'sh', '-c', "git commit -m '[Automated] Update the toml files' Ballerina.toml Dependencies.toml"
+            }
+        }
+    }
+}
+
+// Populate ./lib and build the native glue before the Ballerina package. The test-bridge jar
+// is a testOnly platform dependency, so bal needs it present whenever it reads Ballerina.toml.
+build.dependsOn copyToLib
+build.dependsOn ":${packageName}-native:build"
+build.dependsOn ":${packageName}-native:testBridgeJar"
+
+test.dependsOn ":${packageName}-native:build"
+test.dependsOn ":${packageName}-native:testBridgeJar"

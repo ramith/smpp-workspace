@@ -1,3 +1,22 @@
+pluginManagement {
+    plugins {
+        id "io.ballerina.plugin" version "${ballerinaGradlePluginVersion}"
+    }
+    repositories {
+        gradlePluginPortal()
+        // io.ballerina.plugin is published only to ballerina-platform GitHub Packages, so
+        // resolving it requires a GitHub PAT with read:packages exported as packageUser /
+        // packagePAT (see README). This is the same requirement every ballerinax connector has.
+        maven {
+            url = 'https://maven.pkg.github.com/ballerina-platform/*'
+            credentials {
+                username System.getenv("packageUser")
+                password System.getenv("packagePAT")
+            }
+        }
+    }
+}
+
 def projectName = 'smpp'
 rootProject.name = "module-ballerinax-${projectName}"
 

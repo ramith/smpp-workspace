@@ -16,3 +16,7 @@ smpp/ballerina/lib/
 # Compiled Java classes / logs from manual test artifacts
 mock-smsc/*.class
 *.log
+
+# Ballerina Central credentials — never commit
+Settings.toml
+**/Settings.toml
