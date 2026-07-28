@@ -617,8 +617,11 @@ one, and shipping an opt-in parameter with no compile-time validation is not the
 package holds itself to. **1.1.0 publishes at the end of Sprint 9.** Two practical consequences:
 the signature contract must be frozen by this sprint's Phase-5 review so Sprint 9 can encode it;
 and the `examples/` rewrite (which resolves `ramith/smpp` from Central) is blocked for two sprints
-rather than one, so add the local-repo override to `examples/build.sh` + `smoke-test.sh` rather
-than waiting — see item N8 in the reconciliation notes.
+rather than one. **Resolved by the second pass (D9): do nothing to `examples/` in Sprint 8.** The
+local-repo override idea in N8 is withdrawn — `examples.yml` does not build the connector at all, its
+`paths` filter would not even run on a connector change, and all five examples pin `1.0.0`, so the
+override would cost three CI changes and destroy the one signal that job exists for (proving a
+*Central* consumer can compile). Sequence the whole examples story after the Sprint 9 publish.
 
 **Input:** [docs/submit-sm-implementation-report.md](submit-sm-implementation-report.md) (a design
 report written against `main` at 2026-07-28), then a five-SME panel — `architect-reviewer`,
@@ -636,16 +639,16 @@ implementations do request-response.
 
 | # | Item | Scope | Scoped by | Est. |
 |---|---|---|---|---|
-| 1 | Public types | `OutboundSms` (closed, every field documented — a build WARNING on an undocumented public field is a regression); `Encoding` = `ASCII`/`LATIN1`/`UCS2`, default `LATIN1`; `Address record {\| string value; Ton ton; Npi npi; \|}` used behind a `string\|Address` union on both `destAddr` and `sourceAddr` (mirrors this package's own `crypto:TrustStore\|string cert`, `types.bal:155`, and keeps `destAddr: sms.sourceAddr` a one-liner); `Ton`/`Npi` **string enums** mirroring jsmpp's enum member names; `DeliveryReceiptRequest` = `NONE`/`ON_SUCCESS_OR_FAILURE`/`ON_FAILURE_ONLY`; `SubmitResult record {\| string messageId?; \|}`; `ConnectionConfig.sourceAddr` **defaulted, and NOT validated in `validateConfig`**. | ballerina-developer + conformance audit | 8–10h |
+| 1 | Public types | `OutboundSms` (closed, every field documented — plus every **parameter** and **return**, which also warn; note `types.bal` has one *pre-existing* warning at `:127`, so fix that token or record a baseline of 1). `Encoding` = `ASCII`/`LATIN1`/`UCS2`, default `LATIN1`. `Address record {\| string value; Ton ton; Npi npi; \|}` behind a `string\|Address` union on `OutboundSms.destAddr`/`sourceAddr` only — **plain `Address` on `ConnectionConfig`**, because the union collapses three precise `Config.toml` diagnostics into one useless message on the deployment-configured field (D9). `Ton`/`Npi` string enums with a **decided prefixed name map** (`TON_UNKNOWN`, `NPI_NATIONAL`, …) — **not** jsmpp's raw member names, which collide with the published `DeliveryReceiptStatus.UNKNOWN` and produce five build warnings (D2). `DeliveryReceiptRequest` = `NONE`/`ON_SUCCESS_OR_FAILURE`/`ON_FAILURE_ONLY`. `SubmitResult record {\| string messageId; \|}` — **required, not optional** (D4). `ConnectionConfig.sourceAddr` **defaulted, and NOT validated in `validateConfig`**; an absent source address is spec-legal, so do not reject it locally either (D9). | ballerina-developer + conformance audit, corrected by the second pass | 10–12h |
 | 2 | `Caller` on the Ballerina side | `smpp/ballerina/caller.bal`: `public isolated client class Caller` — **not `distinct`** (0 of 7 stdlib Callers are) — with a **module-private `isolated function init`**, or users can write `new smpp:Caller()`. One `remote isolated function submit(OutboundSms) returns SubmitResult\|Error`. Signature is the one a future `Client` will carry verbatim. | ballerina-developer | 4h |
-| 3 | Trailing-optional caller parameter + attach-time validation | `onDeliverSm(smpp:Sms sms, smpp:Caller caller)` — **Caller LAST**, matching the two verifiable stdlib precedents for an *optional* Caller (ftp `FTP_109`: "(WatchEvent) or (WatchEvent & Caller)"; mqtt's own code template and position-enforcing validator). Resolve **by parameter TYPE**, never by arity or position. Add a `BAD_SIGNATURE` variant to the existing typed `AttachResult` (`Dispatcher.java:87`) and store the resolved plan **inside `ServiceBinding`** (`:85`) so the documented torn-attach guarantee holds. `onError` stays 1-arity. | red-team (amending the report) | 8–10h |
+| 3 | Trailing-optional caller parameter + attach-time validation | `onDeliverSm(smpp:Sms sms, smpp:Caller caller)` — **Caller LAST**, per mqtt's position-enforcing validator and code template. *(ftp is **not** a second precedent — its validator accepts either order; see D1.)* Resolve **by parameter TYPE**. **Read D1 before writing this: the rule as first stated is defective** — match a `Caller`-typed parameter *before* applying the `isDefault` skip, reject a non-nil `MethodType.getType().getRestType()`, and decide explicitly whether `(Caller, Sms)` is legal, since Sprint 9 must encode that answer. Add a `BAD_SIGNATURE` variant to the existing typed `AttachResult` (`Dispatcher.java:87`) and store the resolved plan **inside `ServiceBinding`** (`:85`) so the documented torn-attach guarantee holds. Note the method set comes from `getMethods()`, so it includes non-`remote` methods — handle that deliberately. `onError` stays 1-arity. | red-team, corrected by the second pass | 10–12h |
 | 4 | `NativeCaller.java` | Its **own** native data — the `AtomicReference<SMPPSession>`, the `AtomicReference<ListenerState>`, the config map — handed over **once, at `initListener`**, single-threaded. `NativeListener`'s native-data map is a plain unsynchronised `HashMap` and `:93-97` already documents that post-init writes are a data race, so the Caller must never touch the listener `BObject`. Read the session **through the `AtomicReference` on every submit**. Three-way pre-check (below). No `stateLock` on the submit path. | java-architect | 12–14h |
 | 5 | `transactionTimeout` on `ConnectionConfig` | jsmpp's `transactionTimer` defaults to **2000 ms** (`AbstractSession.java:67`) and the connector never sets it, so every submit would give up after 2 s — on a call whose timeout means *"possibly delivered, retrying may duplicate"*. Apply via `setTransactionTimer` in `bind()` beside `setEnquireLinkTimer` (`NativeListener.java:205`) so it is re-applied on every rebind. **Not named `submitTimeout`:** the same jsmpp field also bounds `unbind()` (`:436`), `sendEnquireLink()` (`:403`) and `pduExecutor.awaitTermination` (`SMPPSession.java:678`). Document all three couplings. **Includes updating three existing tests** whose assertions encode the 2 s default. | 4 SMEs independently; couplings by red-team | 6–8h |
 | 6 | Native pre-validation, non-echoing | Pre-check `short_message` ≤254 octets, addresses ≤20 chars, `service_type` ≤5, time strings — using **jsmpp's own declared limits** (`util/StringParameter.java:46-63`), so jsmpp's validator becomes a never-fires backstop. Two independent reasons: (a) `StringValidator` embeds the offending value verbatim, which for `submit_sm` is **the SMS body and the destination MSISDN** — the same leak class `validateCredentials` (`NativeListener.java:272-279`) already exists to prevent; (b) `PDUStringException` is not an `IOException`, so it escapes `executeSendCommand`'s only catch (`AbstractSession.java:332`) and **permanently orphans a `pendingResponses` entry** — an unbounded leak on a long-lived listener, assertable via `getUnacknowledgedRequests()`. | java-architect + conformance audit | 6h |
-| 7 | Error mapping | `public type Error distinct error<ErrorDetail>` with **all-optional** detail fields (verified source-compatible: existing `error Error("msg")` sites in `listener.bal:100-184` keep compiling). Detail carries `commandStatus` (int), `sequenceNumber`, and a **`FailureMode` enum** over the five jsmpp exception classes — `REJECTED` / `TIMEOUT_DELIVERY_UNKNOWN` / `LINK_DOWN` / `INVALID_REQUEST` / `PROTOCOL_ERROR`. **No `retriable`**, **no `commandStatusName`**. Message is `e.getMessage()`, which jsmpp already formats as hex status + description. Branch order matters: `GenericNackResponseException` **before** `InvalidResponseException` (it is a subclass and carries a real `command_status`); `PDUStringException` before `PDUException`; `IOException` last. Pure static `mapSubmitFailure(Exception) → BError` for JUnit reach. | red-team, over 3 conflicting SME positions | 8h |
+| 7 | Error mapping | `public type Error distinct error<ErrorDetail>` where **`ErrorDetail` is OPEN** (`record { }`) with all-optional fields — open costs nothing and removes one of the two user-facing compile breaks (D3). The connector's own `error Error("msg")` sites in `listener.bal:100-184` all keep compiling; the residual break (`error smpp:Error("m", ownField = 1)`) is unavoidable once any field is named, so record it deliberately. Terminate the mapper in a `Throwable` branch — `QueueException` is unchecked, and a `ClassCastException` and a seven-deref NPE both escape the five named classes as panics (D3). Detail carries `commandStatus` (int), `sequenceNumber`, and a **`FailureMode` enum** over the five jsmpp exception classes — `REJECTED` / `TIMEOUT_DELIVERY_UNKNOWN` / `LINK_DOWN` / `INVALID_REQUEST` / `PROTOCOL_ERROR`. **No `retriable`**, **no `commandStatusName`**. Message is `e.getMessage()`, which jsmpp already formats as hex status + description. Branch order matters: `GenericNackResponseException` **before** `InvalidResponseException` (it is a subclass and carries a real `command_status`); `PDUStringException` before `PDUException`; `IOException` last. Pure static `mapSubmitFailure(Exception) → BError` for JUnit reach. | red-team, over 3 conflicting SME positions | 8h |
 | 8 | Encoding + raw-byte escape hatch | Encode only the three schemes the connector already **decodes precisely** (`Dispatcher.java:464-466`). **No GSM-7 option of any kind** — see reconciliation. The escape hatch (`byte[]` + explicit `dataCoding` int) is **mandatory in this sprint**, because it is what makes `data_coding 0x00` expressible at all; and it must be **mutually exclusive** with `shortMessage`+`encoding`, rejecting both-supplied — otherwise it recreates the very both-fields ambiguity SMPP forbids. Encoder must **reject** unencodable characters naming the offending index (`getBytes(ISO_8859_1)` silently substitutes `?`). | red-team + conformance audit | 6h |
 | 9 | `receiptedMessageId` (TLV 0x001E) | `submit_sm_resp.message_id` is **opaque and SMSC-defined** (§5.2.23) while Appendix B calls the receipt format "SMSC vendor specific" and types `id` as 10 octets decimal — so the hex-vs-decimal radix mismatch is a *consequence of the spec*, not a vendor bug, and jsmpp ships both a hex and a decimal id generator rather than resolving it. The spec's only **guaranteed** correlation key is the `receipted_message_id` TLV (§5.3.2.12), reachable via the same `pdu.getOptionalParameter(Class)` call already made at `Dispatcher.java:272-273`. Add as a new optional field on **`Sms`** — not inside `DeliveryReceipt` (which `types.bal:250-252` promises is a faithful 1:1 surface of jsmpp's bean, and jsmpp's bean has no such field) and not in `properties` (a correlation key is load-bearing, not advisory). **Correct `types.bal:263`**, which currently states the correlation as fact. Normalise nothing. | conformance audit; placement by red-team | 5h |
-| 10 | Mock SMSC submit support — **pulled forward, blocks everything else** | Today `MockSmsc` sets **no** `ServerMessageReceiverListener` at all, so every submit test would fail with `ESME_RX_R_APPN` regardless of connector correctness. Needs: a capturing listener set **once in the private ctor** (`SMPPServerSessionListener.accept()` copies it into each session, which removes the accept→set race structurally); `connectionId` minted **before** `request.accept(...)` (currently `:116-117` mints it after, so a submit arriving on the heels of `bind_resp` is unattributable); a **per-connection** FIFO capture queue + field accessors; monotonic generated `message_id`; `setSubmitFailure`; `setSubmitDelay`; a per-mock `pduProcessorDegree` knob. Use `new SubmitSmResult(new MessageId(id), …)` — the `String` ctors are package-private. | qa-expert | 14–16h |
+| 10 | Mock SMSC submit support — **pulled forward, blocks everything else** | Today `MockSmsc` sets **no** `ServerMessageReceiverListener` at all, so every submit test would fail with `ESME_RX_R_APPN` regardless of connector correctness. Needs: a capturing listener set **once in the private ctor** (`SMPPServerSessionListener.accept()` copies it into each session, which removes the accept→set race structurally); `connectionId` minted **before** `request.accept(...)` (currently `:116-117` mints it after, so a submit arriving on the heels of `bind_resp` is unattributable); a **per-connection** FIFO capture queue + field accessors; monotonic generated `message_id`; `setSubmitFailure`; `setSubmitDelay`. **No `pduProcessorDegree` knob — see D5**, it mitigates a non-hazard and breaks the test it guards. Also required, and missing from the first draft (D9): an `SMPPServerSession → connectionId` map populated *before* `accept` (the listener hands you the session, not your id — this is the mechanism per-connection capture rests on), registering the session in `connections` before `accept` rather than only minting the id, the ability to attach a `receipted_message_id` TLV to a delivery receipt, and a null/empty `message_id` response. Use `new SubmitSmResult(new MessageId(id), …)` — the `String` ctors are package-private. | qa-expert | 16–18h |
 | 11 | Docs | `Package.md:9-10` ("receive-only by design: there is no `submit_sm`/transmit API"), `:62-71`, `:109-112`, `:152-162`; `Module.md:1-9`; `types.bal:4-6` and `listener.bal:7-15` (both ship in generated API docs); `architecture.md:8`, `:161-176`, `:270-293`; `examples/README.md`; `examples/two-way-sms/README.md`. Plus **the M2 re-derivation in all three places it is stated**: `NativeListener.java:46-54`, `architecture.md:236-238`, and `types.bal:88-97` — the last being the guarantee in the connector's own shipped voice. Also fix the **pre-existing** contradiction at `Package.md:161-162` ("receipt text is not parsed into typed fields") against `:96-107` and `types.bal:260-288`. Add `qa-strategy.md` §6, which currently lists outbound `submit_sm` as out of scope. | ballerina-developer + red-team | 8h |
 | 12 | The duplicate-MT caveat | The single biggest risk in the feature, and it is documentation plus one test, not code. See reconciliation. | red-team | 3h |
 
@@ -693,9 +696,11 @@ reach); encoder rejection cases.
 - `testDuplicateMtUnderSyncTransactionTimeout` — **the item-12 test.** Forces the SMSC-side
   transaction timer to expire while a SYNC handler is submitting, and pins the documented outcome.
 - `testDlrCorrelatesWithReturnedMessageId` and `testReceiptedMessageIdTlvSurfaced`.
-- `testOversizeRejectedAtExactBoundary` — per-encoding, in **octets**; includes a 160-character
-  string containing one `€` (the escape costs two septets) and the UCS-2 boundary in **UTF-16 code
-  units**, not code points, so emoji are counted correctly.
+- `testOversizeRejectedAtExactBoundary` — per-encoding, in **octets**: 254 accepted / 255 rejected,
+  and the UCS-2 boundary at **127 UTF-16 code units** (not code points), so emoji are counted
+  correctly. **The `€` case is CUT — see D5:** measured, that string is 160 octets under both LATIN1
+  and ASCII, and `€` is not in ISO-8859-1 at all, so it tests unencodable-character rejection rather
+  than the boundary. It moves to its own `testUnencodableCharacterRejectedNamingIndex`.
 - `testRejectedSubmitsDoNotLeakPendingResponses` — `getUnacknowledgedRequests()` stays 0 across N
   rejected submits (item 6b).
 - `config_validation_test.bal` extended for `sourceAddr` and `transactionTimeout`.
@@ -840,8 +845,14 @@ available. The PDF was fetched from smpp.org and all three hold, so **no design 
   `DefaultPDUSender.java:240`, not a spec claim.)*
 
 Three further claims pinned in the same pass, all CONFIRMED verbatim: §5.2.12's notes make UDHI
-**mandatory** — "it must set the UDHI flag in the esm_class field" — which is what forces
-reject-oversize rather than merely recommending it; §5.2.16 defines `validity_period` in "absolute
+mandatory *when a UDH is present* — "**if** an ESME encodes GSM User Data Header information in the
+short message user data, it must set the UDHI flag in the esm_class field". **Correction from the
+second pass:** that is a constraint on UDH-*building*, which this connector does not do, so it does
+**not** make reject-oversize spec-required as originally claimed here. §3.2.3 and Table 4-10 say the
+opposite — 254 octets is the mandated field limit and "the exact physical limit for short_message size
+**may vary according to the underlying network**". So 254 is spec-mandated and any lower threshold is
+connector *policy*; state its value and own it as policy (see D5/D9, and note the architect's argument
+that a 254-only guard is the reversible choice). §5.2.16 defines `validity_period` in "absolute
 time format or relative time format" per §7.1.1, so it is definitively not a number of seconds; and
 the item-9 honesty argument is the spec's own wording — §5.2.23: `message_id` "is an **opaque value**
 and is set according to SMSC implementation", versus §5.3.2.12 `receipted_message_id`: "the opaque
@@ -882,9 +893,15 @@ business; and reject only when a **required** parameter exists that the dispatch
 That is narrower than "reject unknown 2-param shapes", it preserves every 1.0.1-legal program by
 construction rather than by enumeration, and it uses a public field the runtime hands us instead of
 a heuristic. `Parameter` exposes `name`, `isDefault`, `defaultFunctionName` and `type` as public
-members, so all of this is a plain read. *(The runtime does raise an error inside that method for the
-genuinely-unsatisfiable case; the connector should still reject at attach so the failure names the
-method and the two legal signatures rather than surfacing per-PDU.)*
+members, so all of this is a plain read.
+
+**Correction (second adversarial pass): the rule above is necessary but not sufficient, and there is
+no runtime backstop.** `getArgsWithDefaultValues` has **no throw path** — a missing required parameter
+arrives as `null` and surfaces as a panic from generated code, so attach-time rejection is the *only*
+guard. And the `isDefault` skip is itself exploitable two ways: `smpp:Caller? c = ()` is `isDefault`
+and would be silently skipped, and `smpp:Caller... c` does not appear in `getParameters()` at all.
+See **D1** for the corrected rule (match the `Caller` type *before* the `isDefault` skip; reject a
+non-nil `getRestType()`).
 
 **The biggest remaining risk is not placement, encoding, or concurrency — it is that the shipped
 defaults make duplicate MTs the likely outcome rather than the exotic one.** Every link is verified
@@ -902,6 +919,296 @@ handler CPU"*, and tell users to carry their own idempotency key. That is item 1
 one test in the gate that pins a documented hazard rather than a behaviour.
 
 **Total: ~90–105h estimated.**
+
+---
+
+### Second adversarial pass — four `the-fool`-paired reviews (2026-07-29)
+
+The plan above was re-reviewed in full by `architect-reviewer`, `ballerina-developer`, `qa-expert`
+and `java-architect`, each running `the-fool` in red-team + evidence-audit mode, in parallel so no
+reviewer's framing anchored another's. They had ground truth the first pass lacked: the SMPP v3.4
+spec on disk, and (for the Ballerina pass) a scratch workspace in which **every** API claim was
+compiled and run rather than reasoned about.
+
+**The evidence base held: ~30 jsmpp claims, 11 spec claims and 4 runtime claims were attacked and
+all but a handful survived. The design's *rules* and the *exit gate* did not.** Dispositions below;
+every item is CONFIRMED against ground truth unless marked otherwise. Nothing is dropped.
+
+#### D1. Item 3's binding rule is itself defective — fix before writing any of it
+
+The rule as written ("bind by type; skip trailing parameters where `Parameter.isDefault` is true;
+reject only unsatisfiable required params") was broken by two compile-verified signatures:
+
+- **`onDeliverSm(smpp:Sms sms, smpp:Caller? c = ())`** — `isDefault` is **true**, so the rule *skips
+  it*: the handler runs with `c` nil, the user's `caller->submit` is unreachable, and there is no
+  error, no warning and no attach rejection. This is precisely the shape a user writes by analogy
+  with this package's own `secureSocket?` idiom, and a module-private `init` does not prevent it
+  because `()` needs no constructor.
+- **`onDeliverSm(smpp:Sms sms, smpp:Caller... c)`** — rest parameters are **not in
+  `getParameters()`**, so the rule sees a satisfiable 1-parameter method, accepts it, and the runtime
+  pads a `null` into the rest slot → **panic per PDU**. (Latent at 1.0.1 already; item 3 is the only
+  place that will ever look.)
+
+**Corrected rule:** match a `Caller`-typed parameter **before** applying the `isDefault` skip, and
+reject at attach when `MethodType.getType().getRestType()` is non-nil. Also specify the behaviour
+when two parameters share a type (verified accepted today, second parameter null).
+
+Related, and it must be decided **in this sprint** because Sprint 9 encodes it: item 3 says both
+"Caller **LAST**" and "resolve by TYPE, never by position", which are different contracts. The
+runtime accepts `(Caller, Sms)`; a plugin modelled on `MqttFunctionValidator` would reject it.
+`testCallerParamShapes` has no caller-first case, so the contract is unpinned exactly where the two
+sprints disagree.
+
+**And the precedent claim was overstated.** mqtt does enforce caller-last (compile-verified: caller-first
+is `MQTT_105`/`MQTT_106`). **ftp does not** — `FtpFunctionValidator` tries `(Caller, WatchEvent)`
+first and `(WatchEvent, Caller)` second, `FTP_109` fires only when neither matches, and a caller-first
+ftp service **compiles clean**. So there is one precedent for caller-last and one for order-agnostic
+type binding. ftp also does not consult `isDefault`, which makes our rule *better* than stdlib rather
+than a match to it — claim it that way.
+
+#### D2. `Ton`/`Npi` "mirroring jsmpp's enum member names" is not implementable
+
+Compile-verified: it produces **five build warnings**, because Ballerina enum members are
+module-scoped string constants and `UNKNOWN` collides with the **already-published**
+`DeliveryReceiptStatus.UNKNOWN` (`types.bal:249`) while `NATIONAL` collides across the two jsmpp
+enums. One warning lands on the *shipped* `DeliveryReceiptStatus` doc comment, retroactively.
+So "mirror jsmpp's names" and the zero-warning standard are mutually exclusive. **Ship a decided,
+prefixed name map** (`TON_UNKNOWN`, `NPI_UNKNOWN`, `NPI_NATIONAL`, …) plus a documented
+Ballerina-member → jsmpp-member table, and **drop the zero-transcription justification** — it does
+not survive the rename. Decide the map now rather than discovering it in hour one.
+
+#### D3. `Error distinct error<ErrorDetail>` has two user-facing compile breaks
+
+Both patterns compile clean at 1.0.1 and break at 1.1.0:
+- `e.detail()["k"]` → `undefined field 'k'`. **Free fix: make `ErrorDetail` open** (`record { }`),
+  which removes this break at no cost to typed reads. Item 7 specifies closed; change it.
+- `error smpp:Error("m", myOwnField = 42)` → rejected once any field is named. **Unavoidable**, and
+  an open detail does not rescue it. Accept and record it in writing; probability a real user hit
+  this is unverifiable (PLAUSIBLE), the break itself is CONFIRMED.
+
+Also: `QueueException`/`QueueMaxException` are **unchecked** and match none of the five `FailureMode`
+branches; and two more escape as **panics**, not errors — a `ClassCastException` at
+`SMPPSession.java:378`'s unchecked `(SubmitSmResp)` cast, and an NPE from `DefaultPDUSender.java:238-242`,
+which has **seven** unguarded derefs where the plan names only `esm_class` (and which fires *after*
+`pendingResponses.put`, so a mapping bug is also an item-6b orphan on a path length-validation does
+not cover). `mapSubmitFailure` must terminate in a `Throwable` branch, and `SubmitErrorMappingTest`
+must cover the no-branch case.
+
+#### D4. `SubmitResult.messageId` must be required, not optional — the justification was refuted twice
+
+Two reviewers independently killed the stated reason. `MESSAGE_ID` is declared with **min length 0**
+(`StringParameter.java:63`), so an empty `message_id` is spec-legal and returning `""` is *faithful*,
+not a fabrication. And §4.4.2 withholds the response body **only** for non-zero `command_status`,
+which jsmpp converts to `NegativeResponseException` before `getMessageId()` is ever reached. So a
+null on `ESME_ROK` requires a **non-conformant SMSC** — which is what `FailureMode.PROTOCOL_ERROR`
+is for.
+
+**Disposition: `messageId` is a required `string`; an absent id on an `ESME_ROK` maps to
+`PROTOCOL_ERROR`.** Keep the record — but justify it on the argument the plan never made: jsmpp's
+`SubmitSmResult` also carries `getOptionalParameters()` (congestion state, SMPP 5.0 TLVs), so the
+record is where that lands without a break. Note `getOptionalParameters()` is **also** null on the
+header-only path — a second NPE trap. Tightening a `?` later is impossible; this is the sprint's
+last remaining one-way door.
+
+#### D5. The exit gate needs roughly half its tests rewritten
+
+- **The concurrency test's keepalive half is vacuous** — `enquireLinkInterval` defaults to 60s on
+  both sides, so a ~2s test never probes and `recordedErrorCount() == 0` is satisfied by *silence*.
+  You could delete `KEEPALIVE_RESERVE_THREADS` entirely and it still passes. Fix by copying
+  `backpressure_test.bal:67-77`'s recipe (lower the mock's enquire-link and transaction timers, do a
+  warm-up round trip to force the reader off its initial 60s read, hold saturation ~3s).
+- **…and the `pduProcessorDegree = 1` pin makes that fix impossible, while mitigating a non-hazard.
+  Delete the knob.** The corruption it guards against does not exist: `SocketConnection`'s stream is
+  unbuffered, `writeAndFlush` is a single `write()` of a fully-composed PDU, and both transports
+  serialise whole writes (`NioSocketImpl.write` holds a `ReentrantLock`;
+  `SSLSocketOutputRecord.deliver` holds `recordLock`). The pin also violates `qa-strategy.md:337-341`
+  and `MockSmsc.java:71-73` verbatim, serialises N submits into `N × delay`, and starves the mock's
+  own `enquire_link_resp` so the test fails for a mock reason.
+- **`testDuplicateMtUnderSyncTransactionTimeout` is unfalsifiable** — jsmpp implements no redelivery;
+  redelivery is SMSC *policy*. **Item 12 is docs-only.** Replace with a falsifiable late-response
+  test: submit returns `TIMEOUT_DELIVERY_UNKNOWN`, the MT **was** captured at the mock (proving
+  "possibly delivered"), and `recordedErrorCount() == 0` (no spurious drop) — all mutation-detectable.
+- **`testSubmitHappyPathPinsWirePdu` does not assert the message body.** The report's §8 had "the
+  right bytes at the mock"; the gate kept `data_coding` and dropped the bytes. Combined with
+  `"€".getBytes(ISO_8859_1)` → `0x3F` (measured), **an encoder that emits `?` for every non-ASCII
+  character passes the entire gate.** Item 8's positive path has zero coverage. Add byte assertions,
+  and assert the six other mandatory fields at the wire (an implementation sending
+  `replace_if_present_flag = 1` currently passes).
+- **The rebind test is blind to the most natural wrong implementation** — a per-dispatch snapshot
+  (`new Caller(session)` inside `Dispatcher.dispatch`) passes, because no handler is ever alive across
+  the sever. **Add the strongest missing test: hold a gated handler open across the drop and submit
+  after the rebind**, from a `Caller` handed out while the old connection was live. It is the only
+  assertion that tests "read through the `AtomicReference` on every **submit**" rather than every
+  *dispatch*, and `GatedService`/`armGate`/`releaseGate` already exist.
+- **`testCallerParamShapes` cannot distinguish type-based from arity- or position-based resolution** —
+  all four services put `Caller` at index 1. Add the defaulted-parameter service, the two D1 shapes,
+  and a caller-first case.
+- **`testRejectedSubmitsDoNotLeakPendingResponses` is not writable** — `getUnacknowledgedRequests()`
+  is on the connector's session and no bridge exposes it; **no work item creates that accessor**. Add
+  it. And assert a **delta**, not "stays 0": the enquire-link thread holds its own pending entry while
+  a probe is in flight.
+- **CUT the 160-character-with-`€` oversize case.** Measured: that string is 160 octets under both
+  LATIN1 and ASCII — nowhere near 254 — and `€` is not in ISO-8859-1 at all, so it exercises item 8's
+  *unencodable-character* rejection, not the boundary. It is residue from when GSM-7 was in scope.
+  Replace with 254/255 octets and the UCS-2 boundary at **127 UTF-16 code units**; keep the emoji case
+  and split the `€` case into its own `testUnencodableCharacterRejectedNamingIndex`.
+- **Nothing asserts item 6's non-echoing requirement.** House pattern to copy exists:
+  `NativeListenerTest.java:45,58` asserts the exact message *and* that it does not contain the
+  offending value. Use a fixture MSISDN and body that would be unmistakable if leaked, and assert at
+  the Ballerina surface too, since the JUnit test alone does not prove the message survives
+  `ModuleUtils.createError` unchanged.
+- **The payload XOR's runtime rejection covers 1 of 4 reachable misuses** (both-supplied is caught;
+  neither-supplied, bytes-without-`dataCoding`, and `encoding`-alongside-bytes all compile clean and
+  pass). Either grow item 8's validation to three rules and document that `encoding` is ignored when
+  bytes are supplied, or shape it as a **union of two closed records** — which is what this package
+  already does for `SecureSocket|InsecureSocket` (`types.bal:141`), verified to keep closed-with-defaults
+  arms and narrowing. The union's own cost is an opaque diagnostic; that trade is a real decision.
+- Add `mockSmscSetTransactionTimer` as a stated prerequisite for the three submit-from-handler tests —
+  the mock's own `deliverShortMessage` is bounded by *its* 2s timer while the handler blocks, so
+  `sendDeliverSm` errors spuriously. And add a test that the timer is re-applied **on rebind**, which
+  is item 5's whole reason for living in `bind()` and is currently unasserted.
+- `.github/workflows/*` has **no `timeout-minutes` on any job**, so a deadlocked submit test hangs to
+  GitHub's 6-hour default. Add `timeout-minutes: 30`.
+
+#### D6. Item 5's backward-compatibility analysis was wrong in three places
+
+- **Two of the three "affected existing tests" are mock-side timers** and are untouched by this
+  change; `immediate_stop_test.bal:40-42`'s comment is arguably a third. The genuinely stressed
+  assertions are elsewhere in those files. Part of item 5's 6–8h is therefore work that may not
+  exist — re-derive before scheduling.
+- **`awaitTermination` is not part of stop latency.** It sits on the reader thread's own exit path
+  and nothing joins that thread. The real cost is **thread lifetime** during a rebind storm. Do not
+  tell users the reader drain is part of their stop time.
+- **"13% not 5×" is default-specific.** The relation is `(eli + tt) / (eli + 2)`: at the validated
+  minimum `enquireLinkInterval = 5` it is **+114%**, and at 5s/300s it is **44×**. The objection was
+  relocated into the tunable range, not refuted. **Validate the two knobs jointly**, or cap
+  `transactionTimeout` relative to `enquireLinkInterval`.
+- The single knob is **forced by jsmpp's API**, not chosen — `Session` exposes only
+  `setTransactionTimer`, `unbind()` reads the same field, and mutating per call would be a data race
+  on a non-volatile `long` shared with the enquire-link thread. Say that.
+- Setting it in `bind()` is safe **only because of ordering** — it must precede `connectAndBind`,
+  which is where `Thread.start()` supplies the publication edge. That placement is load-bearing, not
+  stylistic; comment it.
+- **A fourth coupling, and the operationally serious one:** `close()` never wakes blocked submitters
+  (`pendingResponses` is untouched outside `executeSendCommand`), so raising the timer multiplies the
+  worst-case **inbound dispatch freeze on link death** proportionally. At the default
+  `maxConcurrentDispatch = 3`, three submitting handlers mean a dead link stalls *all* inbound
+  traffic for the full timeout. No test, no doc line.
+- **And the plan never states the default value or the validated range** — for the sprint's most
+  consequential number.
+
+#### D7. Claims in the plan that are simply false — correct or delete
+
+- **"The runtime does raise an error for the genuinely-unsatisfiable case."** It does not:
+  `getArgsWithDefaultValues` has no throw path; a missing required parameter arrives as `null` and
+  surfaces as a **panic** from generated code. Delete the parenthetical — it is the sentence that
+  would let someone skip the attach-time check, which is now the *only* guard.
+- **"A method missing `remote` silently never fires."** `Dispatcher.java:221` collects
+  `objType.getMethods()`, not `getRemoteMethods()`, and the runtime's lookup map includes plain
+  methods — so it **is** invoked. The typo'd-name half of the claim stands. Two consequences: Sprint 9
+  must decide whether a "must be `remote`" diagnostic is a **warning** (a hard error would convert a
+  working 1.0.1 program into a compile failure in a minor release), and item 3's validation will be
+  reading parameters off a set that includes non-remote methods — decide that deliberately.
+- **`_ = caller->submit(...)` does not compile** (`incompatible types: expected 'any'`), and an unused
+  `var r = ...` is also a compile error. Ballerina refuses the cheap discard. **CUT finding N7** and
+  its doc item; keep at most one sentence noting that an explicit empty `on fail` swallows the error.
+- **The `AtomicReference`-as-only-safe-publication-edge argument is refuted.** jsmpp starts both its
+  threads *after* writing `conn`/`in`/`out`, and `Thread.start()` is itself a happens-before edge, so
+  the reader thread, the enquire-link thread, SYNC handlers on the `pduExecutor` and ASYNC virtual
+  threads all inherit it transitively. The only thread needing our edge is one with no start-chain
+  from the binding thread — a stashed `Caller` used from an unrelated strand. **Read-through stays
+  mandatory, for the original staleness-across-rebind reason.** Do not write the refuted version into
+  a code comment.
+- **`types.bal` is not warning-free.** There is a pre-existing `WARNING` at `types.bal:127` (an
+  invalid doc reference to a bare `'start()`), so item 1's "a warning is a regression" framing rests
+  on a false baseline. Fix that one token, or record a baseline of 1.
+- **The real version bump is `smpp/gradle.properties:4`**, not `Ballerina.toml` — the toml is
+  *generated* from `smpp/build-config/resources/`. Neither sprint mentions it, and Sprint 9 is the
+  release gate.
+- Item 9 cites `types.bal:250-252` for the "faithful 1:1 jsmpp surface" promise; it is at
+  **`:254-256`**. The `Concatenation.java` citation is from **jsmpp-examples, not core** — Grade C
+  evidence presented as Grade A. The conclusion survives on the cleaner argument (absent from core ⇒
+  fails the jsmpp-supported filter); downgrade the citation so nobody reopens GSM-7 on noticing.
+- The `SynchronizedPDUSender` claim should read *"`sendSubmitSmResp` is the only send that reaches the
+  inner `PDUSender` without holding the stream monitor"* — a literal grep for `synchronized (os)`
+  yields three false leads, one of which fooled an earlier reviewer twice.
+- The concurrency invariant is **one monitor per *connection***, not per listener: a rebind builds a
+  fresh session and therefore a fresh monitor. Harmless today; state it in per-connection terms.
+
+#### D8. Two behaviours nobody chose, and one error message that is actively harmful
+
+- **`STARTED && SessionState == CLOSED` is not only "rebind in flight"** — it is also the permanent
+  terminal state after the rebind loop gives up, and when `maxRebindAttempts = 0`. Both branches
+  return without touching `ListenerState`, and the session reference is never cleared. So on a
+  permanently dead link every submit says *"a rebind is in flight, retry shortly"* forever. Needs a
+  third input (a `rebindAbandoned` flag) or wording that does not promise a retry.
+- **`gracefulStop` will reject submits from the very handlers it is waiting for.** `stop()` sets
+  `STOPPING`, then waits `gracefulStopTimeout` for handlers to drain, and only then closes the
+  session — so the session is bound and usable throughout, while the state check rejects every submit
+  as "stopped". Decide and document it; "graceful" currently reads as the opposite.
+- **`immediateStop`'s hazard is `unbind()`'s `synchronized (os)` acquisition**, blocking behind a
+  submitting thread's untimed write *before* anything closes the socket — **not**
+  `enquireLinkSender.join()`, which happens after the close and is the lesser hazard. Item 5's change
+  makes it strictly worse. The prescribed documentation must name the right mechanism or it will not
+  describe what users see. Add a test that asserts `immediateStop` **terminates** (no wall-clock
+  ceiling) while a submit is in flight.
+
+#### D9. Scope and sequencing corrections
+
+- **"Item 10 blocks everything else" is overstated.** Against today's unmodified mock — which answers
+  `submit_sm` with `ESME_RX_R_APPN` because no message-receiver listener is set — the following are
+  writable now: the `NegativeResponseException` → `REJECTED` mapping end-to-end, the `Caller` plumbing
+  itself, `testSubmitOnReceiverBindIsRejected`, both lifecycle-guard tests, and all of Level 2.1.
+  Reorder so the `Caller` dispatch path is proven before harness work begins.
+- **Promote the raw-jsmpp harness spike into the gate** (~1h): drive a bare `SMPPSession` against the
+  extended mock with no connector in the loop, proving the harness before the code it measures exists.
+  It is Sprint 0's discipline, it is in the ledger, and it was dropped.
+- **Item 10 omits four capabilities its own gate tests need:** sending the `receipted_message_id` TLV
+  on a delivery receipt (`sendDeliveryReceipt` hardcodes an empty TLV array); a null/empty
+  `message_id` response; registering the session in `connections` *before* `accept` (not just minting
+  the id); and an `SMPPServerSession → connectionId` map, since `onAcceptSubmitSm` hands you the
+  session, not your id — that map is the whole mechanism per-connection capture rests on.
+- **The `examples/` decision contradicts itself** — one paragraph says add the local-repo override
+  now, another says the rewrite is out of gate *because* it is blocked on Central. Both reviewers who
+  looked recommend resolving it toward **doing nothing to `examples/` in Sprint 8**: `examples.yml`
+  does not build the connector at all, its `paths` filter would not even run on a connector change,
+  and all five examples pin `1.0.0`. Sequence the whole examples story after the Sprint 9 publish.
+- **Item 11 misses six more receive-only claims.** Most important: **`types.bal:290-294`**, where the
+  `Error` doc enumerates exactly three origins and ships in the generated API docs; **`README.md:4`**
+  (added after the report was written, which explains the miss); **`examples/two-way-sms/main.bal:5`**,
+  a comment in shipped example *source*; `qa-strategy.md:10`'s framing sentence; `examples/README.md:52`;
+  and `sprint-plan.md:454`, a Sprint-4 note that uses receive-only as a premise. Note also that
+  undocumented public **types** and **enum members** produce no warning while **parameters** and
+  **returns** do — so item 11's rule both under- and over-covers.
+- **Drop `sourceAddr` from the `config_validation_test.bal` gate line.** It contradicts item 1's own
+  "NOT validated in `validateConfig`". Keep `transactionTimeout`. And note the spec makes an absent
+  source address legal — *"If not known, set to NULL (Unknown)"*, with jsmpp's min length 0 — so a
+  connector-side rejection has warrant under neither governing filter. Document that the SMSC answers
+  `ESME_RINVSRCADR` → `FailureMode.REJECTED` instead.
+- **Use `string|Address` on `OutboundSms` only; use plain `Address` on `ConnectionConfig`.** The union
+  collapses three precise `Config.toml` diagnostics into one useless one, on the
+  deployment-configured field. The cited `crypto:TrustStore|string` precedent carries the same defect.
+- **Read jsmpp's length limits, don't mirror them.** `StringParameter` is a public enum with public
+  `getMax()`/`getType()`/`isRangeMinAndMax()`. That removes the drift hazard entirely, and it matters
+  because the comparisons are *asymmetric* — C-octet rejects `>= max`, octet rejects `> max` — so a
+  hand-transcribed off-by-one in the permissive direction resurrects both reasons item 6 exists.
+- The reader thread can stall up to 60s on a response PDU, but **only once ~100 PDUs are backlogged**
+  (`LinkedBlockingQueue(100)`, never overridden). State the precondition or the risk reads as routine
+  and gets discounted.
+- Split verdict, unresolved: `architect-reviewer` proposes splitting Sprint 8 into an additive **8a**
+  (mock + TLV + the pre-existing doc fixes, shippable as 1.0.2) and **8b** (the feature), on the
+  grounds that timing changes to the three most flake-prone existing tests should not share a diff
+  with a new concurrency path. That is a real bisectability argument and it is **the owner's call**;
+  it is recorded here rather than decided.
+
+#### D10. Still unverified after two passes
+
+`ErrorCreator.createDistinctError(String, Module, BString, BMap)`'s exact signature (do not accept
+the ledger's "javap-verified" annotation — re-run it); whether `Runtime.callMethod` invokes
+non-`remote` methods; runtime behaviour on **exactly** 2201.13.0 (only 13.1/13.4 installed, and
+`Parameter` is byte-identical between them); whether any real 1.0.1 user constructs `smpp:Error` with
+custom detail args; `graalvmCompatible = false`'s rationale, which should be recorded while the toml
+is being touched; and the rabbitmq caller-arity claim, which remains unrelied-upon.
 
 ---
 

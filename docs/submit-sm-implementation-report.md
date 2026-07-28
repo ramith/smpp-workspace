@@ -19,7 +19,7 @@
 > | 4 | `boolean requestDeliveryReceipt` | **Wrong type, and unfixable later** — widening a published `boolean` to an enum is a verified compile break. `registered_delivery` is a bit-mask; "receipt on failure only" is a normal carrier setup. Ships as a **three**-member enum (jsmpp's `SMSCDeliveryReceipt.SUCCESS` is javadoc'd "Introduced in SMPP 5.0" and `0x03` is reserved on IF_34). |
 > | 4 | `int` for TON/NPI | **Enums.** NPI's legal set is non-contiguous (0,1,3,4,6,8,9,10,14,18), so `int` accepts non-values, and `valueOf` then throws an unchecked exception that escapes as a Ballerina **panic**. `ALPHANUMERIC = 5` — needed for brand sender IDs — is undiscoverable behind `int destAddrTon = 1`. |
 > | 4 | no `sourceAddrTon`/`sourceAddrNpi`; `sourceAddr` as a bare string | **Alphanumeric sender IDs are inexpressible** — the motivating short-code example cannot say what it is. Ships as an `Address` record behind a `string\|Address` union. |
-> | 4 | `returns string\|Error` | **Result record.** `getMessageId()` can be **null on an `ESME_ROK` response**, which `string` cannot honestly represent — you would have to return `""` (silently breaking correlation) or fabricate an error for a successful submit. |
+> | 4 | `returns string\|Error` | **Result record — but the reason first given here was itself refuted.** `MESSAGE_ID` is declared with **min length 0**, so an empty `message_id` is spec-legal and returning `""` is *faithful*, not a fabrication; and §4.4.2 withholds the response body only for a **non-zero** `command_status`, which jsmpp converts to `NegativeResponseException` before `getMessageId()` is reached. So a null on `ESME_ROK` means a non-conformant SMSC — that is what `FailureMode.PROTOCOL_ERROR` is for, and `messageId` ships **required**. The record still earns its place, on the argument nobody made: jsmpp's `SubmitSmResult` also carries `getOptionalParameters()` (congestion state, SMPP 5.0 TLVs), so the record is where those land without a break. |
 > | 4 | `sourceAddr` validated in `validateConfig` | **Would break every existing user at runtime on upgrade.** `validateConfig` runs on `Listener.init` for receive-only users too. Default it; validate at submit time. |
 > | 4/5 | `esm_class`, `service_type`, `protocol_id`, `priority_flag`, `replace_if_present_flag`, `sm_default_msg_id`, `schedule_delivery_time` | **All silently omitted, all mandatory PDU fields.** `esm_class` has no jsmpp default and **NPEs on null**; it must be an explicit `0x00`. |
 > | 5 | "One `Caller` per listener… it holds only the session reference" | **It must hold no session at all** — that contradicts §6.1. And read-through is mandatory for a reason stronger than staleness: `SMPPSession`'s `conn`/`in`/`out` are **non-volatile**, so the `AtomicReference` is the only safe-publication edge for jsmpp's own internals. |
@@ -40,6 +40,15 @@
 >
 > The report's own suggestion in §6.2 to ship non-GSM-7 encodings first turned out to be right, for
 > reasons it didn't have. Its §10 open questions are all answered in Sprint 8's reconciliation notes.
+>
+> **A second adversarial pass (four `the-fool`-paired specialist reviews, 2026-07-29) then corrected
+> parts of this box and of the plan itself** — most consequentially: `messageId` ships **required**
+> rather than optional (row 4 above), `receipted_message_id` is the spec's *recommended* rather than
+> *guaranteed* key (the spec says it "should be present"), ftp is **not** a precedent for a
+> position-enforced optional caller, and the claim that a discarded `submit` result loses an MT
+> silently is false — Ballerina refuses `_ = caller->submit(...)` at compile time. See
+> **[sprint-plan.md § "Second adversarial pass"](sprint-plan.md)** for the full dispositions; that
+> section, not this box, is current where they disagree.
 
 **Status:** design report / handoff — **partly superseded, see the box above**. No code written.
 **Target repo:** [`ramith/smpp-workspace`](https://github.com/ramith/smpp-workspace) — the connector at `smpp/`.
