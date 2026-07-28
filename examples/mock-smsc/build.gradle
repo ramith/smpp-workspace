@@ -1,0 +1,27 @@
+// Standalone mock SMSC used by the ramith/smpp examples. Pulls jsmpp + a simple
+// slf4j binding from Maven Central; no dependency on the connector build.
+//
+//   ./gradlew run --args="steady 2775"   # default MO + DLR stream
+//   ./gradlew run --args="flaky 2775"    # drops the link to exercise rebind
+//   ./gradlew run --args="tls 3550"      # same stream over TLS
+plugins {
+    id 'application'
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation 'org.jsmpp:jsmpp:3.0.2'
+    runtimeOnly 'org.slf4j:slf4j-simple:2.0.16'
+}
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
+}
+
+application {
+    mainClass = 'MockSmsc'
+}

@@ -12,6 +12,7 @@ smpp/build/
 smpp/native/build/
 smpp/ballerina/build/
 smpp/ballerina/lib/
+examples/mock-smsc/build/
 
 # Compiled Java classes / logs from manual test artifacts
 mock-smsc/*.class
