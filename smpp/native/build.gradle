@@ -4,20 +4,15 @@ plugins {
 
 description = 'Ballerina - SMPP Native'
 
-// `ballerina-runtime` isn't reliably resolvable from a public Maven repo under a version
-// matching this project's distribution, and it doesn't need to be: the native glue only
-// needs it to compile against Ballerina's Java-interop API (io.ballerina.runtime.api.*) —
-// the real classes are supplied by the Ballerina runtime itself when the connector
-// executes, so this is compileOnly and comes straight from the locally installed
-// distribution (auto-detected via `bal home`, overridable with -PballerinaHome=... or the
-// BALLERINA_HOME env var for CI images that don't have `bal` on PATH).
-def ballerinaHome = project.hasProperty('ballerinaHome')
-        ? project.property('ballerinaHome')
-        : (System.getenv('BALLERINA_HOME')
-            ?: providers.exec { commandLine 'bal', 'home' }.standardOutput.asText.get().trim())
+// The native glue compiles against Ballerina's Java-interop API (io.ballerina.runtime.api.*).
+// The runtime is resolved from Maven (org.ballerinalang:ballerina-runtime, served from GitHub
+// Packages via the repos in the root build.gradle) — matching how ballerinax connectors do it,
+// with no dependency on a local `bal` install or the distribution's on-disk layout. It is
+// compileOnly for the main glue because the real classes are supplied by the Ballerina runtime
+// at execution time.
 
 dependencies {
-    compileOnly fileTree(dir: "${ballerinaHome}/bre/lib", include: 'ballerina-rt-*.jar')
+    compileOnly "org.ballerinalang:ballerina-runtime:${ballerinaLangVersion}"
     implementation group: 'org.jsmpp', name: 'jsmpp', version: "${jsmppVersion}"
 
     // DispatcherTest/NativeListenerTest only call static/package-private methods and never
@@ -25,7 +20,7 @@ dependencies {
     // of a class's member types (including an unused constructor's Runtime parameter) when
     // linking it, so loading Dispatcher.class at all requires this to be on the classpath,
     // not just compileOnly like the main source.
-    testImplementation fileTree(dir: "${ballerinaHome}/bre/lib", include: 'ballerina-rt-*.jar')
+    testImplementation "org.ballerinalang:ballerina-runtime:${ballerinaLangVersion}"
     testImplementation platform('org.junit:junit-bom:5.10.2')
     testImplementation 'org.junit.jupiter:junit-jupiter'
 }
@@ -71,7 +66,7 @@ configurations {
 dependencies {
     testBridgeImplementation group: 'org.jsmpp', name: 'jsmpp', version: "${jsmppVersion}"
     // Ballerina's `string` interops as BString, not java.lang.String directly.
-    testBridgeCompileOnly fileTree(dir: "${ballerinaHome}/bre/lib", include: 'ballerina-rt-*.jar')
+    testBridgeCompileOnly "org.ballerinalang:ballerina-runtime:${ballerinaLangVersion}"
 }
 
 tasks.register('testBridgeJar', Jar) {
