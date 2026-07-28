@@ -30,3 +30,8 @@ jobs:
 
       - name: Build all examples
         run: ./examples/build.sh
+
+      # Run-and-assert: start the mock SMSC per scenario, run each example, and check
+      # it logs the expected line. Proves the examples work, not just that they compile.
+      - name: Smoke-test all examples
+        run: ./examples/smoke-test.sh
