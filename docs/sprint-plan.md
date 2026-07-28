@@ -557,6 +557,52 @@ JUnit green.
 
 ---
 
+## Sprint 7 — Delivery-receipt parsing ✅ DONE
+
+**Governing principle (project owner):** the connector must not do anything jsmpp doesn't /
+can't do — jsmpp is mature, widely used, and authoritative. The connector stays a faithful
+thin wrapper: it surfaces what jsmpp parses and adds no protocol logic jsmpp lacks.
+
+After the Sprint-6 conformance audit, an expert panel reviewed the open findings (F1 UDH
+multipart, F2 delivery-receipt parsing, F3 packed GSM-7, F4 compiler plugin, F5 observability,
+F6 TLS-trust-failure). Filtered by two owner rules — **do it only if it is in the SMPP spec
+AND supported by jsmpp** — the list collapses to one item:
+
+- **F2 delivery-receipt parsing — DONE (this sprint).** In the spec (Appendix B) and fully
+  parsed by jsmpp (`DeliverSm.getShortMessageAsDeliveryReceipt()` → `DeliveryReceipt` bean).
+  Added a typed optional `DeliveryReceipt?` on `Sms` (+ a `DeliveryReceiptStatus` enum),
+  mapped 1:1 from jsmpp's bean — `id`, `finalStatus`, `submitted`/`delivered`,
+  `submitDate`/`doneDate` (raw `yyMMddHHmm` strings — the wire has no timezone), `errorCode`,
+  `text`, all optional. **Lenient / never-throw:** jsmpp's parser throws
+  `InvalidDeliveryReceiptException` on a non-conforming body, and a bare `NullPointerException`
+  (null short_message) *before* that wrapping — both caught
+  (`InvalidDeliveryReceiptException | RuntimeException`), yielding `receipt = ()` with the raw
+  body preserved on `shortMessage`. A throw escaping into the jsmpp PDU thread would NACK the
+  receipt → endless SMSC redelivery, so the catch is load-bearing. The parse runs inside
+  `toSms` **after** the permit gate (no work on the throttle/reject path) and only for
+  `deliver_sm` (data_sm has no receipt body, and jsmpp has no data_sm equivalent). No delivery
+  TLVs are read or merged — jsmpp's DLR parse doesn't, so neither does the connector.
+  40 bal + 36 JUnit green.
+
+### Dropped, per the owner's two rules (not in spec, or not jsmpp-supported)
+
+- **F1 UDH parsing/reassembly — OUT.** The UDH is a GSM 03.40 structure, not SMPP; jsmpp does
+  not parse it (it only exposes the `udhi` esm_class flag + raw bytes). Both filters fail. The
+  connector keeps surfacing `udhi` + `shortMessageBytes`; the application handles concatenation.
+- **F3 packed GSM-7 — OUT.** Not in jsmpp core (no packed/septet codec; the only packed codec
+  in the tree is an examples-only external dependency). Unpacked GSM-7 (`decodeGsm7`, Sprint 5)
+  stays; packed bytes remain available via `shortMessageBytes`.
+- **F4 compiler plugin, F5 observability — OUT.** Neither is SMPP-spec conformance, and the
+  owner declined observability. Sprint 1's runtime service-shape check already stands.
+- **F6 TLS-trust-failure-at-rebind — OUT (not a spec item).** Left as-is: retry under
+  `rebindPolicy` (bounded by `maxRebindAttempts`), with `onError` on every failed attempt.
+
+**Net:** the connector conforms to SMPP v3.4 (Sprint 6) and now surfaces delivery receipts via
+jsmpp's own parser. Nothing further is both spec-required and jsmpp-supported; the remaining
+findings are deliberately left to jsmpp / the application.
+
+---
+
 ## Explicit backlog (scoped, not scheduled)
 
 | Item | Why it's backlog | Rough size |

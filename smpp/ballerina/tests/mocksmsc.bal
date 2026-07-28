@@ -69,6 +69,19 @@ isolated function mockSmscSendDeliverSmRaw(int mockId, int connectionId, byte[] 
     name: "sendDeliverSmRaw"
 } external;
 
+# Sends a deliver_sm flagged as an SMSC delivery receipt, carrying `receiptText` as its
+# short_message body — for exercising the connector's receipt-parsing path end to end.
+#
+# + mockId - the mock's handle
+# + connectionId - the connection handle from `mockSmscAwaitNextBind`
+# + receiptText - the Appendix-B delivery-receipt body to put in short_message
+# + return - an `error` only on misuse (unknown handle) or send failure
+isolated function mockSmscSendDeliveryReceipt(int mockId, int connectionId, string receiptText)
+        returns error? = @java:Method {
+    'class: "io.ballerinax.smpp.test.MockSmscBridge",
+    name: "sendDeliveryReceipt"
+} external;
+
 # Sends one data_sm on the given connection, blocking until its data_sm_resp arrives.
 # `messagePayload` empty means "no message_payload TLV at all" (DATA_SM has no
 # short_message field, so that exercises the connector's empty-payload fallback).

@@ -10,6 +10,8 @@ import java.nio.charset.StandardCharsets;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 
 /**
  * Exercises {@link Dispatcher#decodeShortMessage} and {@link Dispatcher#payloadBytes}
@@ -224,5 +226,100 @@ class DispatcherTest {
         assertEquals("", Dispatcher.decodeShortMessage(new byte[0], (byte) 0x00, true));
         // A stray high bit is treated as 7-bit padding: 0x80|0x01 still decodes as \u00A3.
         assertEquals("\u00A3", Dispatcher.decodeShortMessage(new byte[] {(byte) 0x81}, (byte) 0x00, true));
+    }
+
+    // ---- parseReceipt: faithful jsmpp DeliveryReceipt mapping, lenient (never throws) ----
+
+    // Builds a delivery-receipt-flagged deliver_sm carrying the given Appendix-B receipt body.
+    private static DeliverSm deliveryReceiptPdu(String receiptBody) {
+        DeliverSm ds = new DeliverSm();
+        ds.setEsmClass(DeliverSm.composeSmscDeliveryReceipt((byte) 0));
+        if (receiptBody != null) {
+            ds.setShortMessage(receiptBody.getBytes(StandardCharsets.US_ASCII));
+        }
+        return ds;
+    }
+
+    @Test
+    void parseReceipt_wellFormed_mapsAllFields() {
+        DeliverSm ds = deliveryReceiptPdu(
+                "id:0123456789 sub:001 dlvrd:001 submit date:0809011130 done date:0809011131 "
+                        + "stat:DELIVRD err:000 text:Hello");
+        Dispatcher.ReceiptFields f = Dispatcher.parseReceipt(ds);
+        assertNotNull(f);
+        assertEquals("0123456789", f.id);
+        assertEquals(Integer.valueOf(1), f.submitted);
+        assertEquals(Integer.valueOf(1), f.delivered);
+        assertEquals("0809011130", f.submitDate);   // re-serialized to the wire yyMMddHHmm
+        assertEquals("0809011131", f.doneDate);
+        assertEquals("DELIVRD", f.finalStatus);      // matches the DeliveryReceiptStatus enum
+        assertEquals("000", f.errorCode);
+        assertEquals("Hello", f.text);
+    }
+
+    @Test
+    void parseReceipt_onlyStat_leavesEverythingElseAbsent() {
+        // jsmpp is lenient about MISSING fields (nulls / -1). Our mapping turns those into
+        // "absent" (null holder fields), so the optional Ballerina fields end up nil.
+        Dispatcher.ReceiptFields f = Dispatcher.parseReceipt(deliveryReceiptPdu("stat:DELIVRD"));
+        assertNotNull(f);
+        assertEquals("DELIVRD", f.finalStatus);
+        assertNull(f.id);
+        assertNull(f.submitted);      // jsmpp -1 sentinel -> absent
+        assertNull(f.delivered);
+        assertNull(f.submitDate);
+        assertNull(f.doneDate);
+        assertNull(f.errorCode);
+        assertNull(f.text);
+    }
+
+    @Test
+    void parseReceipt_unknownStatToken_returnsNull() {
+        // A non-standard vendor stat token makes jsmpp's parser throw
+        // InvalidDeliveryReceiptException; we swallow it and surface no parsed receipt (the
+        // raw body remains on Sms.shortMessage).
+        assertNull(Dispatcher.parseReceipt(deliveryReceiptPdu("id:1 stat:BUFFERED err:000")));
+    }
+
+    @Test
+    void parseReceipt_nullShortMessage_returnsNull_notThrow() {
+        // The load-bearing case: a DLR-flagged deliver_sm with NO short_message makes jsmpp
+        // throw a bare NullPointerException BEFORE it wraps to InvalidDeliveryReceiptException.
+        // If this escaped, it would NACK the receipt and the SMSC would redeliver forever.
+        assertNull(Dispatcher.parseReceipt(deliveryReceiptPdu(null)));
+    }
+
+    @Test
+    void parseReceipt_notFlaggedAsReceipt_returnsNull() {
+        // Defensive: a deliver_sm without the SMSC-delivery-receipt esm_class bit makes jsmpp's
+        // stripper throw; parseReceipt returns null rather than propagating.
+        DeliverSm plain = new DeliverSm();
+        plain.setShortMessage("just a normal message".getBytes(StandardCharsets.US_ASCII));
+        assertNull(Dispatcher.parseReceipt(plain));
+    }
+
+    @Test
+    void parseReceipt_allEightStatusTokens_mapToTheirNames() {
+        // Locks the invariant that jsmpp's DeliveryReceiptState.name() matches the eight
+        // DeliveryReceiptStatus enum members exactly - the drift of which is the one thing that
+        // could otherwise make the record build reject a finalStatus value.
+        String[] stats = {"ENROUTE", "DELIVRD", "EXPIRED", "DELETED", "UNDELIV", "ACCEPTD",
+                "UNKNOWN", "REJECTD"};
+        for (String stat : stats) {
+            Dispatcher.ReceiptFields f = Dispatcher.parseReceipt(deliveryReceiptPdu("id:1 stat:" + stat));
+            assertNotNull(f, "stat:" + stat + " should parse");
+            assertEquals(stat, f.finalStatus);
+        }
+    }
+
+    @Test
+    void parseReceipt_dateWithSeconds_reserializesToWireTenDigits() {
+        // A 12-digit (with-seconds) date is accepted by jsmpp and re-serialized through the
+        // Appendix-B yyMMddHHmm pattern - matching jsmpp's own DeliveryReceipt date format.
+        Dispatcher.ReceiptFields f = Dispatcher.parseReceipt(deliveryReceiptPdu(
+                "id:1 submit date:080901113012 done date:080901113047 stat:DELIVRD err:000"));
+        assertNotNull(f);
+        assertEquals("0809011130", f.submitDate);
+        assertEquals("0809011130", f.doneDate);
     }
 }

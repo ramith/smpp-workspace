@@ -20,12 +20,17 @@ import org.jsmpp.bean.AbstractSmCommand;
 import org.jsmpp.bean.AlertNotification;
 import org.jsmpp.bean.DataSm;
 import org.jsmpp.bean.DeliverSm;
+import org.jsmpp.bean.DeliveryReceipt;
 import org.jsmpp.bean.OptionalParameter;
 import org.jsmpp.extra.ProcessRequestException;
 import org.jsmpp.session.DataSmResult;
 import org.jsmpp.session.MessageReceiverListener;
 import org.jsmpp.session.Session;
+import org.jsmpp.util.InvalidDeliveryReceiptException;
 import org.jsmpp.util.MessageId;
+
+import java.text.SimpleDateFormat;
+import java.util.Date;
 
 import java.nio.charset.StandardCharsets;
 import java.util.HashSet;
@@ -283,7 +288,140 @@ public class Dispatcher implements MessageReceiverListener {
         sms.put(StringUtils.fromString("shortMessageBytes"), ValueCreator.createArrayValue(body.clone()));
         sms.put(StringUtils.fromString("deliveryReceipt"), deliveryReceipt);
         sms.put(StringUtils.fromString("properties"), toProperties(pdu));
+        // A delivery receipt's structured fields, when this is one. Only deliver_sm carries the
+        // Appendix-B receipt body (data_sm has no short_message), and jsmpp's parser is
+        // deliver_sm-typed. Built after the base record so shortMessage/shortMessageBytes (the
+        // raw receipt) are always populated regardless of whether the parse succeeds.
+        if (deliveryReceipt && pdu instanceof DeliverSm) {
+            BMap<BString, Object> receipt = buildReceipt((DeliverSm) pdu);
+            if (receipt != null) {
+                sms.put(StringUtils.fromString("receipt"), receipt);
+            }
+        }
         return sms;
+    }
+
+    /**
+     * A plain holder for the mapped delivery-receipt fields, so the parse/mapping logic is a
+     * pure function testable by JUnit (which has no Ballerina runtime and cannot build record
+     * values). A {@code null} field means "absent from the receipt" - {@code buildReceipt}
+     * omits those, leaving the corresponding optional Ballerina field nil.
+     */
+    static final class ReceiptFields {
+        final String id;
+        final Integer submitted;   // null = jsmpp's -1 "absent" sentinel
+        final Integer delivered;
+        final String submitDate;
+        final String doneDate;
+        final String finalStatus;  // jsmpp DeliveryReceiptState name; matches the Ballerina enum
+        final String errorCode;
+        final String text;
+
+        ReceiptFields(String id, Integer submitted, Integer delivered, String submitDate,
+                String doneDate, String finalStatus, String errorCode, String text) {
+            this.id = id;
+            this.submitted = submitted;
+            this.delivered = delivered;
+            this.submitDate = submitDate;
+            this.doneDate = doneDate;
+            this.finalStatus = finalStatus;
+            this.errorCode = errorCode;
+            this.text = text;
+        }
+    }
+
+    /**
+     * Parses an SMSC delivery receipt via jsmpp's own Appendix-B parser and maps its
+     * {@link DeliveryReceipt} bean to a plain holder - the connector adds no interpretation.
+     *
+     * <p>LENIENT / NEVER-THROW: jsmpp's {@code getShortMessageAsDeliveryReceipt()} throws
+     * {@link InvalidDeliveryReceiptException} on a non-conforming body, and can throw a bare
+     * {@link RuntimeException} (e.g. a {@code NullPointerException} inside jsmpp when the
+     * short_message is null) BEFORE that wrapping. This runs inside {@code toSms}, which is
+     * called on a jsmpp PDU-processor thread inside {@code dispatch()}; a throw escaping here
+     * would become a negative deliver_sm_resp and the SMSC would redeliver the malformed
+     * receipt forever. So both are caught and mapped to {@code null} (no parsed receipt; the
+     * raw body stays on {@code Sms.shortMessage}) - exactly what a jsmpp user gets when they
+     * catch the exception.
+     *
+     * <p>Package-private and static: exercised directly by DispatcherTest with an in-process
+     * {@code DeliverSm}, no jsmpp session or Ballerina runtime needed.
+     *
+     * @param ds the delivery-receipt-flagged deliver_sm
+     * @return the mapped fields, or {@code null} if jsmpp could not parse the receipt
+     */
+    static ReceiptFields parseReceipt(DeliverSm ds) {
+        // The whole parse-AND-map runs in the try so this method is STRUCTURALLY never-throw,
+        // not merely never-throw-while-invariants-hold: the catch covers jsmpp's parse throws
+        // (InvalidDeliveryReceiptException, and the bare NullPointerException it raises on a
+        // null short_message before wrapping) AND anything a getter/mapping could throw now or
+        // after a future jsmpp change. On any failure: no parsed receipt (the raw body stays on
+        // Sms.shortMessage). A throw escaping here would NACK the receipt -> endless redelivery.
+        try {
+            DeliveryReceipt dr = ds.getShortMessageAsDeliveryReceipt();
+            return new ReceiptFields(
+                    emptyToNull(dr.getId()),
+                    dr.getSubmitted() >= 0 ? dr.getSubmitted() : null,
+                    dr.getDelivered() >= 0 ? dr.getDelivered() : null,
+                    formatReceiptDate(dr.getSubmitDate()),
+                    formatReceiptDate(dr.getDoneDate()),
+                    dr.getFinalStatus() != null ? dr.getFinalStatus().name() : null,
+                    emptyToNull(dr.getError()),
+                    emptyToNull(dr.getText()));
+        } catch (InvalidDeliveryReceiptException | RuntimeException e) {
+            return null;
+        }
+    }
+
+    /** Builds the Ballerina {@code DeliveryReceipt} record, or {@code null} if the parse failed. */
+    private static BMap<BString, Object> buildReceipt(DeliverSm ds) {
+        ReceiptFields f = parseReceipt(ds);
+        if (f == null) {
+            return null;
+        }
+        // The record build is also guarded: a `finalStatus` value not in the DeliveryReceiptStatus
+        // enum (if jsmpp's DeliveryReceiptState ever drifts from the eight names) could make the
+        // runtime reject the put with a BError - which, unguarded, would escape to the jsmpp
+        // thread and NACK the receipt. Degrade to no parsed receipt instead of ever throwing.
+        try {
+            BMap<BString, Object> r = ValueCreator.createRecordValue(ModuleUtils.getModule(), "DeliveryReceipt");
+            putStringIfPresent(r, "id", f.id);
+            if (f.submitted != null) {
+                r.put(StringUtils.fromString("submitted"), (long) (int) f.submitted);
+            }
+            if (f.delivered != null) {
+                r.put(StringUtils.fromString("delivered"), (long) (int) f.delivered);
+            }
+            putStringIfPresent(r, "submitDate", f.submitDate);
+            putStringIfPresent(r, "doneDate", f.doneDate);
+            putStringIfPresent(r, "finalStatus", f.finalStatus);
+            putStringIfPresent(r, "errorCode", f.errorCode);
+            putStringIfPresent(r, "text", f.text);
+            return r;
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
+    private static void putStringIfPresent(BMap<BString, Object> record, String key, String value) {
+        if (value != null) {
+            record.put(StringUtils.fromString(key), StringUtils.fromString(value));
+        }
+    }
+
+    private static String emptyToNull(String s) {
+        return (s == null || s.isEmpty()) ? null : s;
+    }
+
+    /**
+     * Re-serializes jsmpp's parsed receipt {@code Date} back to the raw wire format
+     * ({@code yyMMddHHmm}). jsmpp parsed it in the JVM default timezone; formatting in the same
+     * zone round-trips the digits, so this surfaces the wire value without inventing a
+     * timezone-anchored instant. A fresh formatter per call keeps this thread-safe (receipts
+     * are low volume); {@code SimpleDateFormat} is not shareable across the jsmpp pool threads.
+     */
+    private static String formatReceiptDate(Date date) {
+        return date == null ? null : new SimpleDateFormat("yyMMddHHmm").format(date);
     }
 
     /**

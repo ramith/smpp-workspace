@@ -3,6 +3,7 @@ package io.ballerinax.smpp.test;
 
 import org.jsmpp.SMPPConstant;
 import org.jsmpp.extra.NegativeResponseException;
+import org.jsmpp.bean.DeliverSm;
 import org.jsmpp.bean.ESMClass;
 import org.jsmpp.bean.NumberingPlanIndicator;
 import org.jsmpp.bean.OptionalParameter;
@@ -208,6 +209,20 @@ final class MockSmsc {
                 new RawDataCoding((byte) dataCoding),
                 shortMessage,
                 new OptionalParameter[0]);
+    }
+
+    /**
+     * Sends a {@code deliver_sm} flagged as an SMSC delivery receipt (the SMSC-delivery-receipt
+     * esm_class message-type bit) carrying {@code receiptText} as its short_message body — for
+     * exercising the connector's receipt-parsing path end to end.
+     */
+    void sendDeliveryReceipt(long connectionId, String receiptText) throws Exception {
+        connection(connectionId).deliverShortMessage(
+                "", TypeOfNumber.INTERNATIONAL, NumberingPlanIndicator.ISDN, "12345",
+                TypeOfNumber.INTERNATIONAL, NumberingPlanIndicator.ISDN, "99999",
+                new ESMClass(DeliverSm.composeSmscDeliveryReceipt((byte) 0)), (byte) 0, (byte) 0,
+                new RegisteredDelivery(0), new RawDataCoding((byte) 0),
+                receiptText.getBytes(StandardCharsets.US_ASCII), new OptionalParameter[0]);
     }
 
     /**

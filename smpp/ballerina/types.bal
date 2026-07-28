@@ -218,6 +218,73 @@ public type Sms record {|
     # `esm_class` byte), and `udhi` (`boolean`, User Data Header Indicator — set for
     # concatenated/binary short messages, which this connector does not reassemble).
     map<anydata> properties = {};
+    # The parsed delivery receipt, present only when this PDU is an SMSC delivery receipt
+    # (`deliveryReceipt == true`) AND jsmpp could parse the Appendix-B receipt body. A
+    # delivery receipt whose body doesn't conform to the format leaves this `()` — so
+    # `deliveryReceipt == true` does NOT guarantee a non-nil `receipt`; the raw receipt text
+    # is always available on `shortMessage`/`shortMessageBytes` regardless. `()` for ordinary
+    # mobile-originated messages.
+    DeliveryReceipt? receipt = ();
+|};
+
+# The final delivery state reported in an SMSC delivery receipt — the seven-character `stat:`
+# token defined in SMPP v3.4 Appendix B, as parsed by jsmpp. Only these eight spec-defined
+# tokens are represented; a delivery receipt whose `stat:` is a non-standard vendor token
+# fails jsmpp's parse entirely (leaving `DeliveryReceipt` `()`), so this enum never carries an
+# unknown value — read the raw `stat:` token from `Sms.shortMessage` if your SMSC is exotic.
+public enum DeliveryReceiptStatus {
+    # In transit; not yet in a final state.
+    ENROUTE,
+    # Delivered to the handset.
+    DELIVRD,
+    # Validity period expired before delivery.
+    EXPIRED,
+    # Deleted by the SMSC.
+    DELETED,
+    # Undeliverable — a terminal failure.
+    UNDELIV,
+    # Accepted by the SMSC on the recipient's behalf (no further delivery attempt).
+    ACCEPTD,
+    # State unknown to the SMSC.
+    UNKNOWN,
+    # Rejected by the SMSC.
+    REJECTD
+}
+
+# A parsed SMSC delivery receipt (DLR), as produced by jsmpp's Appendix-B receipt parser
+# (`DeliverSm.getShortMessageAsDeliveryReceipt`). This is a faithful surface of jsmpp's
+# `DeliveryReceipt` — the connector adds no interpretation of its own. Every field is optional
+# because real SMSCs diverge from the Appendix-B layout (omitting/reordering fields), so
+# "field absent" is a routine, meaningful outcome. The full raw receipt is always available on
+# `Sms.shortMessage`.
+public type DeliveryReceipt record {|
+    # The SMSC's message id for the original submission (Appendix-B `id:`) — the key you
+    # correlate against the `message_id` returned in your `submit_sm_resp`.
+    string id?;
+    # The `sub:` count — messages originally submitted (usually 1). Advisory: many SMSCs
+    # omit or zero-fill it.
+    int submitted?;
+    # The `dlvrd:` count — messages delivered (usually 1). Advisory, as `submitted`.
+    int delivered?;
+    # The `submit date:` field — the original submission time, as the ten-digit `yyMMddHHmm`
+    # wire value (a receipt that carries seconds is normalized to `yyMMddHHmm`, matching
+    # jsmpp's own receipt date format). It carries NO timezone on the wire, so it is surfaced
+    # as a string rather than a `time` value (converting would assume the SMSC's local zone,
+    # which is unknown, and present false precision). Parse it against your SMSC's documented
+    # timezone.
+    string submitDate?;
+    # The `done date:` field — the final-state time; same format and same no-timezone caveat
+    # as `submitDate`.
+    string doneDate?;
+    # The final delivery state, from the Appendix-B `stat:` token. See `DeliveryReceiptStatus`.
+    DeliveryReceiptStatus finalStatus?;
+    # The `err:` field — a network/SMSC-specific error code (typically three characters), NOT
+    # standardized by SMPP; present on a failure when the SMSC populates it. (Named
+    # `errorCode` because `error` is a reserved Ballerina identifier.)
+    string errorCode?;
+    # The `Text:` field — a short (≤20 char per Appendix B) echo of the original message.
+    # Advisory only; use `Sms.shortMessage` for the full receipt body.
+    string text?;
 |};
 
 # The distinct error type raised by the SMPP connector. Returned from `Listener` init on

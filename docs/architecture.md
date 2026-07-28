@@ -302,6 +302,7 @@ public type Sms record {|
     byte[] shortMessageBytes = [];
     boolean deliveryReceipt = false;
     map<anydata> properties = {};
+    DeliveryReceipt? receipt = ();
 |};
 ```
 
@@ -335,6 +336,19 @@ public type Sms record {|
   is the actual escape hatch for GSM 7-bit default-alphabet payloads and
   any other `data_coding` this connector doesn't decode precisely.
 - **`deliveryReceipt`** — see `onDeliverSm` above.
+- **`receipt`** — the parsed SMSC delivery receipt (`DeliveryReceipt?`), present
+  only when `deliveryReceipt == true` **and** jsmpp could parse the Appendix-B
+  receipt body. This is a faithful surface of jsmpp's own receipt parser
+  (`DeliverSm.getShortMessageAsDeliveryReceipt()`), mapped 1:1 — the connector adds
+  no interpretation of its own, and reads no delivery TLVs jsmpp's parser doesn't.
+  All fields are optional (`id`, `finalStatus` as a `DeliveryReceiptStatus` enum,
+  `submitted`/`delivered`, `submitDate`/`doneDate` as raw `yyMMddHHmm` strings —
+  the wire has no timezone — `errorCode`, `text`) because SMSCs diverge from the
+  Appendix-B layout. It is `()` when the body doesn't conform (jsmpp's parser throws
+  on that, and the connector catches it rather than NACKing the receipt — the raw
+  body stays on `shortMessage`), so `deliveryReceipt == true` does not guarantee a
+  non-nil `receipt`. Only `deliver_sm` carries a receipt body; `data_sm` receipts
+  are out of scope.
 - **`properties`** — protocol metadata not promoted to a typed field:
   - `dataCoding` (`int`) — the raw `data_coding` value.
   - `sourceAddrTon` / `sourceAddrNpi` / `destAddrTon` / `destAddrNpi`

@@ -119,6 +119,15 @@ public final class MockSmscBridge {
         mock(mockId).sendDeliverSmRaw(connectionId, shortMessage.getBytes(), dataCoding);
     }
 
+    /**
+     * Sends a deliver_sm flagged as an SMSC delivery receipt carrying {@code receiptText} as
+     * its short_message body — exercises the connector's receipt-parsing path end to end.
+     */
+    public static void sendDeliveryReceipt(long mockId, long connectionId, BString receiptText)
+            throws Exception {
+        mock(mockId).sendDeliveryReceipt(connectionId, receiptText.getValue());
+    }
+
     /** Abruptly severs the connection: socket close, no unbind exchange (qa-strategy §3.6). */
     public static void sever(long mockId, long connectionId) throws Exception {
         mock(mockId).sever(connectionId);

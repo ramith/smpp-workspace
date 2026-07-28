@@ -70,9 +70,23 @@ service can never stall the SMSC's `enquire_link` keepalive — see the design d
 ## The `Sms` record
 
 `sourceAddr`, `destAddr`, `shortMessage` (decoded text — see **Character encoding**),
-`shortMessageBytes` (the raw payload bytes, before decoding), `deliveryReceipt`, and
-`properties` (raw protocol metadata: `dataCoding`, TON/NPI for each address, `esmClass`,
-and the `udhi` User-Data-Header flag).
+`shortMessageBytes` (the raw payload bytes, before decoding), `deliveryReceipt`, `receipt`
+(the parsed delivery receipt — see below), and `properties` (raw protocol metadata:
+`dataCoding`, TON/NPI for each address, `esmClass`, and the `udhi` User-Data-Header flag).
+
+## Delivery receipts
+
+When `sms.deliveryReceipt` is `true`, the PDU is an SMSC delivery receipt (DLR). Its
+Appendix-B body is parsed by jsmpp into the typed `sms.receipt` (`DeliveryReceipt?`):
+`id`, `finalStatus` (a `DeliveryReceiptStatus` enum — `DELIVRD`, `EXPIRED`, `UNDELIV`, …),
+`submitted`/`delivered` counts, `submitDate`/`doneDate` (raw `yyMMddHHmm` strings — the wire
+carries no timezone, so parse them against your SMSC's documented zone), `errorCode`, and a
+short `text` echo. Every field is optional because SMSCs diverge from the Appendix-B layout.
+
+`receipt` is `()` (and `deliveryReceipt` may still be `true`) when the SMSC's receipt body
+doesn't conform to the format — the raw receipt text is always available on
+`sms.shortMessage` regardless. The connector adds no interpretation of its own here; it is a
+faithful surface of what jsmpp's receipt parser produces.
 
 ## Bind modes
 
