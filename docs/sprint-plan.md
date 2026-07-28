@@ -682,6 +682,83 @@ sprint — two constraints, both of which hold anyway:
 Nothing publishes mid-sprint, so no interim version number is needed and the semver question that
 the 8a-as-1.0.2 proposal ran into does not arise.
 
+### Phase 3 incident record — the rebind-wedge investigation (2026-07-29)
+
+Items 10 and 5 landed green (40/40, wall clock unchanged). One run later,
+`testRepeatedSeverRebindCycles` — recorded by Sprint 2 as "stable across repeated isolated runs" —
+failed once ("no bind observed within 10000ms"). Per the sprint's accuracy-over-speed rule the
+failure was investigated to conviction instead of being waved off as flake. Findings, so nobody
+re-litigates them:
+
+**The bug (pre-existing, NOT introduced by this sprint).** jsmpp 3.0.2 has a rare failure mode in
+its close choreography: after the peer severs, the `PDUReaderWorker` logs the EOF
+(`"Reading PDU session ... in state BOUND_TRX: null"`) and then **dies before completing
+`AbstractSession.close()`** — before interrupting the `EnquireLinkSender` and before `ctx.close()`,
+the only line that fires the CLOSED state listener. Evidence: 16 consecutive jstack samples across a
+reproduction show the reader thread absent, its EnquireLinkSender orphaned in the
+`AbstractSession.java:531` 500ms wait loop for 64+ seconds, and the session still `BOUND_TRX` 75s
+after the EOF (proven independently by cleanup's `unbindAndClose` taking the `isBound()`-gated
+`unbind()` branch). Consequence: the CLOSED listener — previously the connector's **only** drop
+signal — never fires, so no rebind is ever scheduled: a permanently deaf listener that still
+believes it is bound. Hit rate ≈ 1 sever in a few hundred (three reproductions across ~500
+instrumented cycles); permanent when it hits. The exact kill site inside the reader is bounded to
+the gap between `readPDU`'s log line and `close()`'s interrupt call, and was deliberately left
+unpinned when the owner called time — a working debug harness exists to finish that forensic if
+ever needed (repro worktree with a 45s-window instrumented soak; JUL `org.jsmpp=FINEST` via
+`JAVA_TOOL_OPTIONS` injected through a direct
+`docker run --net=host -v <worktree>/smpp:/home/ballerina/smpp ballerina/ballerina:2201.13.0
+"bal test --groups soak"` invocation, which also cuts a reproduction attempt from ~4.5min to ~2min).
+
+**Eliminated with evidence, in order:**
+
+- *Item 10's mock rewrite* — exonerated structurally by an adversarial review: every
+  `waitForBindAndValidate` path offers a `bindOutcomes` entry, so a 10s-empty queue means no TCP
+  connect ever arrived; the failing cycle also never invokes the new submit surface. (The review
+  did find a real regression of item 10's: a `request.accept()` throw now leaks the three
+  pre-registrations. Fix queued; see the work-item list.)
+- *Item 5's `transactionTimeout` (30s) delaying teardown* — refuted twice: bytecode +
+  live-probe measurement shows `close()` fires CLOSED **before** `pduExecutor.awaitTermination`,
+  EOF→CLOSED = 0–4ms in 20/20 runs even with a blocked executor and a 30s timer; and the
+  instrumented reproduction's 45s watch window outlasted the 30s timer with **no** rebind.
+- *Silent sever / SO_TIMEOUT detection* — refuted: the 75s-BOUND observation outlasts the 60s
+  `enquireLinkInterval`, and the EOF **was** logged, so the drop was seen and then lost.
+- *The connector's `installed`/`dropReported` gating* — exonerated: those guards act on the CLOSED
+  event, which never arrived; had they swallowed a fired CLOSED, the session could not still have
+  been BOUND at cleanup.
+
+**The fix (owner decision: workaround in our code only; jsmpp is not forked or patched).**
+`ObservedConnection` — both connection factories are already ours, so `newSession` now wraps every
+connection jsmpp opens; the wrapper reports EOF / read-`IOException` (never
+`SocketTimeoutException`, which is the keepalive cadence) to a one-shot callback the instant
+jsmpp's reader observes it. The callback shares the same per-attempt `installed`/`dropReported`
+guards as the CLOSED listener, so whichever signal arrives first reports the drop exactly once;
+after a 1s grace (normal-path CLOSED wins by ~250x margin) the connector declares the drop itself,
+abandons the wedged session (never joins jsmpp's close choreography — anything that waits on it
+inherits the wedge; the orphaned EnquireLinkSender is a bounded, logged leak), and drives the
+existing rebind path. Six JUnit cases pin the wrapper contract. Drop-count test assertions now go
+through `recordedDropCount()` (testutils), which accepts either detection path's wording — a
+healed wedge cycle is a *passing* cycle.
+
+**Collateral findings recorded while investigating (all real, none the cause):**
+
+- `./gradlew build` exited 0 with a failing `bal test` suite — the exit gate literally could not
+  fail. Fixed (test task now gates on `test_results.json`: `failed > 0` or `totalTests == 0`
+  throws), plus `test` now depends on `copyToLib` so fresh checkouts can run `:test` directly.
+- `testBindRejectedForInvalidSystemId` flaked once with `java.net.BindException: Address in use`
+  at `mockSmscOpen` — a test-isolation port-reuse exposure (likely lingering listener socket /
+  no `SO_REUSEADDR`), surfaced by shifted suite timing. Known, separate, unfixed.
+- After the failed soak, cleanup's `gracefulStop` burned its full 30s `gracefulStopTimeout` in
+  `awaitDrain` before the unbind — something held `inFlight` nonzero after an aborted test.
+  Observation only; worth a look if stop latency ever matters in test teardown.
+- Item 5's timer coupling is real in the *other* direction and now measured: `unbind()` on a dead
+  session waits the full `transactionTimeout` (2s → 30s), and silent-peer (blackhole) detection is
+  `enquireLinkInterval + transactionTimeout` (≈62s → ≈90s with defaults). Both are documented on
+  the field; whether 30s remains the right default is an open owner decision — the submit-side
+  rationale (a timed-out submit is "possibly delivered, retrying may duplicate") still stands.
+- Sprint 2's "stable across repeated isolated runs" claim for this soak was sampling luck: at
+  ~1-in-a-few-hundred-per-sever odds, 15-cycle runs pass the overwhelming majority of the time.
+  The wedge predates Sprint 8.
+
 ### Exit gate
 
 All of the following pass under `./gradlew build` from `smpp/`, with zero new

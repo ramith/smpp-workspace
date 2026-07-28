@@ -76,6 +76,21 @@ isolated function recordedErrorsContaining(string substring) returns int {
     }
 }
 
+# Counts recorded drop notifications regardless of which detection path reported them.
+# A drop reaches `onError` through one of two exactly-once-guarded signals: jsmpp's
+# CLOSED state listener ("SMPP session closed unexpectedly ...") — the normal path — or
+# the connector's own transport-death observer ("SMPP transport died and jsmpp's CLOSED
+# notification did not arrive ..."), which recovers the rare jsmpp reader-death wedge
+# where CLOSED never fires (see ObservedConnection.java). Tests asserting drop COUNTS
+# must accept either wording, or a correctly-healed wedge cycle fails the count; tests
+# pinning the normal path's wording specifically should keep `recordedErrorsContaining`.
+#
+# + return - how many recorded onError messages are drop notifications, by either wording
+isolated function recordedDropCount() returns int {
+    return recordedErrorsContaining("closed unexpectedly")
+        + recordedErrorsContaining("transport died");
+}
+
 isolated function clearRecordedErrors() {
     lock {
         recordedErrors.removeAll();

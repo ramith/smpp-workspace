@@ -54,9 +54,12 @@ function testRepeatedSeverRebindCycles() returns error? {
 
     // onError notifications ride separate virtual threads and can lag the (SYNC,
     // event-ordered) message flow - poll before asserting counts.
-    test:assertTrue(pollUntil(() => recordedErrorsContaining("closed unexpectedly") >= 15, 10),
-            string `expected 15 drop notifications, got ${recordedErrorsContaining("closed unexpectedly")}`);
-    test:assertEquals(recordedErrorsContaining("closed unexpectedly"), 15);
+    test:assertTrue(pollUntil(() => recordedDropCount() >= 15, 10),
+            string `expected 15 drop notifications, got ${recordedDropCount()}`);
+    // Either wording counts as the drop: the wedge-recovery path (ObservedConnection)
+    // reports "transport died ..." instead of "closed unexpectedly" when jsmpp's CLOSED
+    // never fires - behaviourally the same drop, detected by the connector itself.
+    test:assertEquals(recordedDropCount(), 15);
     test:assertEquals(recordedErrorsContaining("gave up"), 0);
     // >=, not ==: a transiently failed first attempt inside a cycle legitimately adds a
     // "rebind attempt 1 failed" before the retry succeeds (infinite policy); the

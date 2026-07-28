@@ -69,6 +69,20 @@ call):
 This is distinct from a failed *initial* `'start()` call, which is always
 returned to you directly as an `error` and never retried by `rebindPolicy`.
 
+**How drops are detected (two independent signals).** The primary signal is jsmpp's own
+session-state listener firing `CLOSED` — normally 0–4ms after the socket dies. jsmpp 3.0.2
+also has a rare failure mode (roughly one sever in a few hundred under soak) where its
+reader thread dies mid-close and that notification **never** fires, leaving the session
+claiming to be bound forever. The connector therefore observes the transport itself: both
+connection factories wrap every socket stream, and an EOF or read error fires a second,
+independent drop signal. Whichever signal arrives first wins (exactly-once guarded); if
+the primary hasn't fired within a 1s grace, the connector declares the drop itself —
+`onError` message `"SMPP transport died and jsmpp's CLOSED notification did not arrive
+..."` instead of `"SMPP session closed unexpectedly ..."` — abandons the wedged session,
+and proceeds with the same rebind flow. Code that matches on `onError` message text should
+treat either wording as "the link dropped". See `ObservedConnection.java` and the Sprint 8
+Phase 3 incident record in [sprint-plan.md](sprint-plan.md) for the full forensics.
+
 ## Configuration reference
 
 All fields live on `ConnectionConfig`, passed to `new (...)` when you create

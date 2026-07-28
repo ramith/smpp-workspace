@@ -167,7 +167,11 @@ public final class NativeListener {
         // Bounds both the TCP connect (via the connection factory) and the bind-response
         // wait (via connectAndBind below), on the initial start and every rebind alike.
         int bindTimeoutMillis = (int) (decimalValue(config, "bindTimeout") * 1000);
-        SMPPSession session = newSession(listener, bindTimeoutMillis);
+        // Armed further down, once the per-attempt drop guards exist; connections created
+        // before arming (i.e. during connectAndBind's connect phase) report nothing, and
+        // connect/bind-phase failures are surfaced by connectAndBind itself.
+        AtomicReference<Runnable> onTransportDeath = new AtomicReference<>();
+        SMPPSession session = newSession(listener, bindTimeoutMillis, onTransportDeath);
         session.setMessageReceiverListener(dispatcher);
 
         String host = str(config, "host");
@@ -222,6 +226,14 @@ public final class NativeListener {
         // so neither side can assume the other has or hasn't run yet.
         AtomicBoolean installed = new AtomicBoolean(false);
         AtomicBoolean dropReported = new AtomicBoolean(false);
+        // Second, independent drop signal (see ObservedConnection): fires the moment
+        // jsmpp's reader observes EOF/IOException on the socket. Shares the same
+        // per-attempt guards as the state listener below, so whichever signal arrives
+        // first reports the drop exactly once. The grace delay gives jsmpp's own CLOSED
+        // notification - the normal path, measured at 0-4ms after EOF when the close
+        // choreography works - every reasonable chance to win; this path only acts when
+        // that choreography wedges (the reader-death failure mode).
+        onTransportDeath.set(() -> scheduleTransportDeathCheck(listener, installed, dropReported));
         session.addSessionStateListener((newState, oldState, source) -> {
             if (newState != SessionState.CLOSED || !installed.get()) {
                 return;
@@ -308,6 +320,55 @@ public final class NativeListener {
     private static void onUnexpectedDrop(BObject listener, String description) {
         dispatcher(listener).dispatchError(description);
         scheduleRebind(listener, 1);
+    }
+
+    /**
+     * How long the transport-death signal waits for jsmpp's own CLOSED notification
+     * before declaring the drop itself. When jsmpp's close choreography works it fires
+     * CLOSED 0-4ms after the EOF, so 1s is ~250x headroom for the normal path while still
+     * recovering a wedged session ~10x faster than the tightest test budget (10s).
+     */
+    private static final long TRANSPORT_DEATH_GRACE_MS = 1000;
+
+    /**
+     * Invoked (via {@link ObservedConnection}) on jsmpp's reader thread the moment the
+     * transport dies. Schedules a delayed check rather than acting inline: the normal
+     * path is that jsmpp's CLOSED listener fires within milliseconds and wins the
+     * {@code dropReported} CAS, making the check a no-op. Only when the reader thread
+     * dies mid-{@code close()} - leaving the session BOUND forever and the CLOSED
+     * listener unfired (the wedge documented on {@link ObservedConnection}) - does this
+     * path report the drop and drive the rebind.
+     *
+     * <p>The wedged jsmpp threads (an orphaned EnquireLinkSender, at worst) are
+     * deliberately abandoned, not joined: anything that waits on jsmpp's close
+     * choreography inherits the wedge. The next bind builds a fresh session; the orphan
+     * exits on its own if the state ever flips, and is otherwise a bounded, logged leak.
+     */
+    private static void scheduleTransportDeathCheck(BObject listener, AtomicBoolean installed,
+            AtomicBoolean dropReported) {
+        synchronized (stateLock(listener)) {
+            ListenerState st = state(listener).get();
+            if (st != ListenerState.STARTING && st != ListenerState.STARTED) {
+                return; // stopping/stopped: user-initiated teardown closes sockets too
+            }
+            try {
+                rebindExecutor(listener).schedule(() -> {
+                    if (state(listener).get() != ListenerState.STARTED || !installed.get()) {
+                        // Bind-phase death (connectAndBind surfaces it to start()/rebind)
+                        // or a stop won the race - either way, not ours to report.
+                        return;
+                    }
+                    if (dropReported.compareAndSet(false, true)) {
+                        onUnexpectedDrop(listener,
+                                "SMPP transport died and jsmpp's CLOSED notification did not arrive within "
+                                        + TRANSPORT_DEATH_GRACE_MS + "ms (reader-death wedge; abandoning the session)");
+                    }
+                }, TRANSPORT_DEATH_GRACE_MS, TimeUnit.MILLISECONDS);
+            } catch (java.util.concurrent.RejectedExecutionException e) {
+                // A stop shut the executor down between the state check and schedule();
+                // stops own their teardown, nothing to report.
+            }
+        }
     }
 
     @SuppressWarnings("unchecked")
@@ -489,12 +550,17 @@ public final class NativeListener {
      * separately by the timeout passed to {@code connectAndBind}.
      */
     @SuppressWarnings("unchecked")
-    private static SMPPSession newSession(BObject listener, int connectTimeoutMillis) throws Exception {
+    private static SMPPSession newSession(BObject listener, int connectTimeoutMillis,
+            AtomicReference<Runnable> onTransportDeath) throws Exception {
         Object tls = listener.getNativeData(NATIVE_TLS);
-        if (tls == null) {
-            return new SMPPSession(new SmppPlainConnectionFactory(connectTimeoutMillis));
-        }
-        return new SMPPSession(buildSslFactory((BMap<BString, Object>) tls, connectTimeoutMillis));
+        org.jsmpp.session.connection.ConnectionFactory delegate = tls == null
+                ? new SmppPlainConnectionFactory(connectTimeoutMillis)
+                : buildSslFactory((BMap<BString, Object>) tls, connectTimeoutMillis);
+        // Every connection this session ever opens is observed - the connector's own
+        // transport-death signal, independent of jsmpp's CLOSED listener. See
+        // ObservedConnection for the reader-death wedge this guards against.
+        return new SMPPSession((host, port) ->
+                new ObservedConnection(delegate.createConnection(host, port), onTransportDeath));
     }
 
     /** Field names here mirror listener.bal's internal ResolvedTls record exactly. */
