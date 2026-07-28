@@ -8,9 +8,11 @@ repository = "https://github.com/ramith/smpp-workspace"
 icon = "icon.png"
 readme = "Package.md"
 license = ["Apache-2.0"]
-# Raised from 2201.13.0 (owner, 2026-07-29): 13.0 was claimed but never tested — only
-# 13.1 and 13.4 are installed — and D10 flagged the gap. Claim only what CI exercises.
-distribution = "2201.13.1"
+# Must stay in lockstep with `ballerinaLangVersion` in smpp/gradle.properties — the
+# io.ballerina.plugin harness builds and tests the package with exactly that distribution,
+# so declaring a higher minimum here would claim support for a version nothing is built on.
+# (D10 asked whether 13.0 was ever exercised: it is, by every ./gradlew build.)
+distribution = "2201.13.0"
 
 [build-options]
 observabilityIncluded = false

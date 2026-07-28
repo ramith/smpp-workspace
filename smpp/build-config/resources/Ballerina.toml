@@ -8,12 +8,20 @@ repository = "https://github.com/ramith/smpp-workspace"
 icon = "icon.png"
 readme = "Package.md"
 license = ["Apache-2.0"]
+# Must stay in lockstep with `ballerinaLangVersion` in smpp/gradle.properties — the
+# io.ballerina.plugin harness builds and tests the package with exactly that distribution,
+# so declaring a higher minimum here would claim support for a version nothing is built on.
+# (D10 asked whether 13.0 was ever exercised: it is, by every ./gradlew build.)
 distribution = "2201.13.0"
 
 [build-options]
 observabilityIncluded = false
 
 [platform.java21]
+# Deliberate, not a known technical blocker (owner, 2026-07-29): GraalVM native-image
+# builds are very slow, and native-image support is not a requirement for this package,
+# so the build cost is not justified. Whether jsmpp would work under native-image at all
+# is untested and unknown. Revisit only if a consumer actually needs it.
 graalvmCompatible = false
 
 # Hand-written native glue that bridges jsmpp callbacks into the Ballerina runtime.

@@ -1284,10 +1284,30 @@ a `ClassCastException`). Then no non-`remote` name can ever reach `callMethod`, 
 discharged by construction rather than by a runtime experiment. `RemoteMethodType` is also the more
 precise element type for the parameter-shape resolution D1 specifies.
 
-**OPEN — behaviour on exactly 2201.13.0.** Confirmed genuinely absent: `bal dist list` shows 13.1 and
-13.4 locally, no 13.0, while `smpp/ballerina/Ballerina.toml` pins `distribution = "2201.13.0"`.
-Closing this means `bal dist pull 2201.13.0` — an install, so left for the owner to authorise rather
-than done unprompted.
+**RESOLVED — 2201.13.0 *is* what the build runs on. The premise of the question was wrong.**
+
+D10 recorded "only 13.1/13.4 installed", which is true of the local **interactive** `bal` (`bal dist
+list` confirms it) — but that is not what builds this package. `smpp/gradle.properties:7` pins
+`ballerinaLangVersion=2201.13.0`, and the `io.ballerina.plugin` harness builds and tests with exactly
+that distribution. Every `./gradlew build`, and therefore every run of the exit-gate suite, has
+already been on 13.0.
+
+Decisive evidence rather than inference: a green `./gradlew build` on 2026-07-29 rewrote
+`smpp/ballerina/Dependencies.toml` from `distribution-version = "2201.13.4"` to `"2201.13.0"` —
+the build stamps the distribution that actually compiled it.
+
+**Consequence — do not raise the pin.** It was briefly raised to 13.1 and reverted the same day.
+`Ballerina.toml`'s `distribution` and `gradle.properties`'s `ballerinaLangVersion` must move together:
+raising only the former claims a minimum that nothing is built or tested on. (Notably the mismatched
+build still reported BUILD SUCCESSFUL, so the toolchain does not catch this for you.) Both files now
+carry a comment saying so. If 13.1 is ever wanted, change both.
+
+> **Gotcha for implementers.** `./gradlew build` regenerates `ballerina/Ballerina.toml` from
+> `build-config/resources/Ballerina.toml` **and git-commits the result** via `commitTomlFiles` —
+> on a plain build, not only in the release pipeline as `ballerina/build.gradle:56` suggests. Two
+> consequences during Sprint 8: edit the **template**, never only the generated file, or your change
+> is reverted; and expect an `[Automated] Update the toml files` commit to appear on your branch
+> whenever a toml genuinely changes.
 
 **OPEN — any real 1.0.1 user constructing `smpp:Error` with custom detail args.** Unknowable from
 here; it is a question about third-party code, not this repo. What *is* checkable: `Error` is
