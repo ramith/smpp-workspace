@@ -3,21 +3,43 @@ package io.ballerinax.smpp.test;
 
 import org.jsmpp.SMPPConstant;
 import org.jsmpp.extra.NegativeResponseException;
+import org.jsmpp.extra.ProcessRequestException;
+import org.jsmpp.bean.BroadcastSm;
+import org.jsmpp.bean.CancelBroadcastSm;
+import org.jsmpp.bean.CancelSm;
+import org.jsmpp.bean.DataSm;
 import org.jsmpp.bean.DeliverSm;
 import org.jsmpp.bean.ESMClass;
 import org.jsmpp.bean.NumberingPlanIndicator;
 import org.jsmpp.bean.OptionalParameter;
+import org.jsmpp.bean.QueryBroadcastSm;
+import org.jsmpp.bean.QuerySm;
 import org.jsmpp.bean.RawDataCoding;
 import org.jsmpp.bean.RegisteredDelivery;
+import org.jsmpp.bean.ReplaceSm;
+import org.jsmpp.bean.SubmitMulti;
+import org.jsmpp.bean.SubmitSm;
 import org.jsmpp.bean.TypeOfNumber;
 import org.jsmpp.session.BindRequest;
+import org.jsmpp.session.BroadcastSmResult;
+import org.jsmpp.session.DataSmResult;
+import org.jsmpp.session.QueryBroadcastSmResult;
+import org.jsmpp.session.QuerySmResult;
+import org.jsmpp.session.ServerMessageReceiverListener;
+import org.jsmpp.session.Session;
 import org.jsmpp.session.SMPPServerSession;
 import org.jsmpp.session.SMPPServerSessionListener;
+import org.jsmpp.session.SubmitMultiResult;
+import org.jsmpp.session.SubmitSmResult;
 import org.jsmpp.session.connection.ServerConnectionFactory;
+import org.jsmpp.util.MessageId;
 
 import java.io.IOException;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
+import java.util.Collections;
+import java.util.IdentityHashMap;
+import java.util.Map;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
@@ -48,7 +70,24 @@ final class MockSmsc {
     // recycling under that load (a 4-thread/60s combination wedged empirically).
     private final ExecutorService waitBindPool = Executors.newFixedThreadPool(8);
     private final ConcurrentHashMap<Long, SMPPServerSession> connections = new ConcurrentHashMap<>();
+    // Reverse of `connections`: the capturing listener is handed a session, not a handle,
+    // so this is the only way an inbound submit_sm can be attributed to a connection.
+    // Identity-keyed on purpose - SMPPServerSession does not override equals/hashCode, and
+    // relying on inherited identity semantics implicitly would be fragile if it ever did.
+    private final Map<SMPPServerSession, Long> connectionIds = Collections.synchronizedMap(new IdentityHashMap<>());
+    // Per-connection FIFO of captured submit_sm PDUs, so concurrent submits on different
+    // connections cannot interleave into one queue and tests can await a specific link.
+    private final ConcurrentHashMap<Long, BlockingQueue<SubmitSm>> submitCaptures = new ConcurrentHashMap<>();
     private final AtomicLong nextConnectionId = new AtomicLong(1);
+    // Monotonic so a test can assert which submit produced which id, and so the value is
+    // stable across runs (jsmpp's own generators are random).
+    private final AtomicLong nextMessageId = new AtomicLong(1000);
+    // Fault injection, both off by default. 0 = respond normally.
+    private volatile int submitFailureStatus = 0;
+    private volatile long submitDelayMillis = 0;
+    // When true, submit_sm_resp carries an empty message_id - a spec-legal response that
+    // leaves the client with nothing to correlate a later receipt against.
+    private volatile boolean submitEmptyMessageId = false;
     // Each entry is either a Long (connection handle, bind accepted) or a Throwable
     // (bind rejected / listener error), so awaitNextBind can surface both outcomes.
     private final BlockingQueue<Object> bindOutcomes = new LinkedBlockingQueue<>();
@@ -71,6 +110,15 @@ final class MockSmsc {
         // Generous - the mock must never be its own bottleneck (docs/qa-strategy.md §3.7).
         listener.setPduProcessorDegree(50);
         listener.setQueueCapacity(1000);
+        // Set ONCE, here: SMPPServerSessionListener.accept() copies this reference into
+        // every session it returns, so there is no accept-then-set window in which an
+        // early submit_sm could arrive at a session with no listener. Setting it
+        // per-session after accept() would reintroduce exactly that race.
+        //
+        // Before Sprint 8 no receiver listener was set at all, which made jsmpp answer
+        // every submit_sm with ESME_RX_R_APPN - so a submit test would have failed
+        // regardless of connector correctness.
+        listener.setMessageReceiverListener(new CapturingReceiverListener());
     }
 
     /** Starts the accept-loop in the background; returns immediately. */
@@ -113,19 +161,28 @@ final class MockSmsc {
                 bindOutcomes.offer(new IllegalStateException("bind rejected: invalid password"));
                 return;
             }
-            request.accept("mock-smsc");
+            // Mint the handle and register the session BEFORE accepting the bind. The
+            // client may submit the instant bind_resp lands, and the capturing listener
+            // attributes an inbound submit_sm by looking the session up in
+            // `connectionIds` - so if registration happened after accept(), a submit
+            // arriving on the heels of bind_resp would be unattributable (Sprint 8, D9).
             long id = nextConnectionId.getAndIncrement();
+            connections.put(id, session);
+            connectionIds.put(session, id);
+            submitCaptures.put(id, new LinkedBlockingQueue<>());
+            request.accept("mock-smsc");
             if (closeAfterAccept) {
                 // Accepted-then-instantly-dropped: the bound-race soak's cycle driver
                 // (docs/sprint-plan.md Sprint 2, "closes the connection immediately
                 // post-accept, looped"). Close BEFORE offering the outcome so the drop
-                // has already happened by the time the test observes the bind. Not
-                // registered in `connections` - the session is already dead.
+                // has already happened by the time the test observes the bind. Undo the
+                // registration above - the session is already dead, and Sprint 2's soak
+                // cycles this rapidly, so leaving entries behind would leak per-cycle.
+                forget(id, session);
                 session.close();
                 bindOutcomes.offer(id);
                 return;
             }
-            connections.put(id, session);
             bindOutcomes.offer(id);
         } catch (Exception e) {
             bindOutcomes.offer(e);
@@ -217,12 +274,31 @@ final class MockSmsc {
      * exercising the connector's receipt-parsing path end to end.
      */
     void sendDeliveryReceipt(long connectionId, String receiptText) throws Exception {
+        sendDeliveryReceipt(connectionId, receiptText, null);
+    }
+
+    /**
+     * As above, but additionally carrying the {@code receipted_message_id} TLV (0x001E)
+     * when {@code receiptedMessageId} is non-null.
+     *
+     * <p>This is the spec's only <em>guaranteed</em> correlation key (§5.3.2.12): the
+     * {@code id:} field in an Appendix-B receipt body is "SMSC vendor specific", which is
+     * why the hex-vs-decimal radix mismatch exists in the wild at all. A test needs to be
+     * able to send a receipt whose TLV and whose body id disagree, so the connector's
+     * correlation can be pinned to the right one.
+     */
+    void sendDeliveryReceipt(long connectionId, String receiptText, String receiptedMessageId)
+            throws Exception {
+        OptionalParameter[] params = receiptedMessageId == null
+                ? new OptionalParameter[0]
+                : new OptionalParameter[] {
+                        new OptionalParameter.Receipted_message_id(receiptedMessageId) };
         connection(connectionId).deliverShortMessage(
                 "", TypeOfNumber.INTERNATIONAL, NumberingPlanIndicator.ISDN, "12345",
                 TypeOfNumber.INTERNATIONAL, NumberingPlanIndicator.ISDN, "99999",
                 new ESMClass(DeliverSm.composeSmscDeliveryReceipt((byte) 0)), (byte) 0, (byte) 0,
                 new RegisteredDelivery(0), new RawDataCoding((byte) 0),
-                receiptText.getBytes(StandardCharsets.US_ASCII), new OptionalParameter[0]);
+                receiptText.getBytes(StandardCharsets.US_ASCII), params);
     }
 
     /**
@@ -241,6 +317,178 @@ final class MockSmsc {
                 new ESMClass(), new RegisteredDelivery(0),
                 new RawDataCoding((byte) dataCoding),
                 params);
+    }
+
+    // --- submit_sm capture (Sprint 8, item 10) ---------------------------------------
+
+    /**
+     * Receives client-originated PDUs. Only {@code submit_sm} is implemented; the rest
+     * answer the way jsmpp's own {@code SMPPServerSimulator} does for unsupported
+     * operations, rather than returning {@code null} (which is what
+     * {@code Dispatcher.onAcceptDataSm} was fixed for in Sprint 0 — a null here is a
+     * latent NPE inside jsmpp's response writer, not a benign no-op).
+     *
+     * <p>One instance is shared by every session this mock accepts, so it holds no
+     * per-connection state: attribution is by session identity via {@code connectionIds}.
+     */
+    private final class CapturingReceiverListener implements ServerMessageReceiverListener {
+
+        @Override
+        public SubmitSmResult onAcceptSubmitSm(SubmitSm submitSm, SMPPServerSession source)
+                throws ProcessRequestException {
+            Long id = connectionIds.get(source);
+            if (id != null) {
+                // Registered before accept(), so this cannot miss a submit that races
+                // bind_resp. A null id means the session was already severed/forgotten -
+                // capture nothing rather than resurrect a dead connection's queue.
+                BlockingQueue<SubmitSm> queue = submitCaptures.get(id);
+                if (queue != null) {
+                    queue.offer(submitSm);
+                }
+            }
+
+            long delay = submitDelayMillis;
+            if (delay > 0) {
+                // Deliberately blocks the jsmpp PDU-processor thread, which is exactly
+                // what a slow SMSC does - that is the condition the connector's
+                // transactionTimeout (item 5) has to survive.
+                try {
+                    Thread.sleep(delay);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new ProcessRequestException("interrupted while delaying submit_sm",
+                            SMPPConstant.STAT_ESME_RSYSERR);
+                }
+            }
+
+            int failure = submitFailureStatus;
+            if (failure != 0) {
+                // Becomes the submit_sm_resp command_status, which jsmpp surfaces to the
+                // client as NegativeResponseException - the connector's REJECTED path.
+                throw new ProcessRequestException("injected submit failure", failure);
+            }
+
+            String messageId = submitEmptyMessageId
+                    ? ""
+                    : Long.toString(nextMessageId.getAndIncrement());
+            try {
+                // The String ctors of SubmitSmResult are package-private; MessageId is the
+                // only public route. It declares PDUStringException but accepts both ""
+                // and ordinary decimal ids, so neither branch above can trip it.
+                return new SubmitSmResult(new MessageId(messageId), new OptionalParameter[0]);
+            } catch (Exception e) {
+                throw new ProcessRequestException("could not build submit_sm_resp: " + e.getMessage(),
+                        SMPPConstant.STAT_ESME_RSYSERR, e);
+            }
+        }
+
+        @Override
+        public SubmitMultiResult onAcceptSubmitMulti(SubmitMulti submitMulti, SMPPServerSession source)
+                throws ProcessRequestException {
+            throw new ProcessRequestException("submit_multi not supported by this mock",
+                    SMPPConstant.STAT_ESME_RINVCMDID);
+        }
+
+        @Override
+        public QuerySmResult onAcceptQuerySm(QuerySm querySm, SMPPServerSession source)
+                throws ProcessRequestException {
+            throw new ProcessRequestException("query_sm not supported by this mock",
+                    SMPPConstant.STAT_ESME_RINVCMDID);
+        }
+
+        @Override
+        public void onAcceptReplaceSm(ReplaceSm replaceSm, SMPPServerSession source)
+                throws ProcessRequestException {
+            throw new ProcessRequestException("replace_sm not supported by this mock",
+                    SMPPConstant.STAT_ESME_RINVCMDID);
+        }
+
+        @Override
+        public void onAcceptCancelSm(CancelSm cancelSm, SMPPServerSession source)
+                throws ProcessRequestException {
+            throw new ProcessRequestException("cancel_sm not supported by this mock",
+                    SMPPConstant.STAT_ESME_RINVCMDID);
+        }
+
+        @Override
+        public BroadcastSmResult onAcceptBroadcastSm(BroadcastSm broadcastSm, SMPPServerSession source)
+                throws ProcessRequestException {
+            throw new ProcessRequestException("broadcast_sm not supported by this mock",
+                    SMPPConstant.STAT_ESME_RINVCMDID);
+        }
+
+        @Override
+        public void onAcceptCancelBroadcastSm(CancelBroadcastSm cancelBroadcastSm, SMPPServerSession source)
+                throws ProcessRequestException {
+            throw new ProcessRequestException("cancel_broadcast_sm not supported by this mock",
+                    SMPPConstant.STAT_ESME_RINVCMDID);
+        }
+
+        @Override
+        public QueryBroadcastSmResult onAcceptQueryBroadcastSm(QueryBroadcastSm queryBroadcastSm,
+                                                               SMPPServerSession source)
+                throws ProcessRequestException {
+            throw new ProcessRequestException("query_broadcast_sm not supported by this mock",
+                    SMPPConstant.STAT_ESME_RINVCMDID);
+        }
+
+        @Override
+        public DataSmResult onAcceptDataSm(DataSm dataSm, Session source) throws ProcessRequestException {
+            // The connector only ever receives data_sm; a client-originated one is not
+            // something these tests exercise.
+            throw new ProcessRequestException("data_sm not supported by this mock",
+                    SMPPConstant.STAT_ESME_RINVCMDID);
+        }
+    }
+
+    /**
+     * Blocks until the next {@code submit_sm} arrives on this connection, and returns it.
+     * FIFO per connection, so a test on one link is never handed another link's PDU.
+     */
+    SubmitSm awaitNextSubmit(long connectionId, long timeoutMillis) throws Exception {
+        BlockingQueue<SubmitSm> queue = submitCaptures.get(connectionId);
+        if (queue == null) {
+            throw new IllegalArgumentException("no such connection handle: " + connectionId);
+        }
+        SubmitSm submitSm = queue.poll(timeoutMillis, TimeUnit.MILLISECONDS);
+        if (submitSm == null) {
+            throw new TimeoutException("no submit_sm observed on connection " + connectionId
+                    + " within " + timeoutMillis + "ms");
+        }
+        return submitSm;
+    }
+
+    /** How many captured submits are still unread on this connection (0 if unknown). */
+    int pendingSubmitCount(long connectionId) {
+        BlockingQueue<SubmitSm> queue = submitCaptures.get(connectionId);
+        return queue == null ? 0 : queue.size();
+    }
+
+    /**
+     * Makes every subsequent submit_sm answer with this {@code command_status} instead of
+     * succeeding. 0 restores normal behaviour.
+     */
+    void setSubmitFailure(int commandStatus) {
+        this.submitFailureStatus = commandStatus;
+    }
+
+    /** Delays every subsequent submit_sm_resp by this many ms. 0 disables. */
+    void setSubmitDelay(long millis) {
+        this.submitDelayMillis = millis;
+    }
+
+    /** When enabled, submit_sm_resp carries an empty message_id. */
+    void setSubmitEmptyMessageId(boolean enabled) {
+        this.submitEmptyMessageId = enabled;
+    }
+
+    /** Drops every registration for a connection. Idempotent. */
+    private void forget(long connectionId, SMPPServerSession session) {
+        connections.remove(connectionId);
+        submitCaptures.remove(connectionId);
+        if (session != null) {
+            connectionIds.remove(session);
+        }
     }
 
     /**
@@ -268,7 +516,7 @@ final class MockSmsc {
      */
     void sever(long connectionId) {
         SMPPServerSession session = connection(connectionId);
-        connections.remove(connectionId);
+        forget(connectionId, session);
         session.close();
     }
 
@@ -281,7 +529,7 @@ final class MockSmsc {
      */
     void peerUnbind(long connectionId) throws Exception {
         SMPPServerSession session = connection(connectionId);
-        connections.remove(connectionId);
+        forget(connectionId, session);
         session.unbindAndClose();
     }
 
