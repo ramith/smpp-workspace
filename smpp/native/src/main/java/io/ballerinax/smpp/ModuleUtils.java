@@ -4,8 +4,13 @@ package io.ballerinax.smpp;
 import io.ballerina.runtime.api.Environment;
 import io.ballerina.runtime.api.Module;
 import io.ballerina.runtime.api.creators.ErrorCreator;
+import io.ballerina.runtime.api.creators.ValueCreator;
 import io.ballerina.runtime.api.utils.StringUtils;
 import io.ballerina.runtime.api.values.BError;
+import io.ballerina.runtime.api.values.BMap;
+import io.ballerina.runtime.api.values.BString;
+
+import java.util.Map;
 
 /**
  * Captures the {@code ramith/smpp} module reference at module init time so the
@@ -41,5 +46,29 @@ public final class ModuleUtils {
      */
     public static BError createError(String message) {
         return ErrorCreator.createDistinctError(ERROR_TYPE_NAME, smppModule, StringUtils.fromString(message));
+    }
+
+    /**
+     * As {@link #createError(String)}, additionally carrying an {@code ErrorDetail}
+     * record (failureMode / commandStatus / sequenceNumber — all-optional fields of the
+     * open detail record in types.bal). The submit path uses this so callers can branch
+     * retry logic on {@code e.detail().failureMode}; every other error site keeps the
+     * no-detail overload.
+     *
+     * @param message the error message
+     * @param detail detail entries; {@code String} values become {@code BString},
+     *     {@code null} values are skipped
+     * @return a {@code smpp:Error} value with a populated detail record
+     */
+    public static BError createError(String message, Map<String, Object> detail) {
+        BMap<BString, Object> d = ValueCreator.createRecordValue(smppModule, "ErrorDetail");
+        for (Map.Entry<String, Object> e : detail.entrySet()) {
+            if (e.getValue() != null) {
+                Object v = e.getValue() instanceof String s ? StringUtils.fromString(s) : e.getValue();
+                d.put(StringUtils.fromString(e.getKey()), v);
+            }
+        }
+        return ErrorCreator.createDistinctError(ERROR_TYPE_NAME, smppModule,
+                StringUtils.fromString(message), d);
     }
 }

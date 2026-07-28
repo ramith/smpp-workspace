@@ -1076,6 +1076,21 @@ runtime accepts `(Caller, Sms)`; a plugin modelled on `MqttFunctionValidator` wo
 `testCallerParamShapes` has no caller-first case, so the contract is unpinned exactly where the two
 sprints disagree.
 
+> **DECIDED at implementation (2026-07-29): type-based, order-agnostic.** Both `(Sms, Caller)`
+> and `(Caller, Sms)` are legal; `testCallerParamShapes` now pins the caller-first case
+> positively. Rationale: this section itself rates type-binding above stdlib ("our rule is
+> better than stdlib rather than a match to it"), order-agnosticism removes an attach-rejection
+> class with no ambiguity cost (the two parameter types are disjoint), and Sprint 9's plugin
+> rule becomes "one `smpp:Sms`, optionally one non-defaultable `smpp:Caller`, no rest
+> parameter, types not order" — simpler to state and to validate than a position rule.
+> All four D1 traps are enforced at attach with named-method reasons: defaultable Caller,
+> `smpp:Caller?` union, rest parameter, and duplicate same-type parameters each reject loudly
+> (`AttachResult.BAD_SIGNATURE`). `onError` stays strictly 1-arity. One gate deviation, recorded:
+> `testSubmitBeforeStartIsRejected` is untestable by construction — a `Caller` reaches user code
+> only as a dispatch parameter and no dispatch precedes `'start()` (module-private `init` is what
+> guarantees this), so the stopped/mid-rebind cases carry that line and the lifecycle pre-check
+> keeps the unreachable window guarded as defense in depth.
+
 **And the precedent claim was overstated.** mqtt does enforce caller-last (compile-verified: caller-first
 is `MQTT_105`/`MQTT_106`). **ftp does not** — `FtpFunctionValidator` tries `(Caller, WatchEvent)`
 first and `(WatchEvent, Caller)` second, `FTP_109` fires only when neither matches, and a caller-first

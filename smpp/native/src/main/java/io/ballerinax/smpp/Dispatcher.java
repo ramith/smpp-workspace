@@ -6,7 +6,11 @@ import io.ballerina.runtime.api.Runtime;
 import io.ballerina.runtime.api.concurrent.StrandMetadata;
 import io.ballerina.runtime.api.creators.ValueCreator;
 import io.ballerina.runtime.api.types.MethodType;
+import io.ballerina.runtime.api.types.NetworkObjectType;
 import io.ballerina.runtime.api.types.ObjectType;
+import io.ballerina.runtime.api.types.Parameter;
+import io.ballerina.runtime.api.types.RemoteMethodType;
+import io.ballerina.runtime.api.types.Type;
 import io.ballerina.runtime.api.utils.StringUtils;
 import io.ballerina.runtime.api.utils.TypeUtils;
 import io.ballerina.runtime.api.values.BError;
@@ -33,7 +37,9 @@ import java.text.SimpleDateFormat;
 import java.util.Date;
 
 import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -78,13 +84,29 @@ public class Dispatcher implements MessageReceiverListener {
     }
 
     /**
-     * Immutable (service, remote-method-set) pair published through a single volatile
-     * reference, so a PDU thread can never observe a torn attach/detach (the new
-     * service paired with the old method set, or vice versa).
+     * How a remote method wants its arguments: where the Sms goes, and where the Caller
+     * goes ({@code -1} = the method did not declare one). Resolved once, at attach, by
+     * TYPE — never re-derived per PDU.
      */
-    private record ServiceBinding(BObject service, Set<String> remoteMethods) { }
+    record MethodPlan(int smsIndex, int callerIndex, int arity) { }
 
-    enum AttachResult { ATTACHED, ALREADY_ATTACHED, NO_REMOTE_METHODS }
+    /**
+     * Immutable (service, remote-method-set, per-method plans) triple published through a
+     * single volatile reference, so a PDU thread can never observe a torn attach/detach
+     * (the new service paired with the old method set or plans, or vice versa).
+     */
+    private record ServiceBinding(BObject service, Set<String> remoteMethods,
+            Map<String, MethodPlan> plans) { }
+
+    enum AttachResult { ATTACHED, ALREADY_ATTACHED, NO_REMOTE_METHODS, BAD_SIGNATURE }
+
+    /**
+     * Attach outcome plus, for {@code BAD_SIGNATURE}, the human-readable reason
+     * (which method, which rule) — surfaced verbatim in the attach error.
+     */
+    record AttachOutcome(AttachResult result, String detail) {
+        static final AttachOutcome ATTACHED_OK = new AttachOutcome(AttachResult.ATTACHED, null);
+    }
 
     private final Runtime runtime;
     private volatile ServiceBinding binding; // null = no service attached
@@ -117,11 +139,20 @@ public class Dispatcher implements MessageReceiverListener {
      */
     private final boolean decodeGsm7;
 
-    public Dispatcher(Runtime runtime, int maxConcurrentDispatch, boolean decodeGsm7) {
+    /**
+     * The one {@code smpp:Caller} object for this listener, created at native init and
+     * passed to any remote method that declares a Caller-typed parameter. Holds only
+     * stable references (the session {@code AtomicReference}, not a session), so sharing
+     * one instance across every dispatch and every rebind is correct.
+     */
+    private final BObject caller;
+
+    public Dispatcher(Runtime runtime, int maxConcurrentDispatch, boolean decodeGsm7, BObject caller) {
         this.runtime = runtime;
         // Non-fair: tryAcquire never queues, so fairness is irrelevant, and non-fair is faster.
         this.permits = new Semaphore(maxConcurrentDispatch);
         this.decodeGsm7 = decodeGsm7;
+        this.caller = caller;
     }
 
     int inFlightCount() {
@@ -212,21 +243,134 @@ public class Dispatcher implements MessageReceiverListener {
      * the already-attached check; the hot read path (dispatch) stays a single volatile
      * read.
      */
-    synchronized AttachResult attach(BObject service) {
+    synchronized AttachOutcome attach(BObject service) {
         if (this.binding != null) {
-            return AttachResult.ALREADY_ATTACHED;
+            return new AttachOutcome(AttachResult.ALREADY_ATTACHED, null);
+        }
+        // getRemoteMethods(), not getMethods(): the latter mixes remote and non-remote
+        // methods, and a name-only check against it could validate a method that dispatch
+        // (which resolves remote methods by name) would never invoke. ServiceType always
+        // implements NetworkObjectType; anything else structurally cannot be a service.
+        ObjectType objType = (ObjectType) TypeUtils.getReferredType(TypeUtils.getType(service));
+        if (!(objType instanceof NetworkObjectType networkType)) {
+            return new AttachOutcome(AttachResult.NO_REMOTE_METHODS, null);
         }
         Set<String> names = new HashSet<>();
-        ObjectType objType = (ObjectType) TypeUtils.getReferredType(TypeUtils.getType(service));
-        for (MethodType method : objType.getMethods()) {
-            names.add(method.getName());
+        Map<String, MethodPlan> plans = new HashMap<>();
+        for (RemoteMethodType method : networkType.getRemoteMethods()) {
+            String name = method.getName();
+            if (!name.equals(ON_DELIVER_SM) && !name.equals(ON_DATA_SM) && !name.equals(ON_ERROR)) {
+                continue; // unknown remote methods are ignored, as before
+            }
+            String problem = validateAndPlan(name, method, plans);
+            if (problem != null) {
+                // Reject the whole attach with NO state change (validate-before-assign,
+                // Sprint 1 semantics) - a bad signature must be loud at attach, not a
+                // silent nil or a per-PDU panic at dispatch (D1).
+                return new AttachOutcome(AttachResult.BAD_SIGNATURE, problem);
+            }
+            names.add(name);
         }
-        if (!names.contains(ON_DELIVER_SM) && !names.contains(ON_DATA_SM)
-                && !names.contains(ON_ERROR)) {
-            return AttachResult.NO_REMOTE_METHODS;
+        if (names.isEmpty()) {
+            return new AttachOutcome(AttachResult.NO_REMOTE_METHODS, null);
         }
-        this.binding = new ServiceBinding(service, Set.copyOf(names));
-        return AttachResult.ATTACHED;
+        this.binding = new ServiceBinding(service, Set.copyOf(names), Map.copyOf(plans));
+        return AttachOutcome.ATTACHED_OK;
+    }
+
+    /**
+     * Validates one remote method's shape and records its dispatch plan. Returns a
+     * human-readable problem, or {@code null} if valid.
+     *
+     * <p>The rule (D1-corrected, decided this sprint): parameters bind by TYPE, order-
+     * agnostic — {@code (Sms, Caller)} and {@code (Caller, Sms)} are both legal, like
+     * ftp's type-first binding and unlike mqtt's caller-last. Stricter than both where
+     * it matters:
+     * <ul>
+     *   <li>a Caller-typed parameter is matched BEFORE any defaultable-parameter
+     *       leniency, and a defaultable Caller is rejected loudly — {@code isDefault}
+     *       skipping is exactly how {@code smpp:Caller? c = ()} would silently strand a
+     *       user's reply path (D1's first trap);</li>
+     *   <li>{@code smpp:Caller?} (a union) is not a Caller-typed parameter and is
+     *       rejected as an unbindable parameter rather than skipped;</li>
+     *   <li>rest parameters are rejected at attach — they do not appear in
+     *       {@code getParameters()}, and the runtime pads the rest slot with a value the
+     *       method cannot use, panicking per PDU (D1's second trap, latent since 1.0.1);</li>
+     *   <li>two parameters of the same type (e.g. {@code (Sms, Sms)}) are rejected —
+     *       the runtime would accept and pass null into the second, which is a per-PDU
+     *       panic deferred to production traffic.</li>
+     * </ul>
+     */
+    private static String validateAndPlan(String name, RemoteMethodType method,
+            Map<String, MethodPlan> plans) {
+        if (method.getType().getRestType() != null) {
+            return name + " must not declare a rest parameter (the runtime would pad it "
+                    + "with a value per dispatch and panic)";
+        }
+        Parameter[] params = method.getType().getParameters();
+        if (name.equals(ON_ERROR)) {
+            // onError stays 1-arity by design: it is invoked from drop paths where no
+            // request context exists, and handing it a Caller invites submitting from a
+            // session that is mid-teardown.
+            if (params.length != 1) {
+                return "onError must take exactly one parameter (the error); found "
+                        + params.length;
+            }
+            if (isCallerType(params[0].type)) {
+                return "onError must not declare an smpp:Caller parameter";
+            }
+            return null;
+        }
+        int smsIndex = -1;
+        int callerIndex = -1;
+        for (int i = 0; i < params.length; i++) {
+            Parameter param = params[i];
+            if (isCallerType(param.type)) {
+                if (param.isDefault) {
+                    return name + " parameter '" + param.name + "': an smpp:Caller "
+                            + "parameter must not be defaultable";
+                }
+                if (callerIndex >= 0) {
+                    return name + " declares more than one smpp:Caller parameter";
+                }
+                callerIndex = i;
+            } else if (isSmsType(param.type)) {
+                if (smsIndex >= 0) {
+                    return name + " declares more than one smpp:Sms parameter";
+                }
+                smsIndex = i;
+            } else {
+                return name + " parameter '" + param.name + "' has an unsupported type; "
+                        + "expected smpp:Sms or smpp:Caller (note: smpp:Caller? is not "
+                        + "accepted - declare it non-optional or not at all)";
+            }
+        }
+        if (smsIndex < 0) {
+            return name + " must declare an smpp:Sms parameter";
+        }
+        plans.put(name, new MethodPlan(smsIndex, callerIndex, params.length));
+        return null;
+    }
+
+    private static boolean isCallerType(Type type) {
+        return isModuleType(type, "Caller");
+    }
+
+    private static boolean isSmsType(Type type) {
+        return isModuleType(type, "Sms");
+    }
+
+    /** Exact-type match against this module's declaration - unions/optionals do not match. */
+    private static boolean isModuleType(Type type, String name) {
+        Type referred = TypeUtils.getReferredType(type);
+        if (!name.equals(referred.getName())) {
+            return false;
+        }
+        io.ballerina.runtime.api.Module m = referred.getPackage();
+        io.ballerina.runtime.api.Module ours = ModuleUtils.getModule();
+        return m != null && ours != null
+                && java.util.Objects.equals(m.getOrg(), ours.getOrg())
+                && java.util.Objects.equals(m.getName(), ours.getName());
     }
 
     /** Clears the binding only if {@code expected} is the currently attached service (identity). */
@@ -596,6 +740,15 @@ public class Dispatcher implements MessageReceiverListener {
             // isConcurrentSafe = false -> the runtime serializes dispatch; safe default.
             StrandMetadata meta = new StrandMetadata(false, null);
             BMap<BString, Object> sms = toSms(pdu, fallback, deliveryReceipt);
+            // Position the arguments per the plan resolved at attach: 1-arity services
+            // (the 1.0.1 contract) get exactly the Sms; 2-arity services get the shared
+            // Caller in whichever position their signature put it.
+            MethodPlan plan = binding.plans().get(method);
+            Object[] args = new Object[plan.arity()];
+            args[plan.smsIndex()] = sms;
+            if (plan.callerIndex() >= 0) {
+                args[plan.callerIndex()] = this.caller;
+            }
             inFlight.incrementAndGet();
             if (this.async) {
                 // ASYNC: jsmpp acks ESME_ROK as soon as this callback returns; a failure in
@@ -604,7 +757,7 @@ public class Dispatcher implements MessageReceiverListener {
                 try {
                     Thread.startVirtualThread(() -> {
                         try {
-                            Object result = runtime.callMethod(svc, method, meta, sms);
+                            Object result = runtime.callMethod(svc, method, meta, args);
                             if (result instanceof BError err) {
                                 logError("error from " + method
                                         + " (ASYNC mode: not reflected back to the SMSC)", err);
@@ -625,7 +778,7 @@ public class Dispatcher implements MessageReceiverListener {
                 return;
             }
             try {
-                Object result = runtime.callMethod(svc, method, meta, sms);
+                Object result = runtime.callMethod(svc, method, meta, args);
                 if (result instanceof BError err) {
                     // A SYNC handler returning an error becomes the deliver_sm_resp/data_sm_resp
                     // command_status. SMPP v3.4 (Table 5-2) defines a receiver-specific code for

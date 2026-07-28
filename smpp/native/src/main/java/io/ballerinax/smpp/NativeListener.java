@@ -2,6 +2,7 @@
 package io.ballerinax.smpp;
 
 import io.ballerina.runtime.api.Environment;
+import io.ballerina.runtime.api.creators.ValueCreator;
 import io.ballerina.runtime.api.utils.StringUtils;
 import io.ballerina.runtime.api.values.BArray;
 import io.ballerina.runtime.api.values.BDecimal;
@@ -86,23 +87,34 @@ public final class NativeListener {
         int maxConcurrentDispatch = (int) ((Long) config.getIntValue(
                 StringUtils.fromString("maxConcurrentDispatch"))).longValue();
         boolean decodeGsm7 = Boolean.TRUE.equals(config.get(StringUtils.fromString("decodeGsm7")));
-        listener.addNativeData(NATIVE_DISPATCHER,
-                new Dispatcher(env.getRuntime(), maxConcurrentDispatch, decodeGsm7));
-        listener.addNativeData(NATIVE_STATE, new AtomicReference<>(ListenerState.INIT));
-        listener.addNativeData(NATIVE_STATE_LOCK, new Object());
         // SESSION and REBIND_EXECUTOR are mutated after jsmpp threads exist, so they go
         // through write-once AtomicReference holders installed here at init rather than
         // via addNativeData post-init: the runtime's native-data map is a plain HashMap
         // with unsynchronized get/put, and a post-init put racing a jsmpp-thread get would
         // be a data race. All native-data writes now happen once, at init, single-threaded.
-        listener.addNativeData(NATIVE_SESSION, new AtomicReference<SMPPSession>());
+        AtomicReference<ListenerState> stateRef = new AtomicReference<>(ListenerState.INIT);
+        AtomicReference<SMPPSession> sessionRef = new AtomicReference<>();
+        // The one smpp:Caller for this listener. It carries its OWN native data - the
+        // same two AtomicReferences the listener uses plus the config - handed over here,
+        // once, single-threaded, so NativeCaller never has to touch the listener BObject
+        // (whose native-data map has the same post-init-write race documented above).
+        BObject caller = ValueCreator.createObjectValue(ModuleUtils.getModule(), "Caller");
+        caller.addNativeData(NativeCaller.SESSION_REF, sessionRef);
+        caller.addNativeData(NativeCaller.STATE_REF, stateRef);
+        caller.addNativeData(NativeCaller.CONFIG, config);
+        listener.addNativeData(NATIVE_DISPATCHER,
+                new Dispatcher(env.getRuntime(), maxConcurrentDispatch, decodeGsm7, caller));
+        listener.addNativeData(NATIVE_STATE, stateRef);
+        listener.addNativeData(NATIVE_STATE_LOCK, new Object());
+        listener.addNativeData(NATIVE_SESSION, sessionRef);
         listener.addNativeData(NATIVE_REBIND_EXECUTOR, new AtomicReference<ScheduledExecutorService>());
         env.getRuntime().registerListener(listener);
         return null;
     }
 
     public static Object attach(BObject listener, BObject service, Object name) {
-        return switch (dispatcher(listener).attach(service)) {
+        Dispatcher.AttachOutcome outcome = dispatcher(listener).attach(service);
+        return switch (outcome.result()) {
             case ATTACHED -> null;
             case ALREADY_ATTACHED -> ModuleUtils.createError(
                     "cannot attach: a service is already attached to this listener; "
@@ -110,6 +122,8 @@ public final class NativeListener {
             case NO_REMOTE_METHODS -> ModuleUtils.createError(
                     "attached service does not implement any of the supported remote methods "
                             + "(onDeliverSm, onDataSm, onError)");
+            case BAD_SIGNATURE -> ModuleUtils.createError(
+                    "cannot attach: " + outcome.detail());
         };
     }
 

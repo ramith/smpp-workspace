@@ -467,8 +467,57 @@ public type DeliveryReceipt record {|
     string text?;
 |};
 
+# How a `submit` failed, mapped from the jsmpp exception that surfaced it. The five
+# members deliberately partition by WHAT THE CALLER SHOULD DO, not by exception class:
+public enum FailureMode {
+    # The SMSC answered the submit with a negative `command_status` — it received the
+    # request and said no. `ErrorDetail.commandStatus` carries the exact status. The
+    # message was NOT accepted; whether a retry can succeed depends on the status
+    # (throttling: yes, after backing off; invalid destination: no).
+    REJECTED,
+    # No response arrived within `transactionTimeout`. The worst outcome the send path
+    # has: SMPP gives no way to tell "the SMSC never got it" from "the SMSC accepted it
+    # and the response was slow or lost" — so retrying MAY DELIVER A DUPLICATE to the
+    # subscriber. Decide per use case; for billing-relevant traffic, prefer reconciling
+    # via delivery receipts over blind retry.
+    TIMEOUT_DELIVERY_UNKNOWN,
+    # The connection died while sending or waiting. The message may or may not have
+    # reached the SMSC (same duplicate caveat as `TIMEOUT_DELIVERY_UNKNOWN` if it did).
+    # The listener's rebind machinery is already reacting; retry after the rebind.
+    LINK_DOWN,
+    # This connector refused to send: the request failed local validation (oversize,
+    # unencodable character, bad field) or the session/lifecycle state does not permit
+    # a submit (not started, stopped, mid-rebind, RECEIVER bind). Nothing reached the
+    # wire; fix the request or the timing and retry safely.
+    INVALID_REQUEST,
+    # jsmpp raised something outside the four categories above (a malformed response,
+    # an unexpected runtime failure inside the client). Not safely classifiable;
+    # treat like `TIMEOUT_DELIVERY_UNKNOWN` for retry purposes.
+    PROTOCOL_ERROR
+}
+
+# The detail record carried by `Error`. Deliberately **open** with all-optional fields:
+# closed would turn every `e.detail()["anything"]` a 1.0.x user wrote into a compile
+# error, and openness costs typed reads nothing (D3). Fields are populated on `submit`
+# failures; errors from other paths (config validation, start, drops) may carry none.
+public type ErrorDetail record {
+    # Which way the submit failed — the field to branch retry logic on.
+    FailureMode failureMode?;
+    # The SMPP `command_status` from the negative response, when `failureMode` is
+    # `REJECTED`. Compare against SMPP v3.4 §5.1.3 (e.g. 0x00000058 = ESME_RTHROTTLED).
+    int commandStatus?;
+    # The failed request's SMPP `sequence_number`, when one was assigned before the
+    # failure — correlates with SMSC-side logs during carrier support escalations.
+    int sequenceNumber?;
+};
+
 # The distinct error type raised by the SMPP connector. Returned from `Listener` init on
-# invalid configuration, from `'start()` on a failed connect/bind, and passed to a service's
-# `onError` method on an unexpected session drop. Match it with `err is smpp:Error` to
-# distinguish connector errors from other errors in your handler.
-public type Error distinct error;
+# invalid configuration, from `'start()` on a failed connect/bind, from `Caller.submit`
+# on a failed send (with `ErrorDetail` populated — see `FailureMode`), and passed to a
+# service's `onError` method on an unexpected session drop. Match it with
+# `err is smpp:Error` to distinguish connector errors from other errors in your handler.
+#
+# Known 1.0.x compile break, accepted and recorded (D3): once the detail type names any
+# field, `error smpp:Error("m", myOwnField = 42)` no longer compiles. `e.detail()["k"]`
+# reads keep compiling because `ErrorDetail` is open.
+public type Error distinct error<ErrorDetail>;
