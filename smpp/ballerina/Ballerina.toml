@@ -6,6 +6,7 @@ authors = ["Ramith Jayasinghe"]
 keywords = ["smpp", "sms", "messaging"]
 repository = "https://github.com/ramith/smpp-workspace"
 icon = "icon.png"
+readme = "Package.md"
 license = ["Apache-2.0"]
 distribution = "2201.13.0"
 

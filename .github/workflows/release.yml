@@ -20,10 +20,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up JDK 21
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: 21
@@ -41,6 +41,12 @@ jobs:
           packageUser: ${{ github.repository_owner }}
           packagePAT: ${{ secrets.BALLERINA_PACKAGE_PAT }}
         run: ./gradlew build --stacktrace
+
+      # The isConnector=true gradle build runs bal in Docker as root, leaving target/, lib/, and
+      # native/build/ root-owned on the runner. Reclaim them so the host-side bal pack/push can write.
+      - name: Reclaim ownership of Docker-built outputs
+        working-directory: smpp
+        run: sudo chown -R "$(id -u):$(id -g)" .
 
       - name: Pack
         working-directory: smpp/ballerina
