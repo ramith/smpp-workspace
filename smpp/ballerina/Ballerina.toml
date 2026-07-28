@@ -1,7 +1,7 @@
 [package]
 org = "ramith"
 name = "smpp"
-version = "1.0.0"
+version = "1.0.1"
 authors = ["Ramith Jayasinghe"]
 keywords = ["smpp", "sms", "messaging"]
 repository = "https://github.com/ramith/smpp-workspace"
@@ -20,8 +20,8 @@ graalvmCompatible = false
 [[platform.java21.dependency]]
 groupId = "io.ballerina.lib"
 artifactId = "smpp-native"
-version = "1.0.0"
-path = "../native/build/libs/smpp-native-1.0.0.jar"
+version = "1.0.1"
+path = "../native/build/libs/smpp-native-1.0.1.jar"
 
 # jsmpp, copied into ./lib by copyToLib. Its slf4j-api dependency is NOT bundled — the
 # Ballerina runtime already provides slf4j on the classpath (bundling it duplicates slf4j).
@@ -35,6 +35,6 @@ path = "./lib/jsmpp-3.0.2.jar"
 [[platform.java21.dependency]]
 groupId = "io.ballerina.lib"
 artifactId = "smpp-native-test-bridge"
-version = "1.0.0"
-path = "../native/build/libs/smpp-native-test-bridge-1.0.0.jar"
+version = "1.0.1"
+path = "../native/build/libs/smpp-native-test-bridge-1.0.1.jar"
 scope = "testOnly"

@@ -41,6 +41,24 @@ systemId = "your-system-id"
 password = "your-password"
 ```
 
+## Examples
+
+Runnable, end-to-end examples live in the
+[`examples/`](https://github.com/ramith/smpp-workspace/tree/main/examples) directory of
+the source repository. Each runs against a bundled mock SMSC, so no carrier account is
+needed:
+
+- [receive-sms](https://github.com/ramith/smpp-workspace/tree/main/examples/receive-sms)
+  — the minimal listener: bind and log every inbound message.
+- [delivery-receipts](https://github.com/ramith/smpp-workspace/tree/main/examples/delivery-receipts)
+  — parse DLRs, correlate by `id`, and branch on `finalStatus`.
+- [two-way-sms](https://github.com/ramith/smpp-workspace/tree/main/examples/two-way-sms)
+  — route mobile-originated messages by keyword, including `STOP` opt-out.
+- [resilient-listener](https://github.com/ramith/smpp-workspace/tree/main/examples/resilient-listener)
+  — tune `rebindPolicy` and surface unexpected drops via `onError`.
+- [tls-smsc](https://github.com/ramith/smpp-workspace/tree/main/examples/tls-smsc)
+  — bind over verified TLS with a truststore.
+
 ## The service contract
 
 Attach one service implementing at least one of these remote methods:
