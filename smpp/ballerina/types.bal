@@ -124,7 +124,7 @@ public type ConnectionConfig record {|
     # disable dead-link detection.
     decimal enquireLinkInterval = 60;
     # Maximum time the connect-and-bind handshake may take, in seconds — applied to the
-    # initial `'start()` and to every automatic rebind attempt. It bounds the TCP connect
+    # initial ``'start()`` and to every automatic rebind attempt. It bounds the TCP connect
     # and the bind-response wait *separately*, so a fully stalled attempt (a black-holed
     # host that also never answers) can take up to ~2x this value. The rebind loop is
     # single-threaded, so this also caps how long one stalled attempt (e.g. a half-open
@@ -159,6 +159,166 @@ public type ConnectionConfig record {|
     # topology where you control that boundary; this field is for the in-band case where
     # you don't.
     SecureSocket|InsecureSocket secureSocket?;
+    # Default source address for messages this ESME submits — the short code or sender ID
+    # the subscriber sees. `OutboundSms.sourceAddr` overrides it per message.
+    #
+    # Typed as a plain `Address`, deliberately **not** the `string|Address` union used on
+    # `OutboundSms`: this is the deployment-configured field, and on a union the compiler
+    # collapses three precise `Config.toml` diagnostics into one unhelpful "incompatible
+    # types" message.
+    #
+    # An empty `value` means "send no source address", which is spec-legal — the SMSC then
+    # supplies one — so it is **not** rejected at `Listener` init.
+    Address sourceAddr = {value: ""};
+|};
+
+# An SMPP address: the digits plus the two fields that say how to read them. SMPP carries
+# `ton`/`npi` alongside every address, and getting them wrong is a common cause of an SMSC
+# silently misrouting an otherwise correct MSISDN.
+#
+# Where a plain `string` is accepted instead of this record, it is shorthand for
+# `{value: <the string>}` — i.e. the defaults below.
+public type Address record {|
+    # The address itself. For `TON_INTERNATIONAL` this is E.164 **without** a leading `+`
+    # (the `ton` field is what carries that meaning on the wire). Empty means "absent",
+    # which is spec-legal for a source address.
+    string value;
+    # Type of number. Defaults to `TON_INTERNATIONAL`, the right answer for an ordinary
+    # MSISDN; short codes and alphanumeric sender IDs need an explicit value.
+    Ton ton = TON_INTERNATIONAL;
+    # Numbering plan. Defaults to `NPI_ISDN` (E.163/E.164), which pairs with the `ton`
+    # default above.
+    Npi npi = NPI_ISDN;
+|};
+
+# Type of number, per SMPP v3.4 §5.2.5.
+#
+# Member names are prefixed because Ballerina enum members are **module-scoped string
+# constants**: unprefixed, `UNKNOWN` would collide with the already-published
+# `DeliveryReceiptStatus.UNKNOWN` and `NATIONAL` would collide with `Npi`, producing build
+# warnings — one of them retroactively on a shipped doc comment.
+#
+# Each member's *value* is the corresponding `org.jsmpp.bean.TypeOfNumber` constant name,
+# so the Ballerina-member → jsmpp-member table lives here and nowhere else; the native
+# layer resolves it with `valueOf` rather than carrying a second copy of the mapping.
+public enum Ton {
+    # `TypeOfNumber.UNKNOWN` (0) — let the SMSC decide.
+    TON_UNKNOWN = "UNKNOWN",
+    # `TypeOfNumber.INTERNATIONAL` (1) — E.164 without a leading `+`.
+    TON_INTERNATIONAL = "INTERNATIONAL",
+    # `TypeOfNumber.NATIONAL` (2).
+    TON_NATIONAL = "NATIONAL",
+    # `TypeOfNumber.NETWORK_SPECIFIC` (3).
+    TON_NETWORK_SPECIFIC = "NETWORK_SPECIFIC",
+    # `TypeOfNumber.SUBSCRIBER_NUMBER` (4).
+    TON_SUBSCRIBER_NUMBER = "SUBSCRIBER_NUMBER",
+    # `TypeOfNumber.ALPHANUMERIC` (5) — an alphanumeric sender ID rather than digits.
+    TON_ALPHANUMERIC = "ALPHANUMERIC",
+    # `TypeOfNumber.ABBREVIATED` (6) — short codes.
+    TON_ABBREVIATED = "ABBREVIATED"
+}
+
+# Numbering plan indicator, per SMPP v3.4 §5.2.6. Prefixed and value-mapped for the same
+# reasons as `Ton`.
+public enum Npi {
+    # `NumberingPlanIndicator.UNKNOWN` (0).
+    NPI_UNKNOWN = "UNKNOWN",
+    # `NumberingPlanIndicator.ISDN` (1) — E.163/E.164, the usual choice for an MSISDN.
+    NPI_ISDN = "ISDN",
+    # `NumberingPlanIndicator.DATA` (3) — X.121.
+    NPI_DATA = "DATA",
+    # `NumberingPlanIndicator.TELEX` (4) — F.69.
+    NPI_TELEX = "TELEX",
+    # `NumberingPlanIndicator.LAND_MOBILE` (6) — E.212.
+    NPI_LAND_MOBILE = "LAND_MOBILE",
+    # `NumberingPlanIndicator.NATIONAL` (8).
+    NPI_NATIONAL = "NATIONAL",
+    # `NumberingPlanIndicator.PRIVATE` (9).
+    NPI_PRIVATE = "PRIVATE",
+    # `NumberingPlanIndicator.ERMES` (10).
+    NPI_ERMES = "ERMES",
+    # `NumberingPlanIndicator.INTERNET` (14) — IP.
+    NPI_INTERNET = "INTERNET",
+    # `NumberingPlanIndicator.WAP` (18) — WAP client id.
+    NPI_WAP = "WAP"
+}
+
+# How an outbound message's text is encoded, and hence the `data_coding` it is sent with.
+#
+# Only the three schemes this connector also **decodes** precisely are offered. The GSM
+# 03.38 7-bit default alphabet (`data_coding 0x00`) is **not** available for sending: it
+# needs a packed-septet encoder, which jsmpp does not provide, and adding protocol logic
+# jsmpp lacks is outside this connector's remit. Use `OutboundSms.shortMessageBytes` with
+# an explicit `dataCoding` if you need to put such a payload on the wire yourself.
+public enum Encoding {
+    # IA5/ASCII — `data_coding 0x01`. 7-bit US-ASCII only; anything else is rejected.
+    ASCII,
+    # Latin-1 — `data_coding 0x03`. The default: covers English, Afrikaans and most
+    # Western European text.
+    LATIN1,
+    # UCS-2 big-endian — `data_coding 0x08`. Any script, at half the characters per PDU.
+    UCS2
+}
+
+# Whether, and when, the SMSC should return a delivery receipt for a submitted message,
+# per SMPP v3.4 §5.2.17.
+#
+# Three members, not four: jsmpp also defines `SUCCESS` (`0x03`), but its own javadoc marks
+# that as introduced in SMPP 5.0, and `xxxxxx11` is *reserved* in the v3.4 table this
+# connector implements.
+public enum DeliveryReceiptRequest {
+    # `xxxxxx00` — no receipt. The SMPP default.
+    NONE,
+    # `xxxxxx01` — a receipt on final delivery or final failure.
+    ON_SUCCESS_OR_FAILURE,
+    # `xxxxxx10` — a receipt only if delivery ultimately fails.
+    ON_FAILURE_ONLY
+}
+
+# A message to submit to the SMSC (`submit_sm`).
+#
+# Exactly one of `shortMessage` or `shortMessageBytes` must be set. They are mutually
+# exclusive rather than layered because SMPP has no way to carry both, and silently
+# preferring one would hide a caller's mistake.
+public type OutboundSms record {|
+    # Recipient. A plain `string` is shorthand for an international ISDN address.
+    string|Address destAddr;
+    # Sender. Omitted means `ConnectionConfig.sourceAddr`, which is the usual arrangement:
+    # the short code is a property of the binding, not of each message.
+    string|Address sourceAddr?;
+    # The message text, encoded per `encoding`. Mutually exclusive with
+    # `shortMessageBytes`.
+    string shortMessage?;
+    # How to encode `shortMessage`. Ignored when `shortMessageBytes` is used, since those
+    # octets are already encoded.
+    Encoding encoding = LATIN1;
+    # Pre-encoded payload, sent verbatim with `dataCoding`. The escape hatch for anything
+    # `Encoding` cannot express — packed GSM 7-bit above all. Requires `dataCoding`, and is
+    # mutually exclusive with `shortMessage`.
+    byte[] shortMessageBytes?;
+    # The raw `data_coding` byte accompanying `shortMessageBytes`. Required with it, and
+    # meaningless without it.
+    int dataCoding?;
+    # Whether to ask the SMSC for a delivery receipt. A receipt arrives later at
+    # `onDeliverSm` with `deliveryReceipt` set, not as part of the submit.
+    DeliveryReceiptRequest registeredDelivery = NONE;
+    # SMPP `service_type`. Empty (the default) means the SMSC's default service.
+    string serviceType = "";
+    # SMPP `validity_period`: how long the SMSC should keep trying, as an absolute or
+    # relative SMPP time string. Omitted means the SMSC's own default.
+    string validityPeriod?;
+|};
+
+# The outcome of a successful `submit`.
+#
+# `messageId` is required rather than optional: an SMSC that accepts a `submit_sm` must
+# return one (§4.4.2), and typing it optional would push a nil check onto every caller for
+# a case a conforming SMSC cannot produce. A non-conforming SMSC returning an empty id
+# yields an empty string here — visible, rather than silently absent.
+public type SubmitResult record {|
+    # The SMSC's `message_id`. Correlate a later delivery receipt against this — see
+    # `Sms.receiptedMessageId` for the caveat about which field actually carries it back.
+    string messageId;
 |};
 
 # Transport-layer security (TLS) for the SMSC connection. Attach this to
