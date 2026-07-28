@@ -19,6 +19,14 @@ jobs:
           distribution: temurin
           java-version: 21
 
+      # The native subproject runs `bal home` to locate ballerina-rt jars for compiling
+      # the Java glue, so bal must be on the runner (the Docker image only covers the
+      # Ballerina build, not the host-side native compile).
+      - name: Set up Ballerina
+        uses: ballerina-platform/setup-ballerina@v1
+        with:
+          version: 2201.13.0
+
       - name: Build and test
         working-directory: smpp
         env:
