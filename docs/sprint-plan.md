@@ -739,6 +739,13 @@ existing rebind path. Six JUnit cases pin the wrapper contract. Drop-count test 
 through `recordedDropCount()` (testutils), which accepts either detection path's wording — a
 healed wedge cycle is a *passing* cycle.
 
+*Validation status:* full suite 40/40 green with the fix (wall clock unchanged); 840 post-fix
+soak cycles green. The wedge did not recur within that budget, so a live end-to-end heal has
+not been observed — the wrapper contract is unit-pinned instead. Note for future hunts: all
+three pre-fix reproductions occurred under **full-suite** load, and 0-in-840 at the observed
+rate is ~1% likely, so the wedge is probably load-dependent and group-only runs under-sample
+it; hunt with full-suite runs in the worktree harness.
+
 **Collateral findings recorded while investigating (all real, none the cause):**
 
 - `./gradlew build` exited 0 with a failing `bal test` suite — the exit gate literally could not
