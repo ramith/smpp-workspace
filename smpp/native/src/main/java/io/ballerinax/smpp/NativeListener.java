@@ -204,6 +204,16 @@ public final class NativeListener {
         // millis). enquireLinkInterval is validated >= 5s, so it never disables detection.
         session.setEnquireLinkTimer((int) (decimalValue(config, "enquireLinkInterval") * 1000));
 
+        // How long we wait for a response to anything WE send. jsmpp keeps a single
+        // per-session transactionTimer for all of it, so this one value bounds
+        // submit_sm_resp, unbind_resp (both stop paths) and enquire_link_resp (dead-link
+        // detection) alike - see the ConnectionConfig.transactionTimeout docs for why that
+        // coupling is unavoidable and why the field is not called submitTimeout. Set here,
+        // beside the keepalive timer, so it is re-applied to the fresh session on every
+        // rebind and not only on the initial start(). Without it the connector inherited
+        // jsmpp's 2s AbstractSession default, too short for a submit_sm under load.
+        session.setTransactionTimer((long) (decimalValue(config, "transactionTimeout") * 1000));
+
         // Per-attempt flags. `installed` gates the listener lambda: a CLOSED fired by a
         // rejected/failed bind (jsmpp self-closes inside connectAndBind) is start()'s
         // error, not an "unexpected drop". `dropReported` makes drop-reporting

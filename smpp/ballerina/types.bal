@@ -131,6 +131,26 @@ public type ConnectionConfig record {|
     # SMSC that accepts the TCP connection but never answers the bind) blocks the next
     # attempt. This field is in SECONDS. Must be 1-300 (validated at `Listener` init).
     decimal bindTimeout = 60;
+    # How long the connector waits for the SMSC's response to a request it sent, in
+    # seconds. Deliberately **not** named `submitTimeout`: jsmpp exposes this as a single
+    # per-session `transactionTimer`, so one value bounds three different things —
+    #
+    # 1. the `submit_sm_resp` wait,
+    # 2. the `unbind_resp` wait during `gracefulStop`/`immediateStop`, and
+    # 3. the `enquire_link_resp` wait, which is how a silently dead link is detected.
+    #
+    # Raising it therefore buys a submit more room *and* slows dead-link detection by the
+    # same amount; the two cannot be tuned apart without jsmpp exposing separate knobs.
+    #
+    # The default is 30s rather than jsmpp's own 2s. Two seconds is too short for a
+    # `submit_sm` under load, and a timed-out submit is the worst outcome the send path
+    # has: SMPP gives no way to tell "the SMSC never got it" from "the SMSC got it and the
+    # response was slow", so retrying may duplicate a message the subscriber already
+    # received. Prefer waiting to guessing.
+    #
+    # This field is in SECONDS (jsmpp's underlying knob is milliseconds). Must be 1-300
+    # (validated at `Listener` init).
+    decimal transactionTimeout = 30;
     # Transport security. Absent (the default) means the SMSC connection is plaintext
     # TCP, exactly as before this field existed — pre-TLS configs are unaffected. A
     # `SecureSocket` yields a verified TLS connection; an `InsecureSocket` yields a TLS

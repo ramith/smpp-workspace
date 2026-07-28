@@ -126,6 +126,16 @@ isolated function validateConfig(ConnectionConfig config) returns error? {
         // Same seconds-vs-milliseconds unit-confusion guard as enquireLinkInterval.
         return error Error(string `bindTimeout must not exceed 300 seconds - note this field is in SECONDS, not milliseconds, got ${config.bindTimeout}`);
     }
+    if config.transactionTimeout < 1d {
+        // Sub-second would time out responses the SMSC is merely slow to send. This same
+        // value also bounds enquire_link, so a tiny value would flap an otherwise healthy
+        // link as well as breaking submits.
+        return error Error(string `transactionTimeout must be at least 1 second, got ${config.transactionTimeout}`);
+    }
+    if config.transactionTimeout > 300d {
+        // Same seconds-vs-milliseconds unit-confusion guard as enquireLinkInterval.
+        return error Error(string `transactionTimeout must not exceed 300 seconds - note this field is in SECONDS, not milliseconds, got ${config.transactionTimeout}`);
+    }
     if config.gracefulStopTimeout < 0d {
         return error Error(string `gracefulStopTimeout must not be negative, got ${config.gracefulStopTimeout}`);
     }
