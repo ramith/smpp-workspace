@@ -8,12 +8,18 @@ repository = "https://github.com/ramith/smpp-workspace"
 icon = "icon.png"
 readme = "Package.md"
 license = ["Apache-2.0"]
-distribution = "2201.13.0"
+# Raised from 2201.13.0 (owner, 2026-07-29): 13.0 was claimed but never tested — only
+# 13.1 and 13.4 are installed — and D10 flagged the gap. Claim only what CI exercises.
+distribution = "2201.13.1"
 
 [build-options]
 observabilityIncluded = false
 
 [platform.java21]
+# Deliberate, not a known technical blocker (owner, 2026-07-29): GraalVM native-image
+# builds are very slow, and native-image support is not a requirement for this package,
+# so the build cost is not justified. Whether jsmpp would work under native-image at all
+# is untested and unknown. Revisit only if a consumer actually needs it.
 graalvmCompatible = false
 
 # Hand-written native glue that bridges jsmpp callbacks into the Ballerina runtime.
