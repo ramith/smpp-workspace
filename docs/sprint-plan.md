@@ -652,6 +652,35 @@ implementations do request-response.
 | 11 | Docs | `Package.md:9-10` ("receive-only by design: there is no `submit_sm`/transmit API"), `:62-71`, `:109-112`, `:152-162`; `Module.md:1-9`; `types.bal:4-6` and `listener.bal:7-15` (both ship in generated API docs); `architecture.md:8`, `:161-176`, `:270-293`; `examples/README.md`; `examples/two-way-sms/README.md`. Plus **the M2 re-derivation in all three places it is stated**: `NativeListener.java:46-54`, `architecture.md:236-238`, and `types.bal:88-97` — the last being the guarantee in the connector's own shipped voice. Also fix the **pre-existing** contradiction at `Package.md:161-162` ("receipt text is not parsed into typed fields") against `:96-107` and `types.bal:260-288`. Add `qa-strategy.md` §6, which currently lists outbound `submit_sm` as out of scope. | ballerina-developer + red-team | 8h |
 | 12 | The duplicate-MT caveat | The single biggest risk in the feature, and it is documentation plus one test, not code. See reconciliation. | red-team | 3h |
 
+### Sequencing within the sprint
+
+**No 8a/8b split** (owner, 2026-07-29 — supersedes the interim decision earlier that day; see the
+reconciliation notes). One sprint, one gate, one release, and the release number is the owner's to
+choose at publish time. The twelve-item table above stays the canonical scope reference.
+
+The split was proposed to keep the retiming of the three flake-prone existing tests out of the same
+diff as the new concurrency path. That argument is answered by **ordering**, not by partitioning the
+sprint — two constraints, both of which hold anyway:
+
+- **Item 10 lands first.** It is marked "blocks everything else" for a real reason: `MockSmsc` sets no
+  `ServerMessageReceiverListener` at all today, so until it does, every submit test fails with
+  `ESME_RX_R_APPN` regardless of connector correctness. This is a compile-and-test dependency, not a
+  process preference.
+- **Item 5 lands before the `Caller` work.** It carries the retiming of the three existing tests whose
+  assertions encode jsmpp's 2 s `transactionTimer` default. Landing it ahead of the concurrency path
+  keeps a later flake attributable: before item 3/4, a flake is timing; after, it is the new dispatch
+  path. That is the whole of what the split was buying, and commit order buys it just as well.
+- **Item 11's doc work splits by truthfulness, not by phase.** The pre-existing fixes (the
+  `Package.md:161-162` vs `:96-107`/`types.bal:260-288` contradiction; the M2 re-derivation at
+  `NativeListener.java:46-54`, `architecture.md:236-238`, `types.bal:88-97`) can land any time. The
+  receive-only reframing (`Package.md:9-10`, `:62-71`, `:109-112`, `:152-162`; `Module.md:1-9`;
+  `types.bal:4-6`; `listener.bal:7-15`; `architecture.md:8`, `:161-176`, `:270-293`;
+  `examples/README.md`; `examples/two-way-sms/README.md`; `qa-strategy.md` §6) must **not** land
+  before the feature works, or the shipped docs describe a capability that does not exist yet.
+
+Nothing publishes mid-sprint, so no interim version number is needed and the semver question that
+the 8a-as-1.0.2 proposal ran into does not arise.
+
 ### Exit gate
 
 All of the following pass under `./gradlew build` from `smpp/`, with zero new
@@ -1195,20 +1224,82 @@ last remaining one-way door.
 - The reader thread can stall up to 60s on a response PDU, but **only once ~100 PDUs are backlogged**
   (`LinkedBlockingQueue(100)`, never overridden). State the precondition or the risk reads as routine
   and gets discounted.
-- Split verdict, unresolved: `architect-reviewer` proposes splitting Sprint 8 into an additive **8a**
-  (mock + TLV + the pre-existing doc fixes, shippable as 1.0.2) and **8b** (the feature), on the
-  grounds that timing changes to the three most flake-prone existing tests should not share a diff
-  with a new concurrency path. That is a real bisectability argument and it is **the owner's call**;
-  it is recorded here rather than decided.
+- **Split verdict — DECIDED (owner, 2026-07-29): do not split. One sprint, one gate, one release.**
+  `architect-reviewer` proposed splitting Sprint 8 into an additive **8a** (mock + TLV + the
+  pre-existing doc fixes, shippable as 1.0.2) and **8b** (the feature), on the grounds that timing
+  changes to the three most flake-prone existing tests should not share a diff with a new concurrency
+  path. The owner first accepted the split with an interim 1.0.2, then reversed it the same day once
+  the versioning consequence surfaced: items 5 and 9 both add public surface
+  (`ConnectionConfig.transactionTimeout`, `Sms.receiptedMessageId`), which is a **minor** bump under
+  semver — colliding with this sprint's own gating, where 1.1.0 is blocked until the Sprint 9
+  compiler plugin. 8a was therefore unreleasable as scoped: too big for a patch, blocked from a minor.
+  **Resolution: no interim publish, so no interim version, so no conflict.** The release number is
+  the owner's to choose at publish time.
+  The reviewer's underlying argument was not discarded — it is satisfied by **commit order** instead
+  of by sprint partitioning (item 10 first, item 5 before the `Caller` work; see "Sequencing within
+  the sprint"). Bisectability comes from ordered diffs, and those survive a single sprint intact.
 
 #### D10. Still unverified after two passes
 
-`ErrorCreator.createDistinctError(String, Module, BString, BMap)`'s exact signature (do not accept
-the ledger's "javap-verified" annotation — re-run it); whether `Runtime.callMethod` invokes
-non-`remote` methods; runtime behaviour on **exactly** 2201.13.0 (only 13.1/13.4 installed, and
-`Parameter` is byte-identical between them); whether any real 1.0.1 user constructs `smpp:Error` with
-custom detail args; `graalvmCompatible = false`'s rationale, which should be recorded while the toml
-is being touched; and the rabbitmq caller-arity claim, which remains unrelied-upon.
+Third-pass status, 2026-07-29. Two resolved, four open.
+
+**RESOLVED — `ErrorCreator.createDistinctError(String, Module, BString, BMap)` exists.** Re-run from
+scratch as instructed. Three overloads, **identical on both 2201.13.1 and 2201.13.4**:
+
+```
+createDistinctError(String, Module, BString)
+createDistinctError(String, Module, BString, BMap<BString, Object>)   <- the one this sprint needs
+createDistinctError(String, Module, BString, BError)
+```
+
+**Likely cause of the earlier distrust:** the class is in `bre/lib/ballerina-rt-<ver>.jar`, **not**
+`bre/lib/runtime-<ver>.jar`. A `javap -cp runtime-*.jar` returns "class not found", which reads as a
+failed verification rather than a wrong classpath. Record the jar, not just the signature, or the
+next pass repeats it.
+
+**RESOLVED (signature only) — `Runtime.callMethod` is varargs.**
+`callMethod(BObject, String, StrandMetadata, Object...)`, so both the 1-arg and 2-arg dispatch shapes
+this sprint needs are accepted at the call site with no overload problem. This does **not** answer
+whether it *invokes* a non-`remote` method — that is runtime resolution by name and is not visible in
+the signature. Still open below.
+
+**RESOLVED — moot, by using the right accessor. Do not build the probe.** The question only arose
+because attach-time validation reads `ObjectType.getMethods()`, which mixes `remote` and non-`remote`
+methods. The runtime API already separates them:
+
+```
+ServiceType extends NetworkObjectType
+NetworkObjectType.getRemoteMethods()   -> RemoteMethodType[]    // remote only
+NetworkObjectType.getResourceMethods() -> ResourceMethodType[]
+ObjectType.getMethods()                -> MethodType[]          // everything  <- currently used
+```
+
+Present and identical on both 2201.13.1 and 2201.13.4. `Dispatcher.java:220-221` currently does
+`(ObjectType) TypeUtils.getReferredType(...)` then `objType.getMethods()` — the mixing path.
+
+**Action for item 3:** cast to `ServiceType`/`NetworkObjectType` and iterate `getRemoteMethods()`,
+behind an `instanceof` guard (a non-service object reaching `attach` should be a clean rejection, not
+a `ClassCastException`). Then no non-`remote` name can ever reach `callMethod`, so whether `callMethod`
+*would* invoke one stops being load-bearing — the earlier "handle that deliberately" note is
+discharged by construction rather than by a runtime experiment. `RemoteMethodType` is also the more
+precise element type for the parameter-shape resolution D1 specifies.
+
+**OPEN — behaviour on exactly 2201.13.0.** Confirmed genuinely absent: `bal dist list` shows 13.1 and
+13.4 locally, no 13.0, while `smpp/ballerina/Ballerina.toml` pins `distribution = "2201.13.0"`.
+Closing this means `bal dist pull 2201.13.0` — an install, so left for the owner to authorise rather
+than done unprompted.
+
+**OPEN — any real 1.0.1 user constructing `smpp:Error` with custom detail args.** Unknowable from
+here; it is a question about third-party code, not this repo. What *is* checkable: `Error` is
+declared `public type Error distinct error;`, so its detail is the open default and users are
+permitted to. Treat as "possible, unquantifiable" and design for it rather than trying to verify it.
+
+**OPEN — `graalvmCompatible = false` rationale.** Set in both `smpp/ballerina/Ballerina.toml:17` and
+`smpp/build-config/resources/Ballerina.toml:17`, with no recorded reason in either. Needs the owner's
+recollection or a native-image trial; do not guess it into the docs.
+
+**OPEN — the rabbitmq caller-arity claim.** Still unrelied-upon, so still not load-bearing. Leave it
+that way unless something starts depending on it.
 
 ---
 
