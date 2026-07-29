@@ -190,6 +190,37 @@ class OutboundSmsMappingTest {
     }
 
     @Test
+    void everyTonAndNpiMemberResolvesToItsJsmppConstant() throws Exception {
+        // The full 17-entry table: this contract freezes at 1.1.0 and Sprint 9's plugin
+        // encodes it, so every member is pinned - not just the ones other tests happen
+        // to use (Phase 5 finding #14).
+        String[][] tons = {
+                {"TON_UNKNOWN", "UNKNOWN"}, {"TON_INTERNATIONAL", "INTERNATIONAL"},
+                {"TON_NATIONAL", "NATIONAL"}, {"TON_NETWORK_SPECIFIC", "NETWORK_SPECIFIC"},
+                {"TON_SUBSCRIBER_NUMBER", "SUBSCRIBER_NUMBER"},
+                {"TON_ALPHANUMERIC", "ALPHANUMERIC"}, {"TON_ABBREVIATED", "ABBREVIATED"}};
+        for (String[] row : tons) {
+            NativeCaller.SubmitSpec spec = minimalText();
+            spec.destTon = row[0];
+            assertEquals(TypeOfNumber.valueOf(row[1]), NativeCaller.compose(spec).dstTon, row[0]);
+        }
+        String[][] npis = {
+                {"NPI_UNKNOWN", "UNKNOWN"}, {"NPI_ISDN", "ISDN"}, {"NPI_DATA", "DATA"},
+                {"NPI_TELEX", "TELEX"}, {"NPI_LAND_MOBILE", "LAND_MOBILE"},
+                {"NPI_NATIONAL", "NATIONAL"}, {"NPI_PRIVATE", "PRIVATE"},
+                {"NPI_ERMES", "ERMES"}, {"NPI_INTERNET", "INTERNET"}, {"NPI_WAP", "WAP"}};
+        for (String[] row : npis) {
+            NativeCaller.SubmitSpec spec = minimalText();
+            spec.destNpi = row[0];
+            assertEquals(NumberingPlanIndicator.valueOf(row[1]), NativeCaller.compose(spec).dstNpi, row[0]);
+        }
+        // Unknown values are loud, never defaulted.
+        NativeCaller.SubmitSpec bad = minimalText();
+        bad.destTon = "TON_BOGUS";
+        assertThrows(NativeCaller.InvalidRequest.class, () -> NativeCaller.compose(bad));
+    }
+
+    @Test
     void validityPeriodAcceptsOnlyEmptyOrExact16Shape() throws Exception {
         // isRangeMinAndMax == false: jsmpp accepts ONLY 0 or exactly 16 chars. A 1-15
         // char value passing local validation would orphan a pendingResponses entry and

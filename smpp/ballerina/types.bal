@@ -107,8 +107,12 @@ public type ConnectionConfig record {|
     # `data_coding` is always available on `Sms.properties` for services that must decode a
     # different scheme themselves.
     boolean decodeGsm7 = false;
-    # Maximum time `gracefulStop` waits for in-flight dispatches to the attached service to
-    # finish before unbinding, in seconds. `immediateStop` does not wait at all.
+    # Maximum time `gracefulStop` waits for in-flight work to finish before unbinding, in
+    # seconds. The drain covers dispatches to the attached service AND in-flight
+    # `Caller.submit` calls (including from non-handler code holding a `Caller`); submits
+    # stay legal for the whole drain window - a reply-style service's in-flight replies
+    # complete rather than being dropped on shutdown. `immediateStop` does not wait at
+    # all: a parked submit then surfaces `LINK_DOWN` when the socket closes under it.
     # Must not be negative (validated at `Listener` init).
     decimal gracefulStopTimeout = 30;
     # Controls automatic rebinding after an unexpected session drop. Defaults to retrying
