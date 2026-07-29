@@ -26,6 +26,7 @@ const int SUBMIT_LATE_RESP_PORT = 27822;
 const int SUBMIT_DUP_MT_PORT = 27823;
 const int SUBMIT_UDHI_TEST_PORT = 27824;
 const int SUBMIT_ABANDONED_TEST_PORT = 27825;
+const int SUBMIT_FLAP_TEST_PORT = 27827;
 
 // Cleanup state for the after: hooks (the house pattern - see data_sm_test.bal for why
 // @test:AfterEach is unusable). A listener leaked by a failed assertion would otherwise
@@ -495,6 +496,62 @@ function testExhaustedRebindYieldsLinkAbandoned() returns error? {
     test:assertEquals(e.detail().possiblySubmitted, false,
             "an abandoned-link refusal provably never wrote - resubmit on a new Listener is safe");
 
+    check smsListener.gracefulStop();
+    mockSmscClose(mockId);
+}
+
+// D13's reason to exist: before Sprint 8.5, onUnexpectedDrop hardcoded attempt=1, so a
+// link that binds successfully and then drops (accept-then-kick: quota enforcement, an
+// L4 balancer resetting bound sessions) reset the counter on every cycle -
+// maxRebindAttempts never exhausted, backOffMultiplier never compounded, and "gave up"
+// was unreachable (stage-2 H1). This pins the fix: consecutive short-lived binds COUNT,
+// the flap terminates at the cap, and the terminal state is program-visible.
+@test:Config {after: cleanupSubmitTest, groups: ["submit"]}
+function testBindThenDropFlapExhaustsRebindAttempts() returns error? {
+    clearCapturedCaller();
+    clearRecordedErrors();
+    int mockId = check mockSmscOpen(SUBMIT_FLAP_TEST_PORT);
+    submitTestMockId = mockId;
+    Listener smsListener = check new ({
+        host: "localhost",
+        port: SUBMIT_FLAP_TEST_PORT,
+        systemId: "test",
+        password: "test",
+        bindType: TRANSCEIVER,
+        rebindPolicy: {initialRebindDelay: 0.1, maxRebindDelay: 0.5, backOffMultiplier: 2.0,
+                maxRebindAttempts: 2}
+    });
+    submitTestListener = smsListener;
+    check smsListener.attach(new CallerCapturingService());
+    // First bind is a normal one (enabling the flap before 'start() would race
+    // connectAndBind itself); capture the Caller while the link is healthy.
+    check smsListener.'start();
+    int conn = check mockSmscAwaitNextBind(mockId, 5000);
+    check mockSmscSendDeliverSm(mockId, conn, "capture", "", 0);
+    test:assertTrue(pollUntil(isolated function() returns boolean {
+        return capturedCaller() !is ();
+    }, 5), "the dispatch never delivered a Caller");
+    Caller caller = <Caller>capturedCaller();
+
+    // Every rebind from here on is accepted (bind_resp OK - the client-side install
+    // genuinely happens) and then instantly dropped: the flap.
+    mockSmscSetCloseAfterAccept(mockId, true);
+    check mockSmscSever(mockId, conn);
+
+    // Drop 1 (uptime of the healthy bind is seconds, far below the ~60s stability
+    // window, so the counter is NOT reset) -> attempts 2, 3 > maxRebindAttempts=2 ->
+    // give up. Before D13 this loop never terminated.
+    test:assertTrue(pollUntil(isolated function() returns boolean {
+        return recordedErrorsContaining("gave up") > 0;
+    }, 20), "the flap never exhausted maxRebindAttempts - the pre-D13 infinite-flap bug");
+
+    // The terminal verdict is program-visible, not just logged.
+    SubmitResult|Error r = caller->submit({destAddr: "264811234567", shortMessage: "x"});
+    test:assertTrue(r is Error, "submit after give-up must fail");
+    test:assertEquals((<Error>r).detail().failureMode, LINK_ABANDONED,
+            "an exhausted flap must latch LINK_ABANDONED");
+
+    mockSmscSetCloseAfterAccept(mockId, false);
     check smsListener.gracefulStop();
     mockSmscClose(mockId);
 }

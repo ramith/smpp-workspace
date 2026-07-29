@@ -48,6 +48,22 @@ public final class NativeListener {
     private static final String NATIVE_REBIND_ABANDONED = "smpp.rebindAbandoned";
     private static final String NATIVE_OBSERVED_CONN = "smpp.observedConn";
     private static final String NATIVE_SELF_CLOSED = "smpp.selfClosed";
+    private static final String NATIVE_LAST_INSTALL_NANOS = "smpp.lastInstallNanos";
+    private static final String NATIVE_CONSECUTIVE_FAILURES = "smpp.consecutiveFailures";
+
+    /**
+     * A session continuously bound for at least this long resets the consecutive-failure
+     * counter at its NEXT drop (D13). Anchored at INSTALL (bind()'s critical section),
+     * never at attempt start: one connectAndBind stalled for bindTimeout (60s default)
+     * on the serialized rebind executor would otherwise look like a minute of stability
+     * and defeat the fix in exactly the flap-adjacent case it exists for. Measured
+     * install→drop-DETECTION, so the ~1s TRANSPORT_DEATH_GRACE_MS skew overstates
+     * uptime by ≤1.7% — immaterial, but this constant must stay an order of magnitude
+     * above the grace or the two start interacting. {@code System.nanoTime()}, not
+     * wall-clock: an NTP step across a 60s window would mis-measure. Internal per the
+     * Sprint 4 minimal-public-surface precedent; additive to expose later.
+     */
+    static final long STABLE_UPTIME_RESET_NANOS = TimeUnit.SECONDS.toNanos(60);
 
     private static final java.util.logging.Logger LOGGER =
             java.util.logging.Logger.getLogger(NativeListener.class.getName());
@@ -175,6 +191,13 @@ public final class NativeListener {
         AtomicBoolean selfClosed = new AtomicBoolean(false);
         caller.addNativeData(NativeCaller.SELF_CLOSED, selfClosed);
         listener.addNativeData(NATIVE_SELF_CLOSED, selfClosed);
+        // D13 rebind bookkeeping: the consecutive-failure counter and the stability
+        // anchor it resets against. Listener-only (the submit path never reads them);
+        // installed here so all native-data writes stay init-time (HashMap race above).
+        listener.addNativeData(NATIVE_LAST_INSTALL_NANOS,
+                new java.util.concurrent.atomic.AtomicLong());
+        listener.addNativeData(NATIVE_CONSECUTIVE_FAILURES,
+                new java.util.concurrent.atomic.AtomicInteger());
         listener.addNativeData(NATIVE_DISPATCHER,
                 new Dispatcher(env.getRuntime(), maxConcurrentDispatch, decodeGsm7, caller));
         listener.addNativeData(NATIVE_STATE, stateRef);
@@ -369,6 +392,11 @@ public final class NativeListener {
                 sessionUsable(listener).set(true);
                 rebindAbandoned(listener).set(false);
                 selfClosed(listener).set(false);
+                // The D13 stability anchor: install time, under this same monitor the
+                // drop path evaluates it under. Deliberately NOT a counter reset -
+                // resetting on install is exactly the flap bug (stage-2 H1); only a
+                // drop that finds >=STABLE_UPTIME_RESET_NANOS of uptime resets.
+                lastInstallNanos(listener).set(System.nanoTime());
                 installed.set(true);
                 state(listener).set(ListenerState.STARTED);
                 // Bound-race check: if the session died in the sliver between
@@ -444,7 +472,25 @@ public final class NativeListener {
         // a dead (or wedged, still-claiming-BOUND) session.
         sessionUsable(listener).set(false);
         dispatcher(listener).dispatchError(description);
-        scheduleRebind(listener, 1);
+        // D13: the attempt counter is CONSECUTIVE-FAILURE based, reset only by a
+        // stability window - never by a successful bind alone. This used to hardcode
+        // attempt=1, which reset the episode on every bind-then-drop flap: against an
+        // SMSC that accepts the bind and then kicks the session, maxRebindAttempts
+        // never exhausted and backOffMultiplier's exponent stayed 0 forever - both
+        // knobs inert against exactly the flap an operator most needs them for
+        // (stage-2 H1). Runs once per drop: only dropReported-CAS winners reach here.
+        int attempt;
+        synchronized (stateLock(listener)) {
+            long installedAt = lastInstallNanos(listener).getAndSet(0);
+            java.util.concurrent.atomic.AtomicInteger failures = consecutiveFailures(listener);
+            if (installedAt != 0
+                    && System.nanoTime() - installedAt >= STABLE_UPTIME_RESET_NANOS) {
+                // The session proved stable before this drop: a fresh failure episode.
+                failures.set(0);
+            }
+            attempt = failures.incrementAndGet();
+        }
+        scheduleRebind(listener, attempt);
     }
 
     private static AtomicBoolean sessionUsable(BObject listener) {
@@ -457,6 +503,14 @@ public final class NativeListener {
 
     private static AtomicBoolean selfClosed(BObject listener) {
         return (AtomicBoolean) listener.getNativeData(NATIVE_SELF_CLOSED);
+    }
+
+    private static java.util.concurrent.atomic.AtomicLong lastInstallNanos(BObject listener) {
+        return (java.util.concurrent.atomic.AtomicLong) listener.getNativeData(NATIVE_LAST_INSTALL_NANOS);
+    }
+
+    private static java.util.concurrent.atomic.AtomicInteger consecutiveFailures(BObject listener) {
+        return (java.util.concurrent.atomic.AtomicInteger) listener.getNativeData(NATIVE_CONSECUTIVE_FAILURES);
     }
 
     private static java.util.concurrent.atomic.AtomicInteger submitsInFlight(BObject listener) {
@@ -624,7 +678,10 @@ public final class NativeListener {
                 return;
             }
             dispatcher(listener).dispatchError("rebind attempt " + attempt + " failed: " + e.getMessage());
-            scheduleRebind(listener, attempt + 1);
+            // Same counter the drop path uses (D13): a failed BIND and a bind-then-drop
+            // flap are one consecutive-failure sequence, so exhaustion and backoff see
+            // both. The increment keeps the counter in lockstep with `attempt + 1`.
+            scheduleRebind(listener, consecutiveFailures(listener).incrementAndGet());
         }
     }
 
@@ -646,6 +703,9 @@ public final class NativeListener {
             // From INIT (never started), STARTING (stop races the initial bind - the
             // binder will see this and discard its fresh session), or STARTED.
             state.set(ListenerState.STOPPING);
+            // A rebind task already queued must not evaluate stability against a stale
+            // install once the stop owns teardown (D13, T1.6).
+            lastInstallNanos(listener).set(0);
         }
         shutdownRebindExecutor(listener);   // no-op if never created
         if (graceful) {

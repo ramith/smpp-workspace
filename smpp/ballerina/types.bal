@@ -58,12 +58,24 @@ public type RebindPolicy record {|
     # Maximum delay between rebind attempts, in seconds — caps the exponential backoff.
     # Must be >= `initialRebindDelay` (validated at `Listener` init).
     decimal maxRebindDelay = 60;
-    # Multiplier applied to the delay after each failed attempt (exponential backoff).
-    # Must be >= 1 (validated at `Listener` init) — values below 1 would shrink, not
-    # back off.
+    # Multiplier applied to the delay after each consecutive failure (exponential
+    # backoff). The exponent grows across a *flapping* link too — a bind that succeeds
+    # and then quickly drops counts as a failure, so the delay keeps compounding instead
+    # of snapping back to `initialRebindDelay` on every short-lived bind. Must be >= 1
+    # (validated at `Listener` init) — values below 1 would shrink, not back off.
     decimal backOffMultiplier = 2.0;
-    # Maximum number of rebind attempts before giving up. `0` disables automatic rebinding
-    # entirely (a drop still notifies `onError` once, but nothing is retried). `-1` retries
+    # Maximum number of CONSECUTIVE failures before giving up, where a failure is either
+    # a failed bind attempt or a bind that did not stay up for the stability window
+    # (~60s continuously bound). The counter resets only after a stable window, at the
+    # next drop — never on a successful bind alone, so this cap is reachable against
+    # exactly the flapping link it exists for. (Behavior change in 8.5: earlier releases
+    # reset the counter on every successful bind, making this cap and the backoff growth
+    # silently inert under a flap — a link that previously retried forever now
+    # terminates after this many consecutive short-lived cycles.) On give-up the
+    # listener latches dead: `onError` is notified once more, a WARN is logged, and
+    # every subsequent `submit` fails with `LINK_ABANDONED` — only a new `Listener`
+    # recovers. `0` disables automatic rebinding entirely (a drop still notifies
+    # `onError` once, latching `LINK_ABANDONED` immediately). `-1` (the default) retries
     # indefinitely. Other negative values are rejected at `Listener` init.
     int maxRebindAttempts = -1;
 |};
