@@ -12,6 +12,7 @@ import org.junit.jupiter.api.Test;
 import java.io.IOException;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -86,6 +87,29 @@ class SubmitErrorMappingTest {
         assertEquals("INVALID_REQUEST", f.failureMode);
         assertEquals("destAddr is required", f.message,
                 "local validation messages pass through verbatim - they are already safe");
+    }
+
+    @Test
+    void possiblySubmittedPartitionsByDuplicateRisk() {
+        // The semantics are "can a retry duplicate?", NOT "did it reach the wire"
+        // (design-review FINDING-6). REJECTED is the subtle row: the PDU WAS written,
+        // but the SMSC received and definitively refused it - a retry cannot duplicate.
+        assertFalse(NativeCaller.mapSubmitFailure(
+                new NativeCaller.InvalidRequest("x")).possiblySubmitted, "local refusal");
+        assertFalse(NativeCaller.mapSubmitFailure(
+                new NegativeResponseException(0x58)).possiblySubmitted, "REJECTED: refused");
+        assertFalse(NativeCaller.mapSubmitFailure(
+                new GenericNackResponseException("nack", 0x03)).possiblySubmitted, "nack: refused");
+        assertFalse(NativeCaller.mapSubmitFailure(
+                new PDUException("bad pdu")).possiblySubmitted, "composer throws pre-write");
+        assertTrue(NativeCaller.mapSubmitFailure(
+                new ResponseTimeoutException("t")).possiblySubmitted, "response lost");
+        assertTrue(NativeCaller.mapSubmitFailure(
+                new InvalidResponseException("seq")).possiblySubmitted, "response unusable");
+        assertTrue(NativeCaller.mapSubmitFailure(
+                new IOException("pipe")).possiblySubmitted, "mid-flight death");
+        assertTrue(NativeCaller.mapSubmitFailure(
+                new NullPointerException()).possiblySubmitted, "unknown: assume the worst");
     }
 
     @Test

@@ -45,6 +45,10 @@ public final class NativeListener {
     private static final String NATIVE_REBIND_EXECUTOR = "smpp.rebindExecutor";
     private static final String NATIVE_SESSION_USABLE = "smpp.sessionUsable";
     private static final String NATIVE_SUBMITS_IN_FLIGHT = "smpp.submitsInFlight";
+    private static final String NATIVE_REBIND_ABANDONED = "smpp.rebindAbandoned";
+
+    private static final java.util.logging.Logger LOGGER =
+            java.util.logging.Logger.getLogger(NativeListener.class.getName());
 
     /**
      * Extra jsmpp PDU-processor threads kept beyond {@code maxConcurrentDispatch} in SYNC
@@ -136,6 +140,16 @@ public final class NativeListener {
                 new java.util.concurrent.atomic.AtomicInteger();
         caller.addNativeData(NativeCaller.SUBMITS_IN_FLIGHT, submitsInFlight);
         listener.addNativeData(NATIVE_SUBMITS_IN_FLIGHT, submitsInFlight);
+        // Terminal rebind verdict (D13/F7): set at the two give-up points (rebind
+        // disabled at drop time, or attempts exhausted), cleared only by a successful
+        // install. The submit path reads it to answer LINK_ABANDONED instead of
+        // LINK_DOWN - "retrying is futile for this Listener's life" is the one
+        // distinction error wording alone could not carry (D8 revisited). Installed on
+        // BOTH objects at init: the Caller never touches the listener BObject (the
+        // native-data HashMap race documented above).
+        AtomicBoolean rebindAbandoned = new AtomicBoolean(false);
+        caller.addNativeData(NativeCaller.REBIND_ABANDONED, rebindAbandoned);
+        listener.addNativeData(NATIVE_REBIND_ABANDONED, rebindAbandoned);
         listener.addNativeData(NATIVE_DISPATCHER,
                 new Dispatcher(env.getRuntime(), maxConcurrentDispatch, decodeGsm7, caller));
         listener.addNativeData(NATIVE_STATE, stateRef);
@@ -315,6 +329,7 @@ public final class NativeListener {
             if (st == ListenerState.STARTING || st == ListenerState.STARTED) {
                 session(listener).set(session);
                 sessionUsable(listener).set(true);
+                rebindAbandoned(listener).set(false);
                 installed.set(true);
                 state(listener).set(ListenerState.STARTED);
                 // Bound-race check: if the session died in the sliver between
@@ -397,6 +412,10 @@ public final class NativeListener {
         return (AtomicBoolean) listener.getNativeData(NATIVE_SESSION_USABLE);
     }
 
+    private static AtomicBoolean rebindAbandoned(BObject listener) {
+        return (AtomicBoolean) listener.getNativeData(NATIVE_REBIND_ABANDONED);
+    }
+
     private static java.util.concurrent.atomic.AtomicInteger submitsInFlight(BObject listener) {
         return (java.util.concurrent.atomic.AtomicInteger) listener.getNativeData(NATIVE_SUBMITS_IN_FLIGHT);
     }
@@ -457,9 +476,21 @@ public final class NativeListener {
         long maxAttempts = policy.getIntValue(StringUtils.fromString("maxRebindAttempts"));
         if (maxAttempts == 0) {
             // Auto-rebind disabled; the onUnexpectedDrop call already reported the drop.
+            // Latch the terminal verdict BEFORE returning so a submit racing in from the
+            // very onError handler that learns of the drop already sees LINK_ABANDONED.
+            rebindAbandoned(listener).set(true);
+            LOGGER.warning("SMPP link is down and rebindPolicy.maxRebindAttempts is 0: this "
+                    + "listener will not recover; submits now fail with LINK_ABANDONED");
             return;
         }
         if (maxAttempts > 0 && attempt > maxAttempts) {
+            rebindAbandoned(listener).set(true);
+            // The one operator-visible WARN at the transition (stage-2 F10.3): the
+            // dispatchError below reaches only an attached onError handler, which a
+            // default deployment may not have.
+            LOGGER.warning("SMPP listener gave up rebinding after " + (attempt - 1)
+                    + " attempt(s): this listener will not recover; submits now fail with "
+                    + "LINK_ABANDONED");
             dispatcher(listener).dispatchError(
                     "gave up rebinding to the SMSC after " + (attempt - 1) + " attempt(s)");
             return;

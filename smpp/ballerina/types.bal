@@ -519,7 +519,7 @@ public type DeliveryReceipt record {|
     string text?;
 |};
 
-# How a `submit` failed, mapped from the jsmpp exception that surfaced it. The five
+# How a `submit` failed, mapped from the jsmpp exception that surfaced it. The six
 # members deliberately partition by WHAT THE CALLER SHOULD DO, not by exception class:
 public enum FailureMode {
     # The SMSC answered the submit with a negative `command_status` — it received the
@@ -536,11 +536,17 @@ public enum FailureMode {
     # The link is the problem: it died while sending or waiting, OR it was already
     # down/rebinding when the submit was attempted (one bucket for one operational
     # condition — owner decision, 2026-07-29). For a mid-flight death the message may
-    # or may not have reached the SMSC (same duplicate caveat as
-    # `TIMEOUT_DELIVERY_UNKNOWN`); for an already-down link nothing was sent. If
-    # `rebindPolicy` is enabled, retry once rebound; if rebinding is disabled or
-    # exhausted, the link stays down until you restart the listener.
+    # or may not have reached the SMSC (`ErrorDetail.possiblySubmitted` tells you
+    # which); for an already-down link nothing was sent. If `rebindPolicy` is enabled,
+    # retry once rebound; when rebinding is disabled or exhausted the submit fails with
+    # `LINK_ABANDONED` instead, so this member always means "worth retrying later".
     LINK_DOWN,
+    # The link is down and this connector will NOT try to restore it: `rebindPolicy`
+    # was disabled (`maxRebindAttempts: 0`) at the time of the drop, or its attempts
+    # are exhausted. Unlike `LINK_DOWN`, retrying against this `Listener` is futile for
+    # the rest of its life — the only remedy is a new `Listener`. Nothing was sent.
+    # (Names the decision THIS connector made; the SMSC itself may be healthy.)
+    LINK_ABANDONED,
     # This connector refused to send: the request failed local validation (oversize,
     # unencodable character, bad field) or the lifecycle/config does not permit a
     # submit (not started, stopped, RECEIVER bind). Nothing reached the wire; fix the
@@ -562,6 +568,13 @@ public type ErrorDetail record {
     # The SMPP `command_status` from the negative response, when `failureMode` is
     # `REJECTED`. Compare against SMPP v3.4 §5.1.3 (e.g. 0x00000058 = ESME_RTHROTTLED).
     int commandStatus?;
+    # Whether the message may already have reached the SMSC — the single most useful
+    # bit for retry logic. `false`: retrying CANNOT duplicate the message (it either
+    # provably never left this connector, or the SMSC received it and definitively
+    # refused it). `true`: the SMSC may have accepted it (response lost or unusable,
+    # or the link died mid-flight), so a retry MAY DELIVER A DUPLICATE to the
+    # subscriber. Populated on every `submit` failure.
+    boolean possiblySubmitted?;
 };
 
 # The distinct error type raised by the SMPP connector. Returned from `Listener` init on

@@ -25,6 +25,7 @@ const int SUBMIT_STALL_TEST_PORT = 27821;
 const int SUBMIT_LATE_RESP_PORT = 27822;
 const int SUBMIT_DUP_MT_PORT = 27823;
 const int SUBMIT_UDHI_TEST_PORT = 27824;
+const int SUBMIT_ABANDONED_TEST_PORT = 27825;
 
 // Cleanup state for the after: hooks (the house pattern - see data_sm_test.bal for why
 // @test:AfterEach is unusable). A listener leaked by a failed assertion would otherwise
@@ -442,6 +443,57 @@ function testSubmitOnReceiverBindIsRejected() returns error? {
     test:assertFalse(msg.includes("BOUND_RX"),
             "jsmpp state names must not leak - that is the guard-absent signature");
     test:assertEquals(e.detail().failureMode, INVALID_REQUEST);
+
+    check smsListener.gracefulStop();
+    mockSmscClose(mockId);
+}
+
+@test:Config {after: cleanupSubmitTest, groups: ["submit"]}
+function testExhaustedRebindYieldsLinkAbandoned() returns error? {
+    clearCapturedCaller();
+    int mockId = check mockSmscOpen(SUBMIT_ABANDONED_TEST_PORT);
+    submitTestMockId = mockId;
+    Listener smsListener = check new ({
+        host: "localhost",
+        port: SUBMIT_ABANDONED_TEST_PORT,
+        systemId: "test",
+        password: "test",
+        bindType: TRANSCEIVER,
+        rebindPolicy: {maxRebindAttempts: 0}
+    });
+    submitTestListener = smsListener;
+    check smsListener.attach(new CallerCapturingService());
+    check smsListener.'start();
+    int conn = check mockSmscAwaitNextBind(mockId, 5000);
+    check mockSmscSendDeliverSm(mockId, conn, "capture", "", 0);
+    test:assertTrue(pollUntil(isolated function() returns boolean {
+        return capturedCaller() !is ();
+    }, 5), "the dispatch never delivered a Caller");
+    Caller caller = <Caller>capturedCaller();
+
+    check mockSmscSever(mockId, conn);
+
+    // Poll until the drop is detected AND the terminal verdict latched: a submit in
+    // the sliver between sessionUsable=false and the latch may correctly see
+    // LINK_DOWN once - the two flags flip microseconds apart, in that order.
+    Error? abandoned = ();
+    int attempts = 0;
+    while abandoned is () {
+        SubmitResult|Error r = caller->submit({destAddr: "264811234567", shortMessage: "x"});
+        if r is Error && r.detail().failureMode == LINK_ABANDONED {
+            abandoned = r;
+        } else {
+            attempts += 1;
+            test:assertTrue(attempts < 50,
+                    "LINK_ABANDONED never surfaced with maxRebindAttempts: 0 after a sever");
+            runtime:sleep(0.1);
+        }
+    }
+    Error e = <Error>abandoned;
+    test:assertTrue(e.message().includes("new Listener"),
+            string `the remedy must be named in the message: ${e.message()}`);
+    test:assertEquals(e.detail().possiblySubmitted, false,
+            "an abandoned-link refusal provably never wrote - resubmit on a new Listener is safe");
 
     check smsListener.gracefulStop();
     mockSmscClose(mockId);

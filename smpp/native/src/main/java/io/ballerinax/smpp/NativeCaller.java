@@ -74,6 +74,7 @@ public final class NativeCaller {
     static final String CONFIG = "smpp.caller.config";
     static final String SESSION_USABLE = "smpp.caller.sessionUsable";
     static final String SUBMITS_IN_FLIGHT = "smpp.caller.submitsInFlight";
+    static final String REBIND_ABANDONED = "smpp.caller.rebindAbandoned";
 
     private NativeCaller() {}
 
@@ -132,11 +133,20 @@ public final class NativeCaller {
         final String message;
         final String failureMode;
         final Integer commandStatus;
+        /**
+         * Whether the message may already have reached the SMSC (D-record F7). The
+         * semantics are "can a retry duplicate?", NOT "did it reach the wire": a
+         * REJECTED submit WAS written, but the SMSC definitively refused it, so a
+         * retry cannot duplicate — false.
+         */
+        final boolean possiblySubmitted;
 
-        MappedFailure(String message, String failureMode, Integer commandStatus) {
+        MappedFailure(String message, String failureMode, Integer commandStatus,
+                boolean possiblySubmitted) {
             this.message = message;
             this.failureMode = failureMode;
             this.commandStatus = commandStatus;
+            this.possiblySubmitted = possiblySubmitted;
         }
     }
 
@@ -316,36 +326,43 @@ public final class NativeCaller {
     static MappedFailure mapSubmitFailure(Throwable t) {
         String msg = t.getMessage() != null ? t.getMessage() : t.getClass().getSimpleName();
         if (t instanceof InvalidRequest) {
-            return new MappedFailure(msg, "INVALID_REQUEST", null);
+            // Local refusal: provably never wrote.
+            return new MappedFailure(msg, "INVALID_REQUEST", null, false);
         }
         if (t instanceof NegativeResponseException e) {
-            return new MappedFailure("SMSC rejected the submit: " + msg, "REJECTED", e.getCommandStatus());
+            // Written AND definitively refused - a retry cannot duplicate.
+            return new MappedFailure("SMSC rejected the submit: " + msg, "REJECTED",
+                    e.getCommandStatus(), false);
         }
         if (t instanceof GenericNackResponseException e) {
             // Before InvalidResponseException: it is a subclass, and unlike its parent it
             // carries the SMSC's actual command_status - a generic_nack IS a rejection.
-            return new MappedFailure("SMSC answered generic_nack: " + msg, "REJECTED", e.getCommandStatus());
+            return new MappedFailure("SMSC answered generic_nack: " + msg, "REJECTED",
+                    e.getCommandStatus(), false);
         }
         if (t instanceof ResponseTimeoutException) {
             return new MappedFailure("no submit_sm_resp within transactionTimeout: " + msg
                     + " (the SMSC may still have accepted the message - retrying may duplicate it)",
-                    "TIMEOUT_DELIVERY_UNKNOWN", null);
+                    "TIMEOUT_DELIVERY_UNKNOWN", null, true);
         }
         if (t instanceof InvalidResponseException) {
-            return new MappedFailure("invalid submit_sm_resp: " + msg, "PROTOCOL_ERROR", null);
+            // Sent; the response was unusable - acceptance unknown.
+            return new MappedFailure("invalid submit_sm_resp: " + msg, "PROTOCOL_ERROR", null, true);
         }
         if (t instanceof PDUException) {
             // Includes PDUStringException - jsmpp's own validator, which compose()'s
-            // pre-checks make a never-fires backstop.
-            return new MappedFailure("jsmpp rejected the request PDU: " + msg, "INVALID_REQUEST", null);
+            // pre-checks make a never-fires backstop. Thrown while COMPOSING, pre-write.
+            return new MappedFailure("jsmpp rejected the request PDU: " + msg, "INVALID_REQUEST",
+                    null, false);
         }
         if (t instanceof IOException) {
+            // Mid-flight death: octets may have been flushed before the failure.
             return new MappedFailure("connection failed mid-submit: " + msg
                     + " (delivery unknown; the listener is rebinding if the link dropped)",
-                    "LINK_DOWN", null);
+                    "LINK_DOWN", null, true);
         }
         return new MappedFailure("unexpected failure in the submit path: "
-                + t.getClass().getSimpleName() + ": " + msg, "PROTOCOL_ERROR", null);
+                + t.getClass().getSimpleName() + ": " + msg, "PROTOCOL_ERROR", null, true);
     }
 
     // ------------------------------------------------------------------
@@ -375,10 +392,11 @@ public final class NativeCaller {
         NativeListener.ListenerState st = stateRef.get();
         if (st == NativeListener.ListenerState.INIT || st == NativeListener.ListenerState.STARTING) {
             return detailError("cannot submit: the listener has not started yet - call 'start() first",
-                    "INVALID_REQUEST", null);
+                    "INVALID_REQUEST", null, false);
         }
         if (st == NativeListener.ListenerState.STOPPED) {
-            return detailError("cannot submit: the listener has been stopped", "INVALID_REQUEST", null);
+            return detailError("cannot submit: the listener has been stopped", "INVALID_REQUEST",
+                    null, false);
         }
 
         // Pre-check 2: bind type. Deliberately names the config field and the fix, and
@@ -387,7 +405,7 @@ public final class NativeCaller {
         String bindType = config.getStringValue(StringUtils.fromString("bindType")).getValue();
         if (!"TRANSCEIVER".equals(bindType)) {
             return detailError("cannot submit on a RECEIVER bind: submitting requires "
-                    + "bindType: TRANSCEIVER in the ConnectionConfig", "INVALID_REQUEST", null);
+                    + "bindType: TRANSCEIVER in the ConnectionConfig", "INVALID_REQUEST", null, false);
         }
 
         // Pre-check 3: session liveness. Two signals, both required:
@@ -418,8 +436,19 @@ public final class NativeCaller {
             SMPPSession session = sessionRef.get();
             if (session == null || !usable.get()
                     || session.getSessionState() != SessionState.BOUND_TRX) {
+                // LINK_ABANDONED vs LINK_DOWN (D-record F7): same down link, opposite
+                // advice. The abandoned flag is latched by scheduleRebind's give-up
+                // points and cleared only by a successful install, so this branch is
+                // the one place "retrying is futile" becomes program-visible.
+                java.util.concurrent.atomic.AtomicBoolean abandoned =
+                        (java.util.concurrent.atomic.AtomicBoolean) caller.getNativeData(REBIND_ABANDONED);
+                if (abandoned.get()) {
+                    return detailError("cannot submit: the SMSC link is down and rebinding was "
+                            + "disabled or exhausted - this listener will not recover; create a "
+                            + "new Listener", "LINK_ABANDONED", null, false);
+                }
                 return detailError("cannot submit: the SMSC session is down"
-                        + " (rebinding runs per rebindPolicy, if enabled)", "LINK_DOWN", null);
+                        + " (rebinding runs per rebindPolicy, if enabled)", "LINK_DOWN", null, false);
             }
             SubmitSpec spec = specFrom(sms, config);
             SubmitRequest req = compose(spec);
@@ -449,7 +478,7 @@ public final class NativeCaller {
             // VirtualMachineError must panic, not become a returned smpp:Error. specFrom
             // is inside this net too, so a malformed BMap cannot panic across interop.
             MappedFailure f = mapSubmitFailure(e);
-            return detailError(f.message, f.failureMode, f.commandStatus);
+            return detailError(f.message, f.failureMode, f.commandStatus, f.possiblySubmitted);
         } finally {
             // The one decrement, on every path incl. throws - a leaked count would make
             // every later gracefulStop burn its full timeout (Phase 5 finding #7).
@@ -461,12 +490,14 @@ public final class NativeCaller {
     // Ballerina-value plumbing
     // ------------------------------------------------------------------
 
-    private static BError detailError(String message, String failureMode, Integer commandStatus) {
+    private static BError detailError(String message, String failureMode, Integer commandStatus,
+            boolean possiblySubmitted) {
         Map<String, Object> detail = new HashMap<>();
         detail.put("failureMode", failureMode);
         if (commandStatus != null) {
             detail.put("commandStatus", (long) (int) commandStatus);
         }
+        detail.put("possiblySubmitted", possiblySubmitted);
         return ModuleUtils.createError(message, detail);
     }
 
