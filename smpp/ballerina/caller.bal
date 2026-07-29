@@ -45,6 +45,12 @@ public isolated client class Caller {
     # or the SMSC sees `ESME_RTHROTTLED` on concurrent inbound traffic (documented
     # consequence, pinned by `testSubmitStarvesInboundDispatchWithThrottle`).
     #
+    # A slow inline reply in `SYNC` also delays the `deliver_sm_resp` past the SMSC's
+    # own transaction timer, making it REDELIVER an MO you already answered - a duplicate
+    # MT (pinned by `testSyncSubmitOutlivesSmscTransactionTimer`). **Prefer
+    # `responseMode: ASYNC` for reply-style services**, and carry your own idempotency
+    # key (e.g. dedupe on the inbound source+text+timestamp) where duplicates are costly.
+    #
     # + sms - the message to send
     # + return - the SMSC's `message_id` for the accepted message (correlate delivery
     #   receipts against it — see `Sms.receiptedMessageId`), or an `Error` whose detail

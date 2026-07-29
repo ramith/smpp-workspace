@@ -22,6 +22,8 @@ const int SUBMIT_THROTTLE_TEST_PORT = 27818;
 const int SUBMIT_REBIND_TIMER_PORT = 27819;
 const int SUBMIT_CONCURRENT_TEST_PORT = 27820;
 const int SUBMIT_STALL_TEST_PORT = 27821;
+const int SUBMIT_LATE_RESP_PORT = 27822;
+const int SUBMIT_DUP_MT_PORT = 27823;
 
 // Cleanup state for the after: hooks (the house pattern - see data_sm_test.bal for why
 // @test:AfterEach is unusable). A listener leaked by a failed assertion would otherwise
@@ -786,6 +788,98 @@ function testSubmitDoesNotStallUnrelatedStrands() returns error? {
     SubmitResult|Error blockedResult = wait blocked;
     test:assertTrue(blockedResult is SubmitResult, "the blocked submit itself must still succeed");
     mockSmscSetSubmitDelay(mockId, 0);
+    check smsListener.gracefulStop();
+    mockSmscClose(mockId);
+    submitTestListener = ();
+    submitTestMockId = -1;
+}
+
+@test:Config {after: cleanupSubmitTest, groups: ["submit"]}
+function testLateSubmitResponseIsTimeoutDeliveryUnknown() returns error? {
+    // Item 12's falsifiable half (D5): transactionTimeout: 1 with a 2.5s-delayed resp.
+    // Note this legally puts the caller bound BELOW the 2s housekeeping bound - the
+    // validated floor is 1s, and nothing exercised that ordering before.
+    clearCapturedCaller();
+    clearRecordedErrors();
+    int mockId = check mockSmscOpen(SUBMIT_LATE_RESP_PORT);
+    submitTestMockId = mockId;
+    Listener smsListener = check new ({
+        host: "localhost",
+        port: SUBMIT_LATE_RESP_PORT,
+        systemId: "test",
+        password: "test",
+        bindType: TRANSCEIVER,
+        transactionTimeout: 1
+    });
+    submitTestListener = smsListener;
+    check smsListener.attach(new CallerCapturingService());
+    check smsListener.'start();
+    int conn = check mockSmscAwaitNextBind(mockId, 5000);
+    check mockSmscSendDeliverSm(mockId, conn, "capture", "", 0);
+    test:assertTrue(pollUntil(isolated function() returns boolean {
+        return capturedCaller() !is ();
+    }, 5), "capture dispatch");
+    Caller caller = <Caller>capturedCaller();
+    mockSmscSetSubmitDelay(mockId, 2500);
+    SubmitResult|Error late = caller->submit({destAddr: "264811234567", shortMessage: "late"});
+    test:assertTrue(late is Error, "a resp after transactionTimeout must be a timeout error");
+    test:assertEquals((<Error>late).detail().failureMode, TIMEOUT_DELIVERY_UNKNOWN);
+    // The "possibly delivered" half is what makes the caveat true, not rhetorical:
+    int captured = check mockSmscAwaitNextSubmit(mockId, conn, 5000);
+    test:assertEquals(mockSmscSubmitShortMessage(captured), "late",
+            "the SMSC DID receive the submit whose response timed out");
+    mockSmscSetSubmitDelay(mockId, 0);
+    // The late, unmatched resp must not be mistaken for a session fault...
+    runtime:sleep(2.5);
+    test:assertEquals(recordedErrorCount(), 0, "a late resp is not a drop");
+    // ...and the link survived: a fresh submit succeeds.
+    SubmitResult again = check caller->submit({destAddr: "264811234567", shortMessage: "after"});
+    test:assertTrue(again.messageId.length() > 0);
+    check smsListener.gracefulStop();
+    mockSmscClose(mockId);
+    submitTestListener = ();
+    submitTestMockId = -1;
+}
+
+@test:Config {after: cleanupSubmitTest, groups: ["submit"]}
+function testSyncSubmitOutlivesSmscTransactionTimer() returns error? {
+    // Item 12's actual hazard, fully deterministic: the SMSC's OWN transaction timer
+    // (mock-side, 1s) expires while a SYNC handler spends ~2s replying inline - the SMSC
+    // concludes the MO was unanswered WHILE the MT reply was nonetheless sent. Resending
+    // the identical MO (explicitly simulating SMSC redelivery POLICY - jsmpp itself
+    // implements none) then produces a SECOND MT: the documented duplicate chain.
+    lock {
+        concurrentReplies = {};
+    }
+    clearCapturedCaller();
+    int mockId = check mockSmscOpen(SUBMIT_DUP_MT_PORT);
+    submitTestMockId = mockId;
+    Listener smsListener = check new ({
+        host: "localhost",
+        port: SUBMIT_DUP_MT_PORT,
+        systemId: "test",
+        password: "test",
+        bindType: TRANSCEIVER
+    });
+    submitTestListener = smsListener;
+    check smsListener.attach(new CorrelatingReplyService());
+    check smsListener.'start();
+    int conn = check mockSmscAwaitNextBind(mockId, 5000);
+    check mockSmscSetTransactionTimer(mockId, conn, 1000);
+    mockSmscSetSubmitDelay(mockId, 2000);
+    error? mo1 = mockSmscSendDeliverSm(mockId, conn, "dup", "", 0);
+    test:assertTrue(mo1 is error,
+            "the SMSC's 1s timer must expire while the handler is mid-reply");
+    int mt1 = check mockSmscAwaitNextSubmit(mockId, conn, 10000);
+    test:assertEquals(mockSmscSubmitShortMessage(mt1), "re:dup",
+            "the MT was nonetheless sent - that is what makes redelivery a DUPLICATE");
+    mockSmscSetSubmitDelay(mockId, 0);
+    // Simulated SMSC redelivery of the identical MO:
+    check mockSmscSendDeliverSm(mockId, conn, "dup", "", 0);
+    int mt2 = check mockSmscAwaitNextSubmit(mockId, conn, 10000);
+    test:assertEquals(mockSmscSubmitShortMessage(mt2), "re:dup");
+    test:assertTrue(mockSmscSubmitMessageId(mt1) != mockSmscSubmitMessageId(mt2),
+            "two distinct MTs for one logical MO - the item-12 chain, pinned end to end");
     check smsListener.gracefulStop();
     mockSmscClose(mockId);
     submitTestListener = ();
