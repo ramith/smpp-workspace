@@ -487,8 +487,10 @@ week with two engineers running Phase 0's two tracks and Phase 1 in parallel).**
   `bal test` (exact octets, TON/NPI, ids correlated via the mock's per-capture record),
   and fault-path tests (rebind survival, fail-fast, throttle-starvation, the
   duplicate-MT chain, concurrent correlation). Standalone transmitter binds remain out
-  of scope (`smpp:Client` is backlog) — nothing here
-  tests sending.
+  of scope (`smpp:Client` is backlog): what is untested is sending *outside a listener
+  session*, not sending as such. (This bullet previously ended "nothing here tests
+  sending", contradicting its own first sentence — a leftover from when submit was out
+  of scope.)
 - **Real carrier-grade SMSC interoperability quirks** (vendor-specific TLV usage, real
   network latency/partition behavior). The in-process `MockSmsc` is a faithful jsmpp-level
   test double, not a substitute for interop testing against an actual carrier or a

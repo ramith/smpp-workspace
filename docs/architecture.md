@@ -80,19 +80,40 @@ call):
 This is distinct from a failed *initial* `'start()` call, which is always
 returned to you directly as an `error` and never retried by `rebindPolicy`.
 
-**How drops are detected (two independent signals).** The primary signal is jsmpp's own
-session-state listener firing `CLOSED` — normally 0–4ms after the socket dies. jsmpp 3.0.2
-also has a rare failure mode (roughly one sever in a few hundred under soak) where its
-reader thread dies mid-close and that notification **never** fires, leaving the session
-claiming to be bound forever. The connector therefore observes the transport itself: both
-connection factories wrap every socket stream, and an EOF or read error fires a second,
-independent drop signal. Whichever signal arrives first wins (exactly-once guarded); if
-the primary hasn't fired within a 1s grace, the connector declares the drop itself —
-`onError` message `"SMPP transport died and jsmpp's CLOSED notification did not arrive
-..."` instead of `"SMPP session closed unexpectedly ..."` — abandons the wedged session,
-and proceeds with the same rebind flow. Code that matches on `onError` message text should
-treat either wording as "the link dropped". See `ObservedConnection.java` and the Sprint 8
-Phase 3 incident record in [sprint-plan.md](sprint-plan.md) for the full forensics.
+**How drops are detected (three independent signals).** The one everyone expects is
+jsmpp's own session-state listener firing `CLOSED` — normally 0–4ms after the socket
+dies. The connector does not rely on it alone, and the reason is structural rather than
+a matter of belt-and-braces:
+
+- jsmpp's `AbstractSession.close()` fires `CLOSED` on its *last* line, inside a guard
+  that is skipped when `close()` is invoked **by the EnquireLinkSender on itself** —
+  which is exactly what happens on the ordinary enquire-link-timeout dead-link path. On
+  that path the notification structurally never fires from the closing thread.
+- Separately, a rare failure mode (roughly one sever in a few hundred under soak) leaves
+  the reader thread dead mid-close with the session claiming to be bound forever.
+
+So the connector observes the transport itself. Both connection factories wrap every
+socket stream, and **(2)** an EOF or read error, or **(3)** a `close()` on the connection
+while the listener is running, each fires the same one-shot drop signal. The third exists
+because the reader is not always in `read()` to see the socket die: under inbound
+overflow it can be parked on jsmpp's output-stream monitor behind a stalled writer, and
+with the state notification skipped as above, *no* signal would fire while submits kept
+being accepted onto a dead socket.
+
+Whichever signal arrives first wins (exactly-once guarded, per bind attempt). If jsmpp's
+own notification hasn't followed within a 1s grace, the connector declares the drop
+itself — `onError` message `"SMPP transport died and jsmpp's CLOSED notification did not
+arrive ..."` instead of `"SMPP session closed unexpectedly ..."` — **force-closes the
+dead transport and closes the wedged session on a throwaway daemon thread** (reclaiming
+the orphaned keepalive thread; the dead session's private PDU pool is not reclaimable and
+is documented as a bounded leak), then proceeds with the same rebind flow. Code that
+matches on `onError` message text should treat either wording as "the link dropped".
+
+The classification of *which* `close()` calls count as drops (a user-initiated stop and a
+connect-phase failure must not) lives entirely in the shared per-attempt guards, not at
+the call site — see `ObservedConnection.java` for the full caller table, and the Sprint 8
+Phase 3 incident record plus the Sprint 8.5 review in [sprint-plan.md](sprint-plan.md)
+for the forensics.
 
 ## Configuration reference
 
@@ -276,8 +297,25 @@ a pool thread. The pool itself is sized *mode-aware*:
 - `SYNC`: `maxConcurrentDispatch + 1`. Handlers run on pool threads and block for
   the handler's duration, but the semaphore caps blocking handlers at
   `maxConcurrentDispatch`, so the `+1` reserve thread is never occupiable by a
-  handler and is always free to answer `enquire_link`. One reserve suffices — all
+  handler and is free to answer `enquire_link`. One reserve suffices — all
   outbound sends serialize on a single stream, so a second would protect nothing.
+
+  **The reserve is load-bearing for more than keepalive.** *Every* inbound PDU
+  rides this pool, including every `submit_sm_resp`. A `SYNC` handler blocked
+  inside `caller->submit` occupies one pool thread while its own completion
+  depends on *another* pool thread delivering the response — so with no reserve,
+  N blocked submitting handlers deadlock each other until `transactionTimeout`.
+  That makes the reserve a liveness requirement for the submit path, not just a
+  keepalive nicety, and it is why the docs say keepalive is answered *while every
+  dispatch slot is busy* rather than promising it is answered under all
+  conditions: on a reply-heavy service, keepalive latency and submit completion
+  compete for the same one thread, and a stuck outbound *write* stalls both no
+  matter how the pool is sized.
+
+  The reserve's effect depends on a jsmpp-private mechanism (the pool is created
+  single-threaded and resized only by jsmpp's own bound-state listener), so it is
+  catalogued in `docs/jsmpp-upgrade-checklist.md` §G along with the two
+  integration tests that are its only regression canaries.
 - `ASYNC`: a small fixed pool. Handlers run on virtual threads, so pool threads
   only marshal each PDU and spawn — they never block, so keepalive is never
   starved regardless of `maxConcurrentDispatch`.
@@ -312,6 +350,31 @@ multiplying the previous delay by `backOffMultiplier`, capped at
 before giving up: `-1` (the default) retries indefinitely; `0` disables
 automatic rebinding entirely, so a drop only ever produces the one initial
 `onError` notification.
+
+**What "attempts" counts, and why it matters.** The counter tracks *consecutive
+failures*, where a failure is either a failed bind **or a bind that did not stay
+up for a stability window (~60s continuously bound)**. It resets only after that
+window, at the next drop — never on a successful bind by itself.
+
+That distinction is the difference between the cap working and being decorative.
+Counting only failed binds means an SMSC that accepts the bind and then drops it —
+post-bind quota enforcement, a load balancer resetting bound sessions — resets the
+episode every cycle: `maxRebindAttempts` never exhausts, `backOffMultiplier`'s
+exponent stays at zero, and the connector hot-loops against the SMSC at
+`initialRebindDelay` forever, with no configuration able to stop it. (That was the
+behaviour before 8.5; it is why a flapping link with a positive
+`maxRebindAttempts` now terminates where it previously retried indefinitely.)
+
+**Giving up is terminal and visible.** On exhaustion — or immediately, with
+`maxRebindAttempts: 0` — `onError` fires once more, a warning is logged, and every
+subsequent `submit` fails with `LINK_ABANDONED` rather than `LINK_DOWN`. The two
+mean opposite things to a caller: `LINK_DOWN` is worth retrying once rebound,
+`LINK_ABANDONED` never will be. Only a new `Listener` recovers.
+
+**Detection can lag.** The rebind worker is single-threaded, and a connect attempt
+against a half-open SMSC occupies it for up to `bindTimeout`. A drop occurring
+during such an attempt is queued behind it, so detection-to-rebind latency can be
+that much worse than the 1s grace suggests.
 
 ## Service contract
 
@@ -408,6 +471,51 @@ public type Sms record {|
     or parse the header — you receive each segment independently if `udhi`
     is set.
 
+## Replying: `smpp:Caller` and the outbound payload types
+
+A remote method may declare an `smpp:Caller` parameter and reply on the same
+session with `caller->submit(...)`. The parameter is matched by **type, not
+position**, and is optional — one-parameter services keep working unchanged.
+Requires `bindType: TRANSCEIVER`. One `Caller` exists per listener and stays valid
+across rebinds: every submit resolves the listener's *current* session, so a
+`Caller` captured before a drop submits on the fresh session afterwards.
+
+The outbound payload is a **union of closed records**, not one record with
+optional fields:
+
+```ballerina
+public type OutboundSms TextSms|BinarySms;
+```
+
+`TextSms` carries `shortMessage` + `encoding` (the connector encodes it and stamps
+the matching `data_coding`); `BinarySms` carries `shortMessageBytes` + `dataCoding`
++ `udhi` (verbatim octets, for anything `Encoding` cannot express). Both include a
+shared `OutboundBase` with the addressing and delivery fields.
+
+This shape is deliberate. A single record with all fields optional needs a runtime
+rule set — exactly one payload field, `dataCoding` required with bytes and
+forbidden with text, `udhi` only with bytes, and `encoding` silently ignored with
+bytes — five rules that only fire *after* the call, and that grow every time a new
+payload carrier is added. The union makes all five unrepresentable at compile time,
+and a future `message_payload` becomes a third *member* rather than a three-way
+runtime exclusion. The runtime checks survive as a native-side backstop, because the
+record crossing the Java interop boundary is untyped.
+
+`udhi` sets `esm_class` bit 6 (UDHI), which §5.2.12 requires whenever the payload
+starts with a User Data Header — concatenation, WAP push, port addressing. Without
+it, an SMSC accepts the message and the handset renders the header octets as
+visible garbage text, with nothing anywhere reporting an error. It is exposed as a
+boolean rather than the raw `esm_class` byte on purpose: the messaging-mode and
+message-type bits change SMSC routing and billing invisibly and this connector has
+no machinery behind them. The connector does **not** validate the UDH itself.
+
+Failures return an `smpp:Error` whose detail carries `failureMode`, optionally
+`commandStatus`, and `possiblySubmitted` — the last being the field to branch retry
+logic on, since SMPP itself cannot distinguish "never arrived" from "arrived,
+response lost". See the **Known limitations** section of `Package.md` for the
+throughput ceiling, the duplicate-MT hazard in `SYNC` mode, and the fact that a
+submit already awaiting its response is not woken by a link death or a stop.
+
 ## Shutting down
 
 ```ballerina
@@ -416,8 +524,34 @@ public isolated function immediateStop() returns error?;
 ```
 
 Both methods cancel any pending rebind attempt and then unbind and close the
-SMSC session. They differ in one respect: `gracefulStop()` first waits — up
-to `ConnectionConfig.gracefulStopTimeout` seconds (default `30`) — for any
-PDUs currently being dispatched to your service to finish, so an in-flight
-`onDeliverSm`/`onDataSm` call gets a chance to complete before the connection
-goes away. `immediateStop()` does not wait at all.
+SMSC session. They differ in what they wait for first:
+
+- `gracefulStop()` waits — up to `ConnectionConfig.gracefulStopTimeout` seconds
+  (default `30`) — for in-flight dispatches *and* in-flight submits to finish,
+  then runs a ≤2s **reservation sweep**. The sweep is correctness, not grace: it
+  closes the race with a submit that reserved its slot immediately before the
+  cutoff, so it applies even at `gracefulStopTimeout: 0`. If the drain times out,
+  the connector logs which counter was still non-zero.
+- `immediateStop()` skips both.
+
+**The unbind/close itself is bounded (~4s), and this is not free.** jsmpp's
+`unbindAndClose()` has three untimed segments — acquiring the output-stream
+monitor behind a stalled writer, the socket write itself (Java has no send
+timeout), and `close()`'s unbounded `enquireLinkSender.join()` — and only the
+`unbind_resp` wait is bounded. Against a black-holed peer, `stop()` would never
+return, the listener would never reach `STOPPED`, and a second stop returns
+immediately because the state is already `STOPPING`: no escape hatch. So the stop
+path arms a **force-close watchdog** on a dedicated daemon thread; if the
+choreography overruns, it closes the *pre-TLS raw socket*, which unwedges all
+three segments at once (see `docs/jsmpp-upgrade-checklist.md` §B and §P).
+
+Worst case: `gracefulStop` ≈ `gracefulStopTimeout` + ~2s + ~4s;
+`immediateStop` ≈ ~4s.
+
+**One thing neither stop can bound:** a submit already awaiting its
+`submit_sm_resp`. jsmpp has no fail-pending-on-close — closing the socket does not
+wake a blocked submitter, and there is no connector-side way to wake one — so it
+completes only at `transactionTimeout` (default 30s). It is at least classified
+honestly: because the connector knows *it* closed the session, that submit gets
+`LINK_DOWN` with `possiblySubmitted: true`, not a `TIMEOUT_DELIVERY_UNKNOWN` that
+would send an operator hunting for a network fault after they pressed stop.

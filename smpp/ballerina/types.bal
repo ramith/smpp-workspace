@@ -100,11 +100,20 @@ public type ConnectionConfig record {|
     # `ASYNC` mode. When the SMSC sends PDUs faster than this limit drains, the excess is
     # answered immediately with `ESME_RTHROTTLED` so the SMSC backs off and retains the
     # message (SMPP is at-least-once — a NACK is not a drop). Inbound throughput is bounded
-    # by design, not best-effort. The connector guarantees the SMSC's `enquire_link`
-    # keepalive is always answered promptly even while every dispatch slot is busy — so a
-    # slow service can no longer provoke the SMSC into dropping the link (in `SYNC` mode via
-    # a reserved worker thread beyond this limit; in `ASYNC` mode handlers run on virtual
-    # threads, so pool threads never block — see `docs/architecture.md`). Must be 1-1024
+    # by design, not best-effort.
+    #
+    # A busy service does not provoke the SMSC into dropping the link: the connector keeps
+    # a PDU-processor thread in reserve beyond this limit (in `SYNC` mode, where handlers
+    # occupy those threads; in `ASYNC` mode handlers run on virtual threads and never
+    # occupy them at all), so `enquire_link` is answered while every dispatch slot is busy.
+    # Stated precisely rather than as a guarantee: that reserve also carries every
+    # `submit_sm_resp`, so on a reply-heavy service keepalive latency and submit completion
+    # compete for the same thread. It is sized for that (`maxConcurrentDispatch + 1`), and
+    # a stuck outbound WRITE would stall both regardless — no reserve can protect against
+    # that. See `docs/architecture.md`.
+    #
+    # This ceiling is **per listener, not per process**: N listeners at 1024 in `SYNC` mode
+    # is a legal configuration that would attempt ~N×1024 platform threads. Must be 1-1024
     # (validated at `Listener` init).
     int maxConcurrentDispatch = 3;
     # Controls when the `deliver_sm_resp`/`data_sm_resp` is sent back to the SMSC
@@ -281,10 +290,17 @@ public enum Npi {
 # How an outbound message's text is encoded, and hence the `data_coding` it is sent with.
 #
 # Only the three schemes this connector also **decodes** precisely are offered. The GSM
-# 03.38 7-bit default alphabet (`data_coding 0x00`) is **not** available for sending: it
-# needs a packed-septet encoder, which jsmpp does not provide, and adding protocol logic
-# jsmpp lacks is outside this connector's remit. Use a `BinarySms` with an explicit
-# `dataCoding` if you need to put such a payload on the wire yourself.
+# 03.38 7-bit default alphabet (`data_coding 0x00`) is **not** available for sending:
+# packing text into septets is protocol logic the underlying library does not provide and
+# this connector deliberately does not add.
+#
+# If your SMSC requires `data_coding 0x00`, send a `BinarySms` with `dataCoding: 0` and
+# the bytes you want. Note the common case needs no encoder at all: for text that is
+# **pure ASCII**, the GSM 03.38 default alphabet agrees with ASCII on every character
+# except `@` (0x00 in GSM-7) and a handful of currency/accented symbols, and most SMSCs
+# accept unpacked one-byte-per-character `0x00` payloads — so `shortMessageBytes` holding
+# the plain ASCII bytes is usually exactly what is wanted. For anything beyond ASCII under
+# `0x00`, you need a real GSM-7 encoder of your own.
 public enum Encoding {
     # IA5/ASCII — `data_coding 0x01`. 7-bit US-ASCII only; anything else is rejected.
     ASCII,
