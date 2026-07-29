@@ -73,6 +73,13 @@ Attach one service implementing at least one of these remote methods:
 - `remote function onError(error err) returns error?` — an unexpected session drop
   (see **Resilience**). If you don't implement it, drops are logged via `ballerina/log`.
 
+An inbound PDU whose handler your service does **not** implement is NACKed with
+`ESME_RX_P_APPN` (permanent application error) and logged once per PDU type — it is
+never silently acknowledged, which would discharge the SMSC's at-least-once guarantee
+against a message nothing consumed. If you want to ignore a PDU type, implement its
+method and return successfully. A PDU arriving before any service is attached gets
+`ESME_RX_T_APPN` instead, so the SMSC redelivers it.
+
 **Response mode** (`responseMode`, default `SYNC`) controls *when* the connector answers
 the SMSC:
 
@@ -85,8 +92,16 @@ the SMSC:
   virtual thread; a later failure can't be reflected to the SMSC and is logged instead.
 
 `maxConcurrentDispatch` (default 3) bounds how many messages run in your service at once,
-in both modes; excess is answered with `ESME_RTHROTTLED` so the SMSC backs off. A slow
-service can never stall the SMSC's `enquire_link` keepalive — see the design doc.
+in both modes; excess is answered with `ESME_RTHROTTLED` so the SMSC backs off and
+retains the message. For a **reply-style** service (one that calls `caller->submit` from
+its handler) this is also the effective outbound concurrency, and throttling is a normal
+steady state rather than an anomaly — see **Throughput** below. The connector logs
+throttling on a geometric schedule so it is visible without flooding.
+
+A slow service does not stall the SMSC's `enquire_link` keepalive: the connector reserves
+a PDU-processor thread beyond `maxConcurrentDispatch` for exactly that. Note the reserve
+also carries every `submit_sm_resp`, so keepalive liveness and submit completion share it
+— see the design doc.
 
 ## The `Sms` record
 

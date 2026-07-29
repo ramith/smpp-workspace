@@ -232,9 +232,30 @@ the SMSC:
   case); the difference from `SYNC` is the immediate ack, not unbounded dispatch.
 
 If your remote method isn't implemented at all (e.g. a service that only
-implements `onDeliverSm`), an inbound `data_sm` is simply not dispatched
-anywhere — the SMSC still gets a positive response, since there's nothing to
-report as failed.
+implements `onDeliverSm`, receiving an inbound `data_sm`), the PDU is **NACKed
+with `ESME_RX_P_APPN`** — the SMPP v3.4 receiver "permanent app error" code
+(0x65) — and a warning is logged once per PDU type naming the missing method.
+
+Permanent, not temporary, and not a positive ack:
+
+- A **positive ack** (what releases before 8.5 sent) told the SMSC the message
+  had been consumed while the connector dropped it on the floor — silently
+  discharging SMPP's at-least-once guarantee against nothing, with no log, no
+  `onError`, and no metric. For a service without `onDeliverSm`, that silently
+  swallowed every delivery receipt.
+- A **temporary** error (`ESME_RX_T_APPN`, used for handler failures) would
+  invite redelivery — but a missing remote method is a property of the deployed
+  code and cannot appear at runtime, so every redelivery would fail identically:
+  a guaranteed poison loop for the life of the deployment.
+
+A PDU arriving when **no service is attached at all** — the window between
+`'start()` and `attach`, or after a `detach` — is genuinely transient and gets
+`ESME_RX_T_APPN` instead, so the SMSC retains and redelivers it.
+
+If you legitimately want to ignore a PDU type, implement its remote method and
+return successfully; that consumes the traffic and acknowledges it positively.
+(`alert_notification` is unaffected either way: SMPP v3.4 defines no response
+PDU for it, so there is nothing to acknowledge.)
 
 #### Why a busy service does not stall keepalive
 
@@ -313,9 +334,11 @@ remote function onError(error err) returns error?;
   above). It is never called for a failed initial `'start()`, only for a
   drop after a successful bind.
 
-If your service implements none of the applicable methods for an incoming
-PDU type, or implements no service at all, that PDU is simply not delivered
-anywhere — it's still acknowledged to the SMSC as if handled.
+If your service implements no method for an incoming PDU type, that PDU is
+NACKed with `ESME_RX_P_APPN` (permanent); if no service is attached at all, it
+is NACKed with `ESME_RX_T_APPN` (transient, so the SMSC redelivers). Neither is
+silently acknowledged — see
+[Dispatch concurrency and response mode](#dispatch-concurrency-and-response-mode).
 
 ### The `Sms` record
 

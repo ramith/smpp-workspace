@@ -81,6 +81,23 @@ class SubmitErrorMappingTest {
     }
 
     @Test
+    void jsmppSessionStateNamesNeverLeak() {
+        // jsmpp's ensureTransmittable throws a bare IOException naming its internal
+        // session id and state. The lifecycle pre-checks answer before that on the
+        // ordinary path, but cannot close the sliver between the liveness check and the
+        // send - so this branch has to sanitize, or the leak the RECEIVER-bind guard
+        // exists to prevent reappears by the racy route (caught by
+        // testSubmitDuringRebindFailsFastAndAfterStopIsRejected).
+        NativeCaller.MappedFailure f = NativeCaller.mapSubmitFailure(new IOException(
+                "Cannot submit_sm while session 12bcad39 in state CLOSED"));
+        assertEquals("LINK_DOWN", f.failureMode);
+        assertTrue(f.possiblySubmitted);
+        assertFalse(f.message.contains("CLOSED"), f.message);
+        assertFalse(f.message.contains("12bcad39"), f.message);
+        assertTrue(f.message.contains("delivery unknown"), f.message);
+    }
+
+    @Test
     void localValidationIsInvalidRequestVerbatim() {
         NativeCaller.MappedFailure f = NativeCaller.mapSubmitFailure(
                 new NativeCaller.InvalidRequest("destAddr is required"));

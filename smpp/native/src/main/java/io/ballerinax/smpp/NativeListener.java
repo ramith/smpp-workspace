@@ -131,6 +131,19 @@ public final class NativeListener {
      * set it to 0, run testConcurrentSubmitsCorrelateAndKeepaliveAnswered, and expect N
      * simultaneous TIMEOUT_DELIVERY_UNKNOWNs at transactionTimeout (a louder signature
      * than the missed keepalive).
+     *
+     * <p><b>Upgrade canaries (stage-2 F4).</b> The degree computed here only takes
+     * effect through a jsmpp-PRIVATE listener: the pool is built {@code (1,1)} in
+     * {@code PDUReaderWorker}'s constructor and resized ONLY by jsmpp's own
+     * {@code BoundSessionStateListener} on the bound transition. There is no public
+     * accessor for the real pool size, so nothing can assert it directly - but two
+     * integration tests fail loudly if that resize ever stops happening, because a
+     * stuck single-threaded pool deadlocks every SYNC submit (the handler occupies the
+     * one thread while its own {@code submit_sm_resp} needs another):
+     * {@code testConcurrentSubmitsCorrelateAndKeepaliveAnswered} and
+     * {@code testSubmitStarvesInboundDispatchWithThrottle}. Neither name suggests it,
+     * hence this note - do not weaken or delete them without replacing the coverage.
+     * {@code PduProcessorDegreeTest} pins only the arithmetic here, not the effect.
      */
     static int pduProcessorDegree(boolean async, int maxConcurrentDispatch) {
         return async ? ASYNC_PDU_PROCESSOR_DEGREE
@@ -215,6 +228,20 @@ public final class NativeListener {
     }
 
     public static Object attach(BObject listener, BObject service, Object name) {
+        // Lifecycle gate (stage-2 F14). attach used to consult no state at all, so
+        // attaching to a STOPPED listener returned success: the service was stored, could
+        // never be dispatched to, and the listener could never be restarted - a silent,
+        // permanent no-op that looks healthy, and one a compiler plugin cannot catch.
+        // Rejects STOPPING/STOPPED ONLY: attach-while-STARTED is the legitimate hot-swap
+        // path, and Ballerina's own `service ... on listener` flow is attach-then-start
+        // from INIT. Read lock-free on purpose - taking stateLock here would add a new
+        // edge to the lock-order analysis for no benefit, and the only race is a
+        // concurrently-stopping listener, where rejecting is the right answer anyway.
+        ListenerState st = state(listener).get();
+        if (st == ListenerState.STOPPING || st == ListenerState.STOPPED) {
+            return ModuleUtils.createError("cannot attach: the listener is stopped "
+                    + "(a stopped listener cannot be restarted - create a new Listener)");
+        }
         Dispatcher.AttachOutcome outcome = dispatcher(listener).attach(service);
         return switch (outcome.result()) {
             case ATTACHED -> null;
@@ -374,13 +401,30 @@ public final class NativeListener {
                 TypeOfNumber.UNKNOWN, NumberingPlanIndicator.UNKNOWN, null, bindTimeoutMillis);
 
         // LOAD-BEARING CROSS-LIBRARY INVARIANT: this critical section holds stateLock and
-        // reads session.getSessionState() (which takes jsmpp's stateProcessorLock), while
-        // the state-listener lambda above acquires stateLock from a jsmpp thread. This is
-        // deadlock-free ONLY because jsmpp releases stateProcessorLock BEFORE firing the
-        // listener (SMPPSessionContext.changeState releases its write lock, then calls
-        // fireStateChanged) - so the lambda's stateLock acquisition never happens while a
-        // jsmpp thread holds stateProcessorLock. If a future jsmpp release moved the fire
-        // inside that lock, this becomes a hard deadlock. Re-verify against jsmpp on upgrade.
+        // reads session.getSessionState(), while the state-listener lambda above acquires
+        // stateLock from a jsmpp thread. TWO jsmpp locks are involved, and the earlier
+        // version of this comment named the wrong one as load-bearing (stage-2 N1):
+        //
+        //  1. stateProcessorLock - released BEFORE fireStateChanged
+        //     (SMPPSessionContext.changeState), so the lambda's stateLock acquisition
+        //     never happens while a jsmpp thread holds its WRITE lock. True, but not
+        //     what makes this safe.
+        //  2. the AbstractSessionContext OBJECT MONITOR - open()/bound()/unbound()/
+        //     close() are all `synchronized`, and fireStateChanged runs INSIDE it. So a
+        //     jsmpp thread firing CLOSED holds that monitor and then wants stateLock.
+        //
+        // Deadlock freedom therefore rests on the fact that getSessionState() takes only
+        // stateProcessorLock's READ lock and NEVER the context object monitor: this
+        // thread holds stateLock and wants the read lock; the firing thread holds the
+        // monitor and wants stateLock; no cycle. If a future jsmpp made getSessionState()
+        // synchronized (a plausible fix for the unsynchronized stateProcessor read in
+        // changeState), this becomes an immediate hard deadlock between a Ballerina
+        // strand and a jsmpp reader thread. Re-verify BOTH facts on upgrade.
+        //
+        // The same reasoning is why no connector code may hold stateLock across ANY
+        // jsmpp Session/SessionContext call except getSessionState() - notably why the
+        // close watchdog force-closes the raw socket rather than calling session.close(),
+        // and why unbindAndClose()/closeSession() run outside this monitor.
         boolean abortedByStop = false;
         synchronized (stateLock(listener)) {
             ListenerState st = state(listener).get();
@@ -777,6 +821,20 @@ public final class NativeListener {
                 break;
             }
         }
+        // Say WHICH counter stalled (stage-2 F10.1). A silent drain that burns its whole
+        // timeout and proceeds is indistinguishable from an instant one in the logs -
+        // that ambiguity already cost this project one investigation, recorded at the
+        // time as "observation only". One line at the timeout is the whole fix, and the
+        // counts separate the two very different causes: a wedged handler (inFlight) vs
+        // a submit parked awaiting a response the SMSC never sent (submitsInFlight).
+        int stalledDispatches = dispatcher.inFlightCount();
+        int stalledSubmits = submits.get();
+        if (stalledDispatches > 0 || stalledSubmits > 0) {
+            LOGGER.warning("gracefulStop drain timed out after " + timeoutSeconds
+                    + "s with " + stalledDispatches + " dispatch(es) and " + stalledSubmits
+                    + " submit(s) still in flight; unbinding anyway. In-flight submits are "
+                    + "not woken by the close and will fail at transactionTimeout.");
+        }
     }
 
     /**
@@ -868,7 +926,12 @@ public final class NativeListener {
         return (AtomicReference<ScheduledExecutorService>) listener.getNativeData(NATIVE_REBIND_EXECUTOR);
     }
 
-    /** Must be called while holding {@code stateLock(listener)} (sole caller: scheduleRebind). */
+    /**
+     * Must be called while holding {@code stateLock(listener)} — callers are
+     * {@code scheduleRebind} and {@code scheduleTransportDeathCheck} (both do; the
+     * "sole caller" claim this comment used to make went stale when the transport-death
+     * path was added).
+     */
     private static ScheduledExecutorService rebindExecutor(BObject listener) {
         AtomicReference<ScheduledExecutorService> ref = rebindExecutorRef(listener);
         ScheduledExecutorService existing = ref.get();

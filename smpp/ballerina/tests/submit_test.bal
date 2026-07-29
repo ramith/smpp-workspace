@@ -27,6 +27,9 @@ const int SUBMIT_DUP_MT_PORT = 27823;
 const int SUBMIT_UDHI_TEST_PORT = 27824;
 const int SUBMIT_ABANDONED_TEST_PORT = 27825;
 const int SUBMIT_FLAP_TEST_PORT = 27827;
+const int SUBMIT_SHAPES_PORT_4 = 27830;
+const int SUBMIT_SHAPES_PORT_5 = 27831;
+const int SUBMIT_ANYDATA_TEST_PORT = 27832;
 
 // Cleanup state for the after: hooks (the house pattern - see data_sm_test.bal for why
 // @test:AfterEach is unusable). A listener leaked by a failed assertion would otherwise
@@ -139,6 +142,62 @@ isolated service class PlainSmsService {
     *Service;
 
     remote isolated function onDeliverSm(Sms sms) returns error? {
+        lock {
+            submitTestDispatches += 1;
+        }
+    }
+}
+
+// `readonly & Sms` - compile-valid, idiomatic, and legal in 1.0.1 (where the parameter
+// was matched by name alone). Stage-2 H5: getReferredType unwraps type-reference chains
+// but NOT intersections, so this shape made the whole attach fail with "unsupported
+// type" - a hard startup failure on a signature users write, in the very release whose
+// headline feature is signature flexibility.
+isolated service class ReadonlySmsService {
+    *Service;
+
+    remote isolated function onDeliverSm(readonly & Sms sms) returns error? {
+        lock {
+            submitTestDispatches += 1;
+        }
+    }
+}
+
+type ReadonlySms readonly & Sms;
+
+isolated string anydataOutcome = "";
+
+isolated function anydataResult() returns string {
+    lock {
+        return anydataOutcome;
+    }
+}
+
+// Every observability integration does this, and nothing in the suite did before
+// Sprint 8.5 - which is how M9 survived: Sms.properties was built with the argless
+// createMapValue(), i.e. runtime type map<any>, into a field DECLARED map<anydata>.
+// RecordValueImpl.put does not type-check, so it went unnoticed until an anydata
+// operation inspected the member's runtime type.
+isolated service class AnydataProbingService {
+    *Service;
+
+    remote isolated function onDeliverSm(Sms sms) returns error? {
+        json j = check sms.toJson();
+        Sms copy = sms.clone();
+        readonly & Sms frozen = sms.cloneReadOnly();
+        lock {
+            anydataOutcome = j is map<json> && copy.shortMessage == sms.shortMessage
+                    && frozen.shortMessage == sms.shortMessage ? "ok" : "unexpected shape";
+        }
+    }
+}
+
+// The same shape behind an alias: getReferredType unwraps the reference and stops at the
+// intersection, so this failed for the same reason by a different route.
+isolated service class ReadonlyAliasSmsService {
+    *Service;
+
+    remote isolated function onDeliverSm(ReadonlySms sms) returns error? {
         lock {
             submitTestDispatches += 1;
         }
@@ -374,6 +433,39 @@ function testSubmitHappyPathPinsWirePdu() returns error? {
     test:assertEquals(mockSmscSubmitServiceType(submit2), "CMT");
     test:assertEquals(r2.messageId, mockSmscSubmitMessageId(submit2));
     test:assertEquals(mockSmscPendingSubmitCount(mockId, conn), 0, "and no more submits");
+
+    check smsListener.gracefulStop();
+    mockSmscClose(mockId);
+}
+
+@test:Config {after: cleanupSubmitTest, groups: ["submit"]}
+function testSmsIsGenuinelyAnydata() returns error? {
+    // M9: toJson/clone/cloneReadOnly all inspect the RUNTIME type of every member. A
+    // map<any> properties map is not a subtype of anydata, so each of these would fail
+    // on a record that type-checks statically. Pins the typed createMapValue.
+    lock {
+        anydataOutcome = "";
+    }
+    int mockId = check mockSmscOpen(SUBMIT_ANYDATA_TEST_PORT);
+    submitTestMockId = mockId;
+    Listener smsListener = check new ({
+        host: "localhost",
+        port: SUBMIT_ANYDATA_TEST_PORT,
+        systemId: "test",
+        password: "test",
+        bindType: TRANSCEIVER
+    });
+    submitTestListener = smsListener;
+    check smsListener.attach(new AnydataProbingService());
+    check smsListener.'start();
+    int conn = check mockSmscAwaitNextBind(mockId, 5000);
+    check mockSmscSendDeliverSm(mockId, conn, "anydata probe", "", 0);
+
+    test:assertTrue(pollUntil(isolated function() returns boolean {
+        return anydataResult() != "";
+    }, 5), "the handler never completed - an anydata operation on Sms panicked or failed");
+    test:assertEquals(anydataResult(), "ok",
+            "Sms must survive toJson/clone/cloneReadOnly - properties must be map<anydata>");
 
     check smsListener.gracefulStop();
     mockSmscClose(mockId);
@@ -670,9 +762,15 @@ function testCallerParamShapes() returns error? {
     Service[] accepted = [
         new PlainSmsService(),
         new CallerCapturingService(),
-        new CallerFirstService()
+        new CallerFirstService(),
+        // The two intersection shapes H5 restored: direct and behind an alias. They
+        // must ATTACH (the pre-8.5 failure) and DISPATCH (the freeze the plan performs
+        // for a readonly parameter must produce a value the runtime accepts).
+        new ReadonlySmsService(),
+        new ReadonlyAliasSmsService()
     ];
-    int[] shapePorts = [SUBMIT_SHAPES_TEST_PORT, SUBMIT_SHAPES_PORT_2, SUBMIT_SHAPES_PORT_3];
+    int[] shapePorts = [SUBMIT_SHAPES_TEST_PORT, SUBMIT_SHAPES_PORT_2, SUBMIT_SHAPES_PORT_3,
+            SUBMIT_SHAPES_PORT_4, SUBMIT_SHAPES_PORT_5];
     int portIndex = 0;
     foreach Service svc in accepted {
         int port = shapePorts[portIndex];

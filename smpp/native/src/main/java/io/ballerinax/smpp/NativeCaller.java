@@ -381,6 +381,19 @@ public final class NativeCaller {
                     null, false);
         }
         if (t instanceof IOException) {
+            // jsmpp's ensureTransmittable throws a bare IOException naming the session id
+            // and its INTERNAL state ("Cannot submit_sm while session <id> in state
+            // CLOSED"). The lifecycle pre-checks exist precisely to answer before that
+            // happens - but they cannot close the sliver between the liveness check and
+            // the send, so the same leak reaches the user by the racy path. Substitute
+            // the connector's own wording there: jsmpp state names are not part of this
+            // connector's published vocabulary, and nothing actionable is lost (the
+            // caller already gets LINK_DOWN + possiblySubmitted).
+            if (msg.contains(" in state ")) {
+                return new MappedFailure("the SMSC session went down while submitting"
+                        + " (delivery unknown; the listener is rebinding if the link dropped)",
+                        "LINK_DOWN", null, true);
+            }
             // Mid-flight death: octets may have been flushed before the failure.
             return new MappedFailure("connection failed mid-submit: " + msg
                     + " (delivery unknown; the listener is rebinding if the link dropped)",

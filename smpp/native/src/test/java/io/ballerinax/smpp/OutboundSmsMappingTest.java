@@ -270,6 +270,29 @@ class OutboundSmsMappingTest {
         NativeCaller.SubmitSpec bad = minimalText();
         bad.destTon = "TON_BOGUS";
         assertThrows(NativeCaller.InvalidRequest.class, () -> NativeCaller.compose(bad));
+
+        // The NUMERIC values, pinned separately (stage-2 §E): inbound TON/NPI reach the
+        // user as raw ints on Sms.properties (Dispatcher.toProperties), so the outbound
+        // enum and the inbound integers are only reconcilable if these values hold. A
+        // jsmpp renumbering would leave every outbound name resolving fine while
+        // silently changing what an inbound 5 means - invisible to the table above.
+        assertEquals(0, TypeOfNumber.UNKNOWN.value());
+        assertEquals(1, TypeOfNumber.INTERNATIONAL.value());
+        assertEquals(2, TypeOfNumber.NATIONAL.value());
+        assertEquals(3, TypeOfNumber.NETWORK_SPECIFIC.value());
+        assertEquals(4, TypeOfNumber.SUBSCRIBER_NUMBER.value());
+        assertEquals(5, TypeOfNumber.ALPHANUMERIC.value());
+        assertEquals(6, TypeOfNumber.ABBREVIATED.value());
+        assertEquals(0, NumberingPlanIndicator.UNKNOWN.value());
+        assertEquals(1, NumberingPlanIndicator.ISDN.value());
+        assertEquals(3, NumberingPlanIndicator.DATA.value());
+        assertEquals(4, NumberingPlanIndicator.TELEX.value());
+        assertEquals(6, NumberingPlanIndicator.LAND_MOBILE.value());
+        assertEquals(8, NumberingPlanIndicator.NATIONAL.value());
+        assertEquals(9, NumberingPlanIndicator.PRIVATE.value());
+        assertEquals(10, NumberingPlanIndicator.ERMES.value());
+        assertEquals(14, NumberingPlanIndicator.INTERNET.value());
+        assertEquals(18, NumberingPlanIndicator.WAP.value());
     }
 
     @Test

@@ -260,15 +260,23 @@ final class MockSmsc {
                     encode(shortMessage, dataCoding),
                     params);
         } catch (NegativeResponseException e) {
-            // Distinguish a throttle (ESME_RTHROTTLED, from the connector's backpressure gate)
-            // from a handler error (ESME_RX_T_APPN) or anything else. Ballerina interop surfaces
-            // the thrown exception's CLASS NAME as error.message(), so a throttle gets its own
-            // type; other negative responses keep the original (class name still identifies it).
-            if (e.getCommandStatus() == SMPPConstant.STAT_ESME_RTHROTTLED) {
-                throw new ThrottledException(e.getCommandStatus());
-            }
-            throw e;
+            // Distinguish the statuses tests pin, by TYPE - Ballerina interop surfaces the
+            // thrown exception's CLASS NAME as error.message(). Wire-level by construction:
+            // the status compared here was decoded from the actual deliver_sm_resp PDU,
+            // which is the only observation that catches jsmpp's catch-all rewriting a
+            // connector exception of the wrong type into RX_T_APPN (D14 trap).
+            throw classify(e);
         }
+    }
+
+    /** Maps a negative resp's decoded command_status to its distinctly-named test type. */
+    private static Exception classify(NegativeResponseException e) {
+        return switch (e.getCommandStatus()) {
+            case SMPPConstant.STAT_ESME_RTHROTTLED -> new ThrottledException(e.getCommandStatus());
+            case SMPPConstant.STAT_ESME_RX_P_APPN -> new PermanentAppErrorException(e.getCommandStatus());
+            case SMPPConstant.STAT_ESME_RX_T_APPN -> new TemporaryAppErrorException(e.getCommandStatus());
+            default -> e;
+        };
     }
 
     /**
@@ -330,12 +338,18 @@ final class MockSmsc {
                 ? new OptionalParameter[0]
                 : new OptionalParameter[] {
                         new OptionalParameter.Message_payload(encode(messagePayload, dataCoding)) };
-        connection(connectionId).dataShortMessage(
-                "", TypeOfNumber.INTERNATIONAL, NumberingPlanIndicator.ISDN, "12345",
-                TypeOfNumber.INTERNATIONAL, NumberingPlanIndicator.ISDN, "99999",
-                new ESMClass(), new RegisteredDelivery(0),
-                new RawDataCoding((byte) dataCoding),
-                params);
+        try {
+            connection(connectionId).dataShortMessage(
+                    "", TypeOfNumber.INTERNATIONAL, NumberingPlanIndicator.ISDN, "12345",
+                    TypeOfNumber.INTERNATIONAL, NumberingPlanIndicator.ISDN, "99999",
+                    new ESMClass(), new RegisteredDelivery(0),
+                    new RawDataCoding((byte) dataCoding),
+                    params);
+        } catch (NegativeResponseException e) {
+            // Same typed classification as sendDeliverSm - data_sm is the other PDU type
+            // the D14 NACK split applies to.
+            throw classify(e);
+        }
     }
 
     // --- submit_sm capture (Sprint 8, item 10) ---------------------------------------

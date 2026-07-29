@@ -103,6 +103,33 @@ function testRestartAfterStopRejected() returns error? {
 }
 
 @test:Config {groups: ["lifecycle"]}
+function testAttachAfterStopIsRejected() returns error? {
+    // Stage-2 F14: attach consulted NO lifecycle state, so attaching to a stopped
+    // listener returned success - the service was stored, could never be dispatched to,
+    // and the listener could never be restarted. A silent permanent no-op that looks
+    // healthy, and one a compiler plugin cannot catch. init does no network work and a
+    // never-started listener stops to STOPPED, so no mock is needed.
+    Listener l = check new ({
+        host: "localhost",
+        port: LIFECYCLE_START_TEST_PORT,
+        systemId: "test",
+        password: "test"
+    });
+    check l.attach(new LifecycleRecordingService());
+    check l.detach(new LifecycleRecordingService());
+    test:assertTrue(l.gracefulStop() is (), "stop on a never-started listener is a no-op");
+
+    error? reattach = l.attach(new LifecycleRecordingService());
+    test:assertTrue(reattach is error, "attach on a stopped listener must be rejected");
+    test:assertTrue((<error>reattach).message().includes(RESTART_AFTER_STOP_MSG),
+            string `the remedy must be named: ${(<error>reattach).message()}`);
+    // detach stays ungated on purpose: it is idempotent by contract and runs during
+    // teardown, where the listener is already stopping.
+    test:assertTrue(l.detach(new LifecycleRecordingService()) is (),
+            "detach must remain idempotent and ungated");
+}
+
+@test:Config {groups: ["lifecycle"]}
 function testStopBeforeStartIsIdempotentNoOp() returns error? {
     // init performs no network activity, so no mock is needed.
     Listener l = check new ({
