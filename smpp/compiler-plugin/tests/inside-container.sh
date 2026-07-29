@@ -20,10 +20,19 @@ if [ "$jarCount" -ne 1 ]; then
 fi
 
 echo "=== packing ramith/smpp:${VERSION} (with the compiler plugin) ==="
-cd "$SMPP/ballerina"
-# target/ may hold root-owned docker build output with a stale bala; pack somewhere else
-# is not an option (bal pack writes target/bala), so clear just that subtree.
-rm -rf target/bala
+# Pack from a CONTAINER-LOCAL copy, never in place: on a Linux CI runner the gradle
+# plugin's earlier `bal test` container leaves ballerina/target root-owned on the host
+# mount, and `bal pack` refuses ("target does not have write permissions") - this
+# failed the v1.1.0 release run while passing every macOS-docker local run, where the
+# file sharing layer masks ownership. The copy preserves the ../native and
+# ../compiler-plugin relative jar paths the tomls reference, and leaves the workspace
+# untouched as a bonus.
+PKG=/tmp/pkgroot
+mkdir -p "$PKG/ballerina" "$PKG/native/build/libs" "$PKG/compiler-plugin/build/libs"
+(cd "$SMPP/ballerina" && tar -c --exclude=./target .) | tar -x -C "$PKG/ballerina"
+cp "$SMPP"/native/build/libs/*.jar "$PKG/native/build/libs/"
+cp "$SMPP"/compiler-plugin/build/libs/smpp-compiler-plugin-*.jar "$PKG/compiler-plugin/build/libs/"
+cd "$PKG/ballerina"
 bal pack || { echo "bal pack failed"; exit 70; }
 bal push --repository=local || { echo "bal push --repository=local failed"; exit 71; }
 
