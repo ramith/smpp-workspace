@@ -768,9 +768,18 @@ function testSubmitDuringRebindFailsFastAndAfterStopIsRejected() returns error? 
     foreach int i in 1 ... 100 {
         SubmitResult|Error r = caller->submit({destAddr: "264811234567", shortMessage: "x"});
         if r is Error {
-            // Every failure on a down link must be LINK_DOWN and must never leak jsmpp
-            // state names, regardless of which path (mid-flight or pre-check) produced it.
-            test:assertEquals(r.detail().failureMode, LINK_DOWN);
+            // A failure on a down link is LINK_DOWN on both common paths (mid-flight
+            // IOException, or the pre-check once the drop verdict lands) - but there is
+            // a third, rare interleaving this loop can catch: a submit WRITTEN in the
+            // sliver just before the sever, whose response is then lost. That one
+            // honestly reports TIMEOUT_DELIVERY_UNKNOWN (a genuine drop - the
+            // connector did not close this session, so the self-closed remap correctly
+            // does not apply, and delivery really is unknown). Asserting LINK_DOWN
+            // alone flaked ~1-in-10 clean-build runs on exactly that sliver (1.1.0
+            // release build). No path may leak jsmpp state names.
+            FailureMode? mode = r.detail().failureMode;
+            test:assertTrue(mode == LINK_DOWN || mode == TIMEOUT_DELIVERY_UNKNOWN,
+                    string `expected LINK_DOWN or TIMEOUT_DELIVERY_UNKNOWN, got ${mode.toString()}`);
             test:assertFalse(r.message().includes("CLOSED"),
                     string `jsmpp state names must not leak: ${r.message()}`);
             if r.message().includes("session is down") {
