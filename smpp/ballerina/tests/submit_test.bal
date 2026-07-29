@@ -1,12 +1,42 @@
 // Copyright (c) 2026. Caller.submit integration tests against the mock SMSC.
 import ballerina/lang.runtime;
 import ballerina/test;
+import ballerina/time;
 
 const int SUBMIT_TEST_PORT = 27805;
 const int SUBMIT_REBIND_TEST_PORT = 27806;
 const int SUBMIT_RECEIVER_TEST_PORT = 27807;
 const int SUBMIT_SHAPES_TEST_PORT = 27808;
 const int SUBMIT_ERRORS_TEST_PORT = 27809;
+const int SUBMIT_TIMER_TEST_PORT = 27810;
+// The shapes test iterates several sub-cases; every port it uses is declared here so
+// `grep 'const int .*PORT'` (the suite's collision check) sees them (review finding M5).
+const int SUBMIT_SHAPES_PORT_2 = 27811;
+const int SUBMIT_SHAPES_PORT_3 = 27812;
+const int SUBMIT_SHAPES_MIXED_PORT = 27813;
+const int SUBMIT_SHAPES_REJECT_PORT = 27814;
+const int SUBMIT_ERRORS_MAPPING_PORT = 27815;
+
+// Cleanup state for the after: hooks (the house pattern - see data_sm_test.bal for why
+// @test:AfterEach is unusable). A listener leaked by a failed assertion would otherwise
+// rebind forever at ~1s cadence against a closed mock AND keep writing the module-level
+// capture globals, contaminating every later test in this file (review finding H1).
+Listener? submitTestListener = ();
+int submitTestMockId = -1;
+
+function cleanupSubmitTest() returns error? {
+    Listener? l = submitTestListener;
+    submitTestListener = ();
+    error? stopResult = ();
+    if l is Listener {
+        stopResult = l.gracefulStop();
+    }
+    if submitTestMockId != -1 {
+        mockSmscClose(submitTestMockId);
+        submitTestMockId = -1;
+    }
+    return stopResult;
+}
 
 // The Caller reaches user code only as a dispatch parameter, so every test captures it
 // from a service. (This is also why "submit before 'start()" is untestable by
@@ -112,6 +142,14 @@ isolated service class RestParamService {
     }
 }
 
+// The 1.0.1 compat shape: trailing defaulted non-Caller params are skipped, not rejected.
+isolated service class DefaultedExtraService {
+    *Service;
+
+    remote isolated function onDeliverSm(Sms sms, string extra = "x") returns error? {
+    }
+}
+
 // Two parameters of one type: unbindable, must be rejected at attach.
 isolated service class TwoSmsService {
     *Service;
@@ -129,6 +167,7 @@ function startCapturingListener(int port, Service svc)
         returns [int, int, Listener]|error {
     clearCapturedCaller();
     int mockId = check mockSmscOpen(port);
+    submitTestMockId = mockId;
     Listener smsListener = check new ({
         host: "localhost",
         port: port,
@@ -137,6 +176,7 @@ function startCapturingListener(int port, Service svc)
         bindType: TRANSCEIVER,
         rebindPolicy: {initialRebindDelay: 0.2, maxRebindDelay: 1, backOffMultiplier: 2.0}
     });
+    submitTestListener = smsListener;
     check smsListener.attach(svc);
     check smsListener.'start();
     int conn = check mockSmscAwaitNextBind(mockId, 5000);
@@ -147,7 +187,7 @@ function startCapturingListener(int port, Service svc)
     return [mockId, conn, smsListener];
 }
 
-@test:Config {groups: ["submit"]}
+@test:Config {after: cleanupSubmitTest, groups: ["submit"]}
 function testSubmitHappyPathPinsWirePdu() returns error? {
     var [mockId, conn, smsListener] = check startCapturingListener(
             SUBMIT_TEST_PORT, new CallerCapturingService());
@@ -175,6 +215,23 @@ function testSubmitHappyPathPinsWirePdu() returns error? {
     test:assertEquals(r1.messageId, "1000",
             "returned id must equal the mock's generated id, not merely be non-empty");
 
+    // Wire-byte + accessor assertions (review H2/M6/D5): a non-ASCII Latin-1 fixture,
+    // the EXACT octets at the mock (an encoder that substituted '?' would pass any
+    // decoded-string comparison), and the id correlated via the mock's own record.
+    SubmitResult rLatin = check caller->submit({
+        destAddr: "264811234567",
+        shortMessage: "Café mañana"
+    });
+    int submitLatin = check mockSmscAwaitNextSubmit(mockId, conn, 5000);
+    byte[] expectedLatin1 = [0x43, 0x61, 0x66, 0xE9, 0x20, 0x6D, 0x61, 0xF1, 0x61, 0x6E, 0x61];
+    test:assertEquals(mockSmscSubmitShortMessageBytes(submitLatin), expectedLatin1,
+            "exact Latin-1 octets on the wire - 0xE9/0xF1, never '?' substitution");
+    test:assertEquals(rLatin.messageId, mockSmscSubmitMessageId(submitLatin),
+            "the returned id must be the id the mock minted for THIS capture");
+    test:assertEquals(mockSmscSubmitSourceAddrTon(submitLatin), 0,
+            "empty source must ship TON Unknown (4.4.1) - asserted at the wire");
+    test:assertEquals(mockSmscSubmitSourceAddrNpi(submitLatin), 0);
+
     // Per-message override: explicit Address source, UCS2, receipt requested.
     SubmitResult r2 = check caller->submit({
         destAddr: {value: "INFO", ton: TON_ALPHANUMERIC, npi: NPI_UNKNOWN},
@@ -194,14 +251,14 @@ function testSubmitHappyPathPinsWirePdu() returns error? {
     test:assertEquals(mockSmscSubmitRegisteredDelivery(submit2), 0x01);
     test:assertEquals(mockSmscSubmitShortMessage(submit2), "reply two");
     test:assertEquals(mockSmscSubmitServiceType(submit2), "CMT");
-    test:assertEquals(r2.messageId, "1001");
-    test:assertEquals(check mockSmscPendingSubmitCount(mockId, conn), 0, "and no more submits");
+    test:assertEquals(r2.messageId, mockSmscSubmitMessageId(submit2));
+    test:assertEquals(mockSmscPendingSubmitCount(mockId, conn), 0, "and no more submits");
 
     check smsListener.gracefulStop();
     mockSmscClose(mockId);
 }
 
-@test:Config {groups: ["submit"]}
+@test:Config {after: cleanupSubmitTest, groups: ["submit"]}
 function testSubmitOnReceiverBindIsRejected() returns error? {
     clearCapturedCaller();
     int mockId = check mockSmscOpen(SUBMIT_RECEIVER_TEST_PORT);
@@ -235,7 +292,7 @@ function testSubmitOnReceiverBindIsRejected() returns error? {
     mockSmscClose(mockId);
 }
 
-@test:Config {groups: ["submit"]}
+@test:Config {after: cleanupSubmitTest, groups: ["submit"]}
 function testSubmitSurvivesRebindOnNewSession() returns error? {
     var [mockId, conn1, smsListener] = check startCapturingListener(
             SUBMIT_REBIND_TEST_PORT, new CallerCapturingService());
@@ -278,6 +335,8 @@ function testSubmitSurvivesRebindOnNewSession() returns error? {
         }
         SubmitResult confirmed = <SubmitResult>after;
         int postSubmit = check mockSmscAwaitNextSubmit(mockId, newConn, 5000);
+        test:assertTrue(mockSmscPendingSubmitCount(mockId, previousConn) <= 0,
+                "nothing may land on the severed connection (gate: submitCount(conn1) unchanged)");
         test:assertEquals(mockSmscSubmitShortMessage(postSubmit),
                 string `post-rebind ${cycle}`, "the post-rebind submit must land on the NEW connection");
         test:assertTrue(confirmed.messageId != before.messageId, "ids must differ");
@@ -289,7 +348,7 @@ function testSubmitSurvivesRebindOnNewSession() returns error? {
     mockSmscClose(mockId);
 }
 
-@test:Config {groups: ["submit"]}
+@test:Config {after: cleanupSubmitTest, groups: ["submit"]}
 function testSubmitDuringRebindFailsFastAndAfterStopIsRejected() returns error? {
     var [mockId, conn, smsListener] = check startCapturingListener(
             SUBMIT_ERRORS_TEST_PORT, new CallerCapturingService());
@@ -338,7 +397,7 @@ function testSubmitDuringRebindFailsFastAndAfterStopIsRejected() returns error? 
     mockSmscClose(mockId);
 }
 
-@test:Config {groups: ["submit"]}
+@test:Config {after: cleanupSubmitTest, groups: ["submit"]}
 function testCallerParamShapes() returns error? {
     // Positive shapes: each attaches AND dispatches. Caller-first pins the D1 decision
     // (order-agnostic type binding - the case mqtt would reject and ftp accepts).
@@ -347,8 +406,11 @@ function testCallerParamShapes() returns error? {
         new CallerCapturingService(),
         new CallerFirstService()
     ];
-    int port = SUBMIT_SHAPES_TEST_PORT;
+    int[] shapePorts = [SUBMIT_SHAPES_TEST_PORT, SUBMIT_SHAPES_PORT_2, SUBMIT_SHAPES_PORT_3];
+    int portIndex = 0;
     foreach Service svc in accepted {
+        int port = shapePorts[portIndex];
+        portIndex += 1;
         clearCapturedCaller();
         int mockId = check mockSmscOpen(port);
         Listener l = check new ({
@@ -367,16 +429,17 @@ function testCallerParamShapes() returns error? {
         }, 5), "dispatch must reach every accepted shape");
         check l.gracefulStop();
         mockSmscClose(mockId);
-        port += 20; // fresh port per sub-case; stays within an unclaimed range
+        submitTestListener = ();
+        submitTestMockId = -1;
     }
 
     // Mixed service: onDeliverSm 1-arity and onDataSm 2-arity coexist; the data_sm path
     // is a separate dispatch site and must position the Caller independently.
     clearCapturedCaller();
-    int mockId = check mockSmscOpen(port);
+    int mockId = check mockSmscOpen(SUBMIT_SHAPES_MIXED_PORT);
     Listener mixed = check new ({
         host: "localhost",
-        port: port,
+        port: SUBMIT_SHAPES_MIXED_PORT,
         systemId: "test",
         password: "test",
         bindType: TRANSCEIVER
@@ -401,7 +464,7 @@ function testCallerParamShapes() returns error? {
     // Negative shapes: rejected at attach, loudly, with the reason.
     Listener rejecting = check new ({
         host: "localhost",
-        port: port + 20,
+        port: SUBMIT_SHAPES_REJECT_PORT,
         systemId: "test",
         password: "test",
         bindType: TRANSCEIVER
@@ -415,9 +478,14 @@ function testCallerParamShapes() returns error? {
     test:assertTrue((<error>rest).message().includes("rest"), (<error>rest).message());
     error? twoSms = rejecting.attach(new TwoSmsService());
     test:assertTrue(twoSms is error, "two same-type parameters must be rejected at attach");
+    // The 1.0.1 compatibility shape (D5's required case): a trailing defaulted extra
+    // parameter is a legal, WORKING 1.0.1 program and must keep attaching - this is the
+    // test whose absence let the compat break ship the first time (review major #1).
+    error? compat = rejecting.attach(new DefaultedExtraService());
+    test:assertTrue(compat is (), compat is error ? compat.message() : "");
 }
 
-@test:Config {groups: ["submit"]}
+@test:Config {after: cleanupSubmitTest, groups: ["submit"]}
 function testSubmitWaitsBeyondHousekeepingTimer() returns error? {
     // The split-timer behavioral pin: the mock delays its submit_sm_resp by 3s - longer
     // than ConnectorSession's 2s housekeeping bound, well under transactionTimeout (30s).
@@ -425,10 +493,14 @@ function testSubmitWaitsBeyondHousekeepingTimer() returns error? {
     // ResponseTimeout at 2s; success proves submits ride the configured long bound while
     // teardown/keepalive stay short (JUnit pins the routing itself).
     var [mockId, conn, smsListener] = check startCapturingListener(
-            27810, new CallerCapturingService());
+            SUBMIT_TIMER_TEST_PORT, new CallerCapturingService());
     Caller caller = <Caller>capturedCaller();
     mockSmscSetSubmitDelay(mockId, 3000);
+    decimal t0 = time:monotonicNow();
     SubmitResult r = check caller->submit({destAddr: "264811234567", shortMessage: "patient"});
+    decimal elapsed = time:monotonicNow() - t0;
+    test:assertTrue(elapsed >= 2.9d,
+            string `the mock's delay knob must actually delay (took ${elapsed}s) - without this the test passes vacuously if the knob regresses (review M3)`);
     test:assertTrue(r.messageId.length() > 0);
     mockSmscSetSubmitDelay(mockId, 0);
     _ = check mockSmscAwaitNextSubmit(mockId, conn, 5000);
@@ -436,10 +508,10 @@ function testSubmitWaitsBeyondHousekeepingTimer() returns error? {
     mockSmscClose(mockId);
 }
 
-@test:Config {groups: ["submit"]}
+@test:Config {after: cleanupSubmitTest, groups: ["submit"]}
 function testSubmitErrorMappingPerCommandStatus() returns error? {
     var [mockId, conn, smsListener] = check startCapturingListener(
-            SUBMIT_ERRORS_TEST_PORT + 20, new CallerCapturingService());
+            SUBMIT_ERRORS_MAPPING_PORT, new CallerCapturingService());
     Caller caller = <Caller>capturedCaller();
 
     // Each forced negative command_status must surface as REJECTED with the exact code.
@@ -467,7 +539,7 @@ function testSubmitErrorMappingPerCommandStatus() returns error? {
     SubmitResult|Error tooLong = caller->submit({destAddr: "264811234567", shortMessage: oversize});
     test:assertTrue(tooLong is Error);
     test:assertEquals((<Error>tooLong).detail().failureMode, INVALID_REQUEST);
-    test:assertEquals(check mockSmscPendingSubmitCount(mockId, conn), 0,
+    test:assertEquals(mockSmscPendingSubmitCount(mockId, conn), 0,
             "an oversize submit must be rejected BEFORE it reaches the wire");
 
     // Spec-legal empty message_id: succeeds with an empty id, visibly - not an error.

@@ -505,10 +505,10 @@ final class MockSmsc {
      */
     int pendingSubmitCount(long connectionId) {
         BlockingQueue<SubmitSm> queue = submitCaptures.get(connectionId);
-        if (queue == null) {
-            throw new IllegalArgumentException("no such connection handle: " + connectionId);
-        }
-        return queue.size();
+        // -1 (not 0) for an unknown/severed handle, so "and no more submits" can never
+        // pass vacuously against a dead connection - and no exception crosses the
+        // interop boundary (a Java throw panics the strand even under int|error).
+        return queue == null ? -1 : queue.size();
     }
 
     /**
