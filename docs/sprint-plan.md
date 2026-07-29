@@ -757,11 +757,25 @@ it; hunt with full-suite runs in the worktree harness.
 - After the failed soak, cleanup's `gracefulStop` burned its full 30s `gracefulStopTimeout` in
   `awaitDrain` before the unbind — something held `inFlight` nonzero after an aborted test.
   Observation only; worth a look if stop latency ever matters in test teardown.
-- Item 5's timer coupling is real in the *other* direction and now measured: `unbind()` on a dead
-  session waits the full `transactionTimeout` (2s → 30s), and silent-peer (blackhole) detection is
-  `enquireLinkInterval + transactionTimeout` (≈62s → ≈90s with defaults). Both are documented on
-  the field; whether 30s remains the right default is an open owner decision — the submit-side
-  rationale (a timed-out submit is "possibly delivered, retrying may duplicate") still stands.
+- Item 5's timer coupling is real in the *other* direction and was measured: `unbind()` on a dead
+  session waited the full `transactionTimeout` (2s → 30s), and silent-peer (blackhole) detection was
+  `enquireLinkInterval + transactionTimeout` (≈62s → ≈90s with defaults).
+  **RESOLVED (owner, 2026-07-29: "split timers if it leads to a better design/outcome, regardless
+  of implementation cost").** `ConnectorSession` (native) splits jsmpp's single timer by role,
+  exploiting the bytecode-verified getter-vs-field asymmetry: the field (which `unbind()` reads
+  directly) carries a short internal housekeeping bound (2s, jsmpp's own historical default for
+  exactly those paths), and the overridden getter routes by calling thread — jsmpp's
+  `EnquireLinkSender-*`/`PDUReaderWorker-*` housekeeping threads get the short bound, every
+  caller thread (Ballerina strands AND jsmpp's `pool-N-thread-M` PDU-processor threads, where
+  SYNC handlers submit) gets the configured `transactionTimeout`. Net: submits keep 30s;
+  worst-case `gracefulStop` ≈ `gracefulStopTimeout` + 2s (was + 30s); blackhole detection back
+  to ≈ `enquireLinkInterval` + 2s; a dead-link enquire probe burns 2s not 30s. No new public
+  surface (internal constant; additive to expose later per the Sprint 4 precedent). Pinned by
+  `ConnectorSessionTimerTest` (thread-name routing, incl. the pool-thread case whose
+  mis-bucketing would time SYNC-handler submits out at 2s) and behaviourally by
+  `testSubmitWaitsBeyondHousekeepingTimer` (a 3s-delayed `submit_sm_resp` must succeed).
+  **Version coupling stated in the class doc:** thread names + getter-vs-field are 3.0.2 facts;
+  a jsmpp upgrade re-runs the javap audit.
 - Sprint 2's "stable across repeated isolated runs" claim for this soak was sampling luck: at
   ~1-in-a-few-hundred-per-sever odds, 15-cycle runs pass the overwhelming majority of the time.
   The wedge predates Sprint 8.

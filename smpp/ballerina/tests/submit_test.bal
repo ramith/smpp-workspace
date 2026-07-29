@@ -195,7 +195,7 @@ function testSubmitHappyPathPinsWirePdu() returns error? {
     test:assertEquals(mockSmscSubmitShortMessage(submit2), "reply two");
     test:assertEquals(mockSmscSubmitServiceType(submit2), "CMT");
     test:assertEquals(r2.messageId, "1001");
-    test:assertEquals(mockSmscPendingSubmitCount(mockId, conn), 0, "and no more submits");
+    test:assertEquals(check mockSmscPendingSubmitCount(mockId, conn), 0, "and no more submits");
 
     check smsListener.gracefulStop();
     mockSmscClose(mockId);
@@ -408,6 +408,25 @@ function testCallerParamShapes() returns error? {
 }
 
 @test:Config {groups: ["submit"]}
+function testSubmitWaitsBeyondHousekeepingTimer() returns error? {
+    // The split-timer behavioral pin: the mock delays its submit_sm_resp by 3s - longer
+    // than ConnectorSession's 2s housekeeping bound, well under transactionTimeout (30s).
+    // If the thread-name routing ever mis-bucketed caller threads, this submit would
+    // ResponseTimeout at 2s; success proves submits ride the configured long bound while
+    // teardown/keepalive stay short (JUnit pins the routing itself).
+    var [mockId, conn, smsListener] = check startCapturingListener(
+            27810, new CallerCapturingService());
+    Caller caller = <Caller>capturedCaller();
+    mockSmscSetSubmitDelay(mockId, 3000);
+    SubmitResult r = check caller->submit({destAddr: "264811234567", shortMessage: "patient"});
+    test:assertTrue(r.messageId.length() > 0);
+    mockSmscSetSubmitDelay(mockId, 0);
+    _ = check mockSmscAwaitNextSubmit(mockId, conn, 5000);
+    check smsListener.gracefulStop();
+    mockSmscClose(mockId);
+}
+
+@test:Config {groups: ["submit"]}
 function testSubmitErrorMappingPerCommandStatus() returns error? {
     var [mockId, conn, smsListener] = check startCapturingListener(
             SUBMIT_ERRORS_TEST_PORT + 20, new CallerCapturingService());
@@ -438,7 +457,7 @@ function testSubmitErrorMappingPerCommandStatus() returns error? {
     SubmitResult|Error tooLong = caller->submit({destAddr: "264811234567", shortMessage: oversize});
     test:assertTrue(tooLong is Error);
     test:assertEquals((<Error>tooLong).detail().failureMode, INVALID_REQUEST);
-    test:assertEquals(mockSmscPendingSubmitCount(mockId, conn), 0,
+    test:assertEquals(check mockSmscPendingSubmitCount(mockId, conn), 0,
             "an oversize submit must be rejected BEFORE it reaches the wire");
 
     // Spec-legal empty message_id: succeeds with an empty id, visibly - not an error.

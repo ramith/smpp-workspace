@@ -185,7 +185,8 @@ public final class NativeListener {
         // before arming (i.e. during connectAndBind's connect phase) report nothing, and
         // connect/bind-phase failures are surfaced by connectAndBind itself.
         AtomicReference<Runnable> onTransportDeath = new AtomicReference<>();
-        SMPPSession session = newSession(listener, bindTimeoutMillis, onTransportDeath);
+        SMPPSession session = newSession(listener, bindTimeoutMillis, onTransportDeath,
+                (long) (decimalValue(config, "transactionTimeout") * 1000));
         session.setMessageReceiverListener(dispatcher);
 
         String host = str(config, "host");
@@ -222,15 +223,10 @@ public final class NativeListener {
         // millis). enquireLinkInterval is validated >= 5s, so it never disables detection.
         session.setEnquireLinkTimer((int) (decimalValue(config, "enquireLinkInterval") * 1000));
 
-        // How long we wait for a response to anything WE send. jsmpp keeps a single
-        // per-session transactionTimer for all of it, so this one value bounds
-        // submit_sm_resp, unbind_resp (both stop paths) and enquire_link_resp (dead-link
-        // detection) alike - see the ConnectionConfig.transactionTimeout docs for why that
-        // coupling is unavoidable and why the field is not called submitTimeout. Set here,
-        // beside the keepalive timer, so it is re-applied to the fresh session on every
-        // rebind and not only on the initial start(). Without it the connector inherited
-        // jsmpp's 2s AbstractSession default, too short for a submit_sm under load.
-        session.setTransactionTimer((long) (decimalValue(config, "transactionTimeout") * 1000));
+        // transactionTimeout is applied at session construction (ConnectorSession), split
+        // by role: submits get the configured value, jsmpp housekeeping stays at the short
+        // internal bound. Deliberately NOT set via setTransactionTimer here - that would
+        // overwrite the field carrying the housekeeping bound (unbind() reads the field).
 
         // Per-attempt flags. `installed` gates the listener lambda: a CLOSED fired by a
         // rejected/failed bind (jsmpp self-closes inside connectAndBind) is start()'s
@@ -565,16 +561,20 @@ public final class NativeListener {
      */
     @SuppressWarnings("unchecked")
     private static SMPPSession newSession(BObject listener, int connectTimeoutMillis,
-            AtomicReference<Runnable> onTransportDeath) throws Exception {
+            AtomicReference<Runnable> onTransportDeath, long submitTransactionTimerMs) throws Exception {
         Object tls = listener.getNativeData(NATIVE_TLS);
         org.jsmpp.session.connection.ConnectionFactory delegate = tls == null
                 ? new SmppPlainConnectionFactory(connectTimeoutMillis)
                 : buildSslFactory((BMap<BString, Object>) tls, connectTimeoutMillis);
         // Every connection this session ever opens is observed - the connector's own
         // transport-death signal, independent of jsmpp's CLOSED listener. See
-        // ObservedConnection for the reader-death wedge this guards against.
-        return new SMPPSession((host, port) ->
-                new ObservedConnection(delegate.createConnection(host, port), onTransportDeath));
+        // ObservedConnection for the reader-death wedge this guards against. The session
+        // itself is a ConnectorSession: submits wait the configured transactionTimeout,
+        // jsmpp's housekeeping (unbind, enquire-link probes, reader exit) is bounded at
+        // ConnectorSession.HOUSEKEEPING_TIMER_MS - see that class for the split.
+        return new ConnectorSession((host, port) ->
+                new ObservedConnection(delegate.createConnection(host, port), onTransportDeath),
+                submitTransactionTimerMs);
     }
 
     /** Field names here mirror listener.bal's internal ResolvedTls record exactly. */

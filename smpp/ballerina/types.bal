@@ -131,22 +131,24 @@ public type ConnectionConfig record {|
     # SMSC that accepts the TCP connection but never answers the bind) blocks the next
     # attempt. This field is in SECONDS. Must be 1-300 (validated at `Listener` init).
     decimal bindTimeout = 60;
-    # How long the connector waits for the SMSC's response to a request it sent, in
-    # seconds. Deliberately **not** named `submitTimeout`: jsmpp exposes this as a single
-    # per-session `transactionTimer`, so one value bounds three different things —
+    # How long a `Caller.submit` waits for the SMSC's `submit_sm_resp`, in seconds.
     #
-    # 1. the `submit_sm_resp` wait,
-    # 2. the `unbind_resp` wait during `gracefulStop`/`immediateStop`, and
-    # 3. the `enquire_link_resp` wait, which is how a silently dead link is detected.
-    #
-    # Raising it therefore buys a submit more room *and* slows dead-link detection by the
-    # same amount; the two cannot be tuned apart without jsmpp exposing separate knobs.
+    # This bounds ONLY the requests this connector issues on your behalf (the
+    # submit-family operations). The session's internal housekeeping — the `unbind_resp`
+    # wait during `gracefulStop`/`immediateStop`, the `enquire_link_resp` wait that
+    # detects a silently dead link, and the reader thread's exit drain — is bounded
+    # separately at a short internal timer (~2s, jsmpp's own historical default for
+    # exactly those paths), so raising this value does NOT slow stops or dead-link
+    # detection. (jsmpp itself has one shared timer; the connector splits it — see
+    # `ConnectorSession` in the native layer.) Worst-case `gracefulStop` latency is
+    # therefore ≈ `gracefulStopTimeout` + 2s, and silent-peer detection stays ≈
+    # `enquireLinkInterval` + 2s, regardless of this setting.
     #
     # The default is 30s rather than jsmpp's own 2s. Two seconds is too short for a
     # `submit_sm` under load, and a timed-out submit is the worst outcome the send path
     # has: SMPP gives no way to tell "the SMSC never got it" from "the SMSC got it and the
     # response was slow", so retrying may duplicate a message the subscriber already
-    # received. Prefer waiting to guessing.
+    # received (`FailureMode.TIMEOUT_DELIVERY_UNKNOWN`). Prefer waiting to guessing.
     #
     # This field is in SECONDS (jsmpp's underlying knob is milliseconds). Must be 1-300
     # (validated at `Listener` init).
