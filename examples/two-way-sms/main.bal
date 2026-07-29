@@ -2,7 +2,7 @@
 // votes, competitions ("text WIN to 12345"), HELP, and — most importantly — STOP
 // opt-outs, which are legally mandated (TCPA in the US, GDPR/PECR in the EU).
 //
-// This connector is receive-only, so it can't send the reply itself. The realistic
+// This example pins smpp:1.0.0 (receive-only); 1.1.0 adds Caller.submit. The realistic
 // pattern is: classify the inbound message here, then hand the action to whatever
 // sends (an HTTP call to your messaging API, a transmitter session, a queue). This
 // example logs the routing decision that outbound path would act on.

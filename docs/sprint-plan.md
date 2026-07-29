@@ -780,6 +780,30 @@ it; hunt with full-suite runs in the worktree harness.
   ~1-in-a-few-hundred-per-sever odds, 15-cycle runs pass the overwhelming majority of the time.
   The wedge predates Sprint 8.
 
+### Deviation ledger — final (2026-07-29, post-review remediation)
+
+Every gate/D-record commitment, dispositioned. BUILT = in the tree, green. RECORDED =
+deliberately not built, reason here.
+
+| Commitment | Disposition |
+|---|---|
+| Gate tests 1-15 (happy path, receiver-reject, rebind-survival x2 cycles, fail-fast, after-stop, onError-no-derail, shapes incl. caller-first + defaulted-extra + 3 traps, error mapping, concurrent-correlation+keepalive, throttle-starvation, item-12 pair, DLR/TLV pair, oversize+unencodable, config validation) | **BUILT** — 55 bal + 69 JUnit |
+| `testSubmitBeforeStartIsRejected` | **RECORDED** — untestable by construction (D1 blockquote); pre-check kept as defense in depth |
+| `testSubmitErrorMappingPerCommandStatus` "every status" | **RECORDED** — two statuses at the wire; the mapping is per exception class and exhaustively JUnit-covered; more wire statuses add no discrimination |
+| `testRejectedSubmitsDoNotLeakPendingResponses` | **RECORDED (deferred)** — needs a test-only accessor on the CONNECTOR session (`getUnacknowledgedRequests`), i.e. new production surface; the known orphan paths (oversize, validity_period) are locally unreachable since the remediation; the residual (D3's DefaultPDUSender NPE) is theoretical. Revisit if a leak is ever observed |
+| Mutation-verified keepalive reserve | **SPLIT per QA audit** — invariant JUnit-pinned (`PduProcessorDegreeTest`, degree > max for 1..1024); end-to-end mutation documented as a manual procedure on `pduProcessorDegree()` (constant is compiler-inlined; automation impossible without new surface) |
+| D5 `timeout-minutes: 30` on CI | **BUILT** (all three workflows) |
+| D5 byte assertions / non-ASCII fixture / Ballerina-surface non-echo | **BUILT** (exact Latin-1 octets asserted at the mock) / non-echo at the Ballerina surface: **RECORDED** — pinned at JUnit (`unencodableCharacterRejectedNamingIndex` asserts no echo); the extern passes messages through verbatim (`localValidationIsInvalidRequestVerbatim`) |
+| D5 timer-reapplied-on-rebind | **BUILT** (`testSubmitTimerReappliedOnRebind`) |
+| D6 joint `transactionTimeout`/`enquireLinkInterval` validation | **RECORDED (moot)** — the ConnectorSession split decoupled them; dead-link detection no longer depends on `transactionTimeout` at all |
+| D6 inbound-freeze doc line | **BUILT** (architecture.md outbound paragraph + Caller.submit docs) |
+| D8 no-false-retry-promise wording | **BUILT** (LINK_DOWN remap; wording promises only "per rebindPolicy, if enabled") |
+| D8 gracefulStop-vs-draining-handlers | **BUILT** (owner decision: submits legal while STOPPING; drain covers submits; `sessionUsable` flips before unbind) |
+| D8 `immediateStop` terminates mid-submit | **RECORDED** — immediateStop skips the drain; a parked submit surfaces LINK_DOWN when the socket closes (mapped path, `ioExceptionIsLinkDown`); dedicated test deferred as low-yield |
+| D9 raw-jsmpp harness promotion | **RECORDED (withdrawn)** — 15 green submit tests prove the harness end to end |
+| Item 13 (`smpp:encodeGsm7Unpacked` helper) | **RECORDED (not built)** — additive utility; unblocked by nothing and blocking nothing; next sprint candidate |
+| Items 9, 11, 12 | **BUILT** (this and prior commits) |
+
 ### Exit gate
 
 All of the following pass under `./gradlew build` from `smpp/`, with zero new

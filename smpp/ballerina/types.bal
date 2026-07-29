@@ -2,8 +2,9 @@
 import ballerina/crypto;
 
 # The SMPP bind mode. Reflects the full set of modes defined by the SMPP spec;
-# `ConnectionConfig.bindType` narrows this to `ListenerBindType` since this connector
-# is a receive-only trigger (see `ListenerBindType`).
+# `ConnectionConfig.bindType` narrows this to `ListenerBindType` (see there for why
+# TRANSMITTER is excluded). Sending is done from the listener's session via
+# `Caller.submit`, so a standalone transmitter bind has no role here.
 public enum BindType {
     # Receiver bind — the session only receives inbound PDUs (MO messages, delivery receipts).
     RECEIVER,

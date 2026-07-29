@@ -7,7 +7,7 @@ rationale); this document is about how that behavior is verified and kept verifi
 
 ## 1. Scope and quality goals
 
-`ramith/smpp` is a receive-only SMPP trigger listener (bind as RECEIVER/TRANSCEIVER,
+`ramith/smpp` is an SMPP trigger listener with reply support (bind as RECEIVER/TRANSCEIVER,
 dispatch inbound `deliver_sm`/`data_sm` to a user service). "Done" for a public Ballerina
 Central release means, at minimum:
 
@@ -482,8 +482,12 @@ week with two engineers running Phase 0's two tracks and Phase 1 in parallel).**
   `gen-certs.sh`, contents keytool-verified). Still out of scope: exhaustive
   cipher/protocol negotiation matrices, real CA-signed / intermediate chains, and OCSP/CRL
   revocation — all JSSE behaviors rather than connector behaviors.
-- **Outbound `submit_sm`/transmitter-side flows.** This connector is receive-only by
-  design (`ListenerBindType RECEIVER|TRANSCEIVER`, no `submit_sm` API) — nothing here
+- **Outbound `submit_sm` flows — IN SCOPE since Sprint 8.** `Caller.submit` is covered
+  at three levels: pure JUnit (compose/encode/error mapping, pool sizing), wire-pinning
+  `bal test` (exact octets, TON/NPI, ids correlated via the mock's per-capture record),
+  and fault-path tests (rebind survival, fail-fast, throttle-starvation, the
+  duplicate-MT chain, concurrent correlation). Standalone transmitter binds remain out
+  of scope (`smpp:Client` is backlog) — nothing here
   tests sending.
 - **Real carrier-grade SMSC interoperability quirks** (vendor-specific TLV usage, real
   network latency/partition behavior). The in-process `MockSmsc` is a faithful jsmpp-level

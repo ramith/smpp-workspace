@@ -5,10 +5,21 @@ mobile-originated (MO) SMS and delivery receipts (DLRs) — by binding to an SMS
 as an SMPP client. It wraps [`org.jsmpp:jsmpp`](https://jsmpp.org/) via
 Ballerina's Java interoperability.
 
-This connector is receive-only. It does not submit outbound messages
-(`submit_sm`); its only job is to bind to an SMSC and dispatch inbound PDUs to
-your service. Everything below describes what actually happens, end to end,
-when you use it.
+This connector binds to an SMSC, dispatches inbound PDUs to your service, and —
+since Sprint 8 — submits outbound messages (`submit_sm`) via the `smpp:Caller`
+delivered to remote methods that declare it (`bindType: TRANSCEIVER` required).
+Everything below describes what actually happens, end to end, when you use it.
+
+**Outbound in one paragraph:** one `Caller` exists per listener, valid across
+rebinds (every submit resolves the current session). Submits wait up to
+`transactionTimeout` for the `submit_sm_resp`; jsmpp housekeeping is bounded
+separately (~2s). Failures map to `FailureMode` (see `types.bal`). In `SYNC`
+mode an inline reply holds a dispatch slot AND relies on the PDU-processor
+reserve thread: **`submit_sm_resp` PDUs ride the same jsmpp pool as inbound
+dispatches**, so the reserve beyond `maxConcurrentDispatch` is a liveness
+requirement for the submit path itself, not just an enquire_link nicety — a
+handler blocked in `submit` completes only because a spare pool thread can
+deliver its response. Prefer `responseMode: ASYNC` for reply-style services.
 
 ## Connection lifecycle
 
