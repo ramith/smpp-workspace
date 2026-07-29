@@ -1,0 +1,11 @@
+[package]
+org = "fixture"
+name = "missing_remote"
+version = "0.1.0"
+distribution = "2201.13.0"
+
+[[dependency]]
+org = "ramith"
+name = "smpp"
+version = "@smpp.version@"
+repository = "local"

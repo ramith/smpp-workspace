@@ -86,6 +86,22 @@ against a message nothing consumed. If you want to ignore a PDU type, implement 
 method and return successfully. A PDU arriving before any service is attached gets
 `ESME_RX_T_APPN` instead, so the SMSC redelivers it.
 
+**Compile-time validation.** The package ships a compiler plugin that checks your
+service shape as you type — the same contract the listener enforces at `attach`, plus
+the cases nothing at runtime can catch: a typo'd method name (`onDeliverSM`), a handler
+missing the `remote` qualifier, a `resource` method, or a return type other than
+`error?` — each of which would otherwise compile clean and silently never fire.
+Diagnostics carry `SMPP_1xx` codes; an empty service offers code actions that insert
+handler templates (with or without the reply `caller`). One warning worth heeding:
+`SMPP_112` flags a non-isolated handler, which forces every dispatch through the
+runtime's process-wide lock — legal, but it quietly turns `maxConcurrentDispatch` into
+a no-op.
+
+> **Breaking change (vs 1.0.x):** the listener now discovers handlers via remote-method
+> lookup, so a handler declared **without** `remote` — which 1.0.x dispatched — is
+> invisible: attach fails if it was the only handler, and the compiler plugin flags it
+> at the exact line (`SMPP_103`). Add the `remote` qualifier.
+
 **Response mode** (`responseMode`, default `SYNC`) controls *when* the connector answers
 the SMSC:
 

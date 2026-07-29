@@ -338,6 +338,27 @@ isolated service class TwoSmsService {
     }
 }
 
+// Sprint 9 N2: the onError twin of OptionalCallerService - used to attach silently.
+isolated service class OnErrorOptionalCallerService {
+    *Service;
+
+    remote isolated function onDeliverSm(Sms sms) returns error? {
+    }
+
+    remote isolated function onError(error err, Caller? c = ()) returns error? {
+    }
+}
+
+// Sprint 9 N1: the only handler lacks `remote` - worked on 1.0.1 (getMethods()),
+// invisible since Sprint 8 (getRemoteMethods()).
+isolated service class NonRemoteHandlerService {
+    *Service;
+
+    isolated function onDeliverSm(Sms sms) returns error? {
+        return;
+    }
+}
+
 # Binds a transceiver listener to a fresh mock, captures the Caller via one dispatch.
 #
 # + port - the mock's port
@@ -846,9 +867,28 @@ function testCallerParamShapes() returns error? {
     test:assertTrue((<error>rest).message().includes("rest"), (<error>rest).message());
     error? twoSms = rejecting.attach(new TwoSmsService());
     test:assertTrue(twoSms is error, "two same-type parameters must be rejected at attach");
+    // Sprint 9 N2: onError(error, smpp:Caller? = ()) used to attach SILENTLY (the
+    // onError branch checked exact-Caller only, and being defaulted the param also
+    // skipped the error-type check) - the same shape onDeliverSm rejects loudly. The
+    // asymmetry was the bug; both branches now reject anything involving Caller.
+    error? onErrorCaller = rejecting.attach(new OnErrorOptionalCallerService());
+    test:assertTrue(onErrorCaller is error,
+            "onError with a defaulted optional Caller must be rejected at attach (N2)");
+    test:assertTrue((<error>onErrorCaller).message().includes("Caller"),
+            (<error>onErrorCaller).message());
+    // Sprint 9 N1 pin: since Sprint 8 moved attach to getRemoteMethods(), a non-remote
+    // handler is INVISIBLE - a service whose only handler lacks `remote` must fail the
+    // attach (as no-remote-methods), never half-work. This is the runtime half of the
+    // shipped breaking change; the compiler plugin's SMPP_103 is the compile-time half
+    // (fixture missing_remote), and Package.md's versioning section records it.
+    error? nonRemote = rejecting.attach(new NonRemoteHandlerService());
+    test:assertTrue(nonRemote is error,
+            "a service whose only handler is non-remote must fail attach (N1)");
     // The 1.0.1 compatibility shape (D5's required case): a trailing defaulted extra
     // parameter is a legal, WORKING 1.0.1 program and must keep attaching - this is the
     // test whose absence let the compat break ship the first time (review major #1).
+    // LAST in this block, deliberately: it SUCCEEDS, so any reject attempted after it
+    // would hit ALREADY_ATTACHED instead of its own rule.
     error? compat = rejecting.attach(new DefaultedExtraService());
     test:assertTrue(compat is (), compat is error ? compat.message() : "");
 }

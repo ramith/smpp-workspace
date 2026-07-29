@@ -404,8 +404,16 @@ public class Dispatcher implements MessageReceiverListener {
             // session that is mid-teardown.
             int required = 0;
             for (Parameter p : params) {
-                if (isCallerType(p.type)) {
-                    return "onError must not declare an smpp:Caller parameter";
+                // involvesCallerType, not isCallerType (Sprint 9 Phase-1 finding N2):
+                // the exact-type check missed `smpp:Caller? c = ()`, which is a UNION
+                // and therefore not Caller — and being defaulted it also skipped the
+                // error-type check below, so it attached silently with c permanently
+                // (). That is D1's trap 1, alive in onError while the identical shape
+                // on onDeliverSm was rejected loudly. The asymmetry is the bug: both
+                // branches now reject anything that INVOLVES Caller.
+                if (involvesCallerType(p.type)) {
+                    return "onError must not declare an smpp:Caller parameter "
+                            + "(including an optional or union-typed one)";
                 }
                 if (!p.isDefault) {
                     required++;

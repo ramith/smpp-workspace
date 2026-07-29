@@ -1510,6 +1510,71 @@ infrastructure gets pulled forward per `development-process.md` Phase 4.
 
 **Est. 3–5 days (24–40h).**
 
+### Sprint 9 — executed 2026-07-29 (exit gate PASSED)
+
+**Phase-1 drift review produced a 5-point scope adjustment**, all executed:
+
+1. **Diagnostics: 12, not ~8** (`SMPP_101`–`SMPP_112`), split explicitly into
+   *load-bearing* — cases where nothing fails at runtime: typo'd handler name
+   (`SMPP_102`), missing `remote` (`SMPP_103`, see N1 below), resource method
+   (`SMPP_104`), non-`error?` return (`SMPP_105`, never inspected at runtime), and the
+   non-isolated warning (`SMPP_112`) — and *convenience mirrors* of the attach-time
+   `BAD_SIGNATURE` rules (`SMPP_106`–`SMPP_111`), which only move an already-loud error
+   from startup to the editor. The load-bearing set is the sprint's justification; the
+   codes are prefixed into the message text because `bal build` renders only messages.
+2. **Code actions: five templates, not two** (`onDeliverSm`/`onDataSm` × ±caller, plus
+   `onError`) — mqtt has one dispatchable handler, smpp has three. All anchor on
+   `SMPP_101`, the diagnostic an empty service lands on.
+3. **Type matching mirrors `Dispatcher.isModuleType` symbol-for-symbol** — through
+   type-reference chains AND intersection constituents. ftp's string-signature
+   comparison was explicitly not ported: it would reject `readonly & smpp:Sms` and
+   re-break H5 at compile time for every IDE user. Likewise the validator skips (never
+   rejects) trailing defaulted params — a mqtt-style "too many parameters" rule would
+   break D5 compat, pinned at the `valid_shapes_class` fixture and
+   `testCallerParamShapes`.
+4. **Both syntactic forms analyzed** — `SERVICE_DECLARATION` (every shipped example)
+   and `CLASS_DEFINITION` with `*smpp:Service` (the reusable-handler idiom this repo's
+   own test suite uses). ftp and mqtt register only the former.
+5. **Two release-gate items the review surfaced, both landed:**
+   - **N1 — a shipped, undocumented breaking change.** Sprint 8 moved attach from
+     `getMethods()` to `getRemoteMethods()`, so a non-`remote` handler that WORKED on
+     the published 1.0.1 is silently invisible from 1.1.0. Nothing recorded it and no
+     test pinned it. Now: a `Package.md` breaking-change callout, a runtime attach pin
+     (`NonRemoteHandlerService`), and the compile-time half is `SMPP_103` — reported as
+     an ERROR, not the warning the plan's pre-Sprint-8 reasoning suggested, because the
+     runtime break already shipped and a loud diagnostic at the exact line (one-word
+     fix) beats a silent runtime regression.
+   - **N2 — a live validation hole.** `onError(error e, smpp:Caller? c = ())` attached
+     silently (the onError branch checked exact-Caller only; being defaulted, the param
+     also skipped the error-type check), while the identical shape on `onDeliverSm` was
+     rejected loudly. Fixed in `Dispatcher.validateAndPlan` (involves-Caller check,
+     symmetric with the handler branch), pinned at attach
+     (`OnErrorOptionalCallerService`) and mirrored in the plugin (`SMPP_111`).
+
+**Testing (Phase 4):** qa-strategy had no diagnostic-assertion level, and mqtt's
+in-process harness needs an extracted test distribution this repo has no machinery
+for. Instead: ten fixture projects compiled end-to-end by the SAME dockerised
+2201.13.0 `bal` the whole repo builds with, against the locally-pushed bala — i.e.
+exactly what a Central consumer executes, bundled plugin and all. Each fixture pins
+its expected `SMPP_1xx` codes (and that NO unexpected ones appear; valid fixtures pin
+zero); the warning-only fixture additionally pins that the build still succeeds. Wired
+into `check`, so `./gradlew build` gates on it. One fixture correction worth recording:
+an empty non-`isolated` handler is *inferred* isolated by the compiler, the runtime
+sees the same inference, and `SMPP_112` rightly stays quiet — the fixture had to
+genuinely defeat inference (unlocked module-level mutable state) to earn its warning.
+
+**Build wiring:** third gradle subproject (`compiler-plugin`), `CompilerPlugin.toml`
+stamped from `build-config/resources/` by `updateTomlFiles` (and committed by
+`commitTomlFiles`) so it cannot drift from `Ballerina.toml` at release. The compiler
+API jars live only in ballerina-platform's GitHub Packages; without a `packagePAT` the
+subproject falls back to compiling against the local `bal home` distribution's jars
+(compileOnly — at plugin runtime the consumer's distribution provides them), with the
+docker fixture tests still exercising the exact pinned 2201.13.0 distribution, so a
+local patch-version skew cannot silently ship an API drift.
+
+**Exit gate: PASSED** — `./gradlew build` green: 79 JUnit + 63 bal + 10 plugin
+fixtures, 0 failures, 0 skipped.
+
 ---
 
 ## Sprint 10 — session-lifecycle extraction, then `smpp:Client`

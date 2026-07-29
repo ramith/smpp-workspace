@@ -32,10 +32,12 @@ allprojects {
 
 task build {
     dependsOn(":smpp-native:build")
+    dependsOn(":smpp-compiler-plugin:build")
     dependsOn(":smpp-ballerina:build")
 }
 
 task clean {
     dependsOn(":smpp-native:clean")
+    dependsOn(":smpp-compiler-plugin:clean")
     dependsOn(":smpp-ballerina:clean")
 }

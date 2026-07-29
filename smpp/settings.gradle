@@ -21,7 +21,9 @@ def projectName = 'smpp'
 rootProject.name = "module-ballerinax-${projectName}"
 
 include ":${projectName}-native"
+include ":${projectName}-compiler-plugin"
 include ":${projectName}-ballerina"
 
 project(":${projectName}-native").projectDir = file('native')
+project(":${projectName}-compiler-plugin").projectDir = file('compiler-plugin')
 project(":${projectName}-ballerina").projectDir = file('ballerina')

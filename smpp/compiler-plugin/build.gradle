@@ -1,0 +1,75 @@
+// Copyright (c) 2026. The smpp compiler plugin: compile-time service-shape validation.
+//
+// Ships INSIDE the bala (see ballerina/CompilerPlugin.toml) and runs when a CONSUMER
+// compiles a project that imports ramith/smpp — never while building this package
+// itself. Modelled on ballerina-platform/module-ballerina-mqtt's compiler-plugin
+// subproject, adjusted to this repo (no checkstyle/spotbugs subprojects here).
+plugins {
+    id 'java'
+}
+
+description = 'Ballerina - SMPP Compiler Plugin'
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
+// The compiler API jars are published ONLY to ballerina-platform's GitHub Packages,
+// which needs a read:packages PAT (packageUser/packagePAT — same requirement as the
+// io.ballerina.plugin gradle plugin itself; see settings.gradle). For a local checkout
+// WITHOUT credentials, fall back to the installed Ballerina distribution's own jars
+// (`bal home`/bre/lib): compileOnly-safe, because at plugin RUNTIME these classes are
+// provided by the consumer's distribution anyway — the jar embedded in the bala must
+// not drag its own copy of the compiler along. The docker fixture tests (fixtureTest)
+// still compile every fixture with the EXACT pinned 2201.13.0 distribution, so a local
+// patch-version skew in this compile classpath cannot silently ship an API drift.
+def balHomeLibs = {
+    try {
+        def proc = ['bal', 'home'].execute()
+        proc.waitFor()
+        if (proc.exitValue() == 0) {
+            def libDir = new File(proc.text.trim(), 'bre/lib')
+            if (libDir.isDirectory()) {
+                return libDir
+            }
+        }
+    } catch (Exception ignored) {
+        // no local bal install; fall through to the GH Packages coordinates
+    }
+    return null
+}
+
+dependencies {
+    def libDir = System.getenv('packagePAT') != null ? null : balHomeLibs()
+    if (libDir != null) {
+        logger.lifecycle("smpp-compiler-plugin: no packagePAT set; compiling against the " +
+                "local Ballerina distribution at ${libDir}")
+        compileOnly fileTree(dir: libDir,
+                includes: ['ballerina-lang-*.jar', 'ballerina-tools-api-*.jar', 'ballerina-parser-*.jar'])
+    } else {
+        compileOnly group: 'org.ballerinalang', name: 'ballerina-lang', version: "${ballerinaLangVersion}"
+        compileOnly group: 'org.ballerinalang', name: 'ballerina-tools-api', version: "${ballerinaLangVersion}"
+        compileOnly group: 'org.ballerinalang', name: 'ballerina-parser', version: "${ballerinaLangVersion}"
+    }
+}
+
+jar {
+    archiveBaseName = 'smpp-compiler-plugin'
+}
+
+// End-to-end diagnostic tests: fixture projects compiled by the SAME dockerised bal
+// distribution the rest of this repo builds with, against the locally-pushed bala -
+// i.e. exactly what a Central consumer executes, bundled plugin and all. See
+// tests/run-fixture-tests.sh for the assertion mechanics (expected diagnostics per
+// fixture). Runs as part of `check`, so `./gradlew build` gates on it (the same
+// standard the bal test gate holds the rest of the repo to).
+tasks.register('fixtureTest', Exec) {
+    dependsOn jar
+    dependsOn ':smpp-native:build'
+    dependsOn ':smpp-ballerina:copyToLib'
+    workingDir projectDir
+    commandLine 'bash', 'tests/run-fixture-tests.sh'
+}
+check.dependsOn 'fixtureTest'

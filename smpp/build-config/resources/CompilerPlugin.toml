@@ -1,0 +1,6 @@
+[plugin]
+id = "smpp-compiler-plugin"
+class = "io.ballerinax.smpp.compiler.SmppCompilerPlugin"
+
+[[dependency]]
+path = "../compiler-plugin/build/libs/smpp-compiler-plugin-@project.version@.jar"

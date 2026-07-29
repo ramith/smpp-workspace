@@ -14,6 +14,8 @@ def packageOrg = "ramith"
 def tomlVersion = stripBallerinaExtensionVersion("${project.version}")
 def ballerinaTomlFilePlaceHolder = new File("${project.rootDir}/build-config/resources/Ballerina.toml")
 def ballerinaTomlFile = new File("$project.projectDir/Ballerina.toml")
+def compilerPluginTomlFilePlaceHolder = new File("${project.rootDir}/build-config/resources/CompilerPlugin.toml")
+def compilerPluginTomlFile = new File("$project.projectDir/CompilerPlugin.toml")
 
 def stripBallerinaExtensionVersion(String extVersion) {
     if (extVersion.matches(project.ext.timestampedVersionRegex)) {
@@ -60,6 +62,10 @@ tasks.register('updateTomlFiles') {
         newBallerinaToml = newBallerinaToml.replace("@toml.version@", tomlVersion)
         newBallerinaToml = newBallerinaToml.replace("@jsmpp.version@", jsmppVersion)
         ballerinaTomlFile.text = newBallerinaToml
+        // CompilerPlugin.toml carries the plugin jar's versioned path; stamped from the
+        // same template mechanism so the two tomls can never drift apart at release.
+        def newCompilerPluginToml = compilerPluginTomlFilePlaceHolder.text.replace("@project.version@", project.version)
+        compilerPluginTomlFile.text = newCompilerPluginToml
     }
 }
 
@@ -70,9 +76,9 @@ tasks.register('commitTomlFiles') {
         project.exec {
             ignoreExitValue true
             if (Os.isFamily(Os.FAMILY_WINDOWS)) {
-                commandLine 'cmd', '/c', "git commit -m \"[Automated] Update the toml files\" Ballerina.toml Dependencies.toml"
+                commandLine 'cmd', '/c', "git commit -m \"[Automated] Update the toml files\" Ballerina.toml Dependencies.toml CompilerPlugin.toml"
             } else {
-                commandLine 'sh', '-c', "git commit -m '[Automated] Update the toml files' Ballerina.toml Dependencies.toml"
+                commandLine 'sh', '-c', "git commit -m '[Automated] Update the toml files' Ballerina.toml Dependencies.toml CompilerPlugin.toml"
             }
         }
     }
@@ -83,9 +89,13 @@ tasks.register('commitTomlFiles') {
 build.dependsOn copyToLib
 build.dependsOn ":${packageName}-native:build"
 build.dependsOn ":${packageName}-native:testBridgeJar"
+// bal reads CompilerPlugin.toml whenever it loads this package, and the referenced jar
+// must exist at that path (../compiler-plugin/build/libs, inside the docker mount).
+build.dependsOn ":${packageName}-compiler-plugin:jar"
 
 test.dependsOn ":${packageName}-native:build"
 test.dependsOn ":${packageName}-native:testBridgeJar"
+test.dependsOn ":${packageName}-compiler-plugin:jar"
 // Without this, `./gradlew :smpp-ballerina:test` on a fresh checkout fails with
 // "could not locate dependency path './lib/jsmpp-...jar'" — only `build` pulled it in,
 // and the main tree masked that by having the jar left over from earlier builds.
