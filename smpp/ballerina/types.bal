@@ -403,6 +403,12 @@ public type Sms record {|
     byte[] shortMessageBytes = [];
     # `true` when this PDU is an SMSC delivery receipt (DLR) rather than a mobile-originated message.
     boolean deliveryReceipt = false;
+    # The `receipted_message_id` TLV (0x001E) when the SMSC attached one — the spec's only
+    # GUARANTEED correlation key (§5.3.2.12) between a delivery receipt and the
+    # `SubmitResult.messageId` your submit returned. The Appendix-B body's `id:` field
+    # (`receipt.id`) is vendor specific and can differ in radix; prefer this when present.
+    # `()` when the receipt carries no TLV (many SMSCs only populate the body).
+    string? receiptedMessageId = ();
     # Protocol metadata not promoted to a typed field above: `dataCoding` (`int`, raw
     # `data_coding` value), `sourceAddrTon`/`sourceAddrNpi`/`destAddrTon`/`destAddrNpi`
     # (`int`, address type-of-number/numbering-plan-indicator), `esmClass` (`int`, the raw
@@ -449,8 +455,10 @@ public enum DeliveryReceiptStatus {
 # "field absent" is a routine, meaningful outcome. The full raw receipt is always available on
 # `Sms.shortMessage`.
 public type DeliveryReceipt record {|
-    # The SMSC's message id for the original submission (Appendix-B `id:`) — the key you
-    # correlate against the `message_id` returned in your `submit_sm_resp`.
+    # The SMSC's message id for the original submission (Appendix-B `id:`). Appendix B is
+    # "SMSC vendor specific": some SMSCs emit this in a different radix (hex vs decimal)
+    # than the `message_id` they returned in the `submit_sm_resp`, so it is NOT a
+    # guaranteed correlation key — `Sms.receiptedMessageId` (the §5.3.2.12 TLV) is.
     string id?;
     # The `sub:` count — messages originally submitted (usually 1). Advisory: many SMSCs
     # omit or zero-fill it.

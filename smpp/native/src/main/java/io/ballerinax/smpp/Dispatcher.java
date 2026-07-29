@@ -470,6 +470,14 @@ public class Dispatcher implements MessageReceiverListener {
         // a buffer with jsmpp internals, even though no post-dispatch mutator exists today.
         sms.put(StringUtils.fromString("shortMessageBytes"), ValueCreator.createArrayValue(body.clone()));
         sms.put(StringUtils.fromString("deliveryReceipt"), deliveryReceipt);
+        // Item 9: the receipted_message_id TLV (0x001E) - the spec's only guaranteed
+        // DLR correlation key (5.3.2.12); the Appendix-B body id: is vendor specific.
+        OptionalParameter.Receipted_message_id receiptedId =
+                pdu.getOptionalParameter(OptionalParameter.Receipted_message_id.class);
+        if (receiptedId != null && receiptedId.getValueAsString() != null) {
+            sms.put(StringUtils.fromString("receiptedMessageId"),
+                    StringUtils.fromString(receiptedId.getValueAsString()));
+        }
         sms.put(StringUtils.fromString("properties"), toProperties(pdu));
         // A delivery receipt's structured fields, when this is one. Only deliver_sm carries the
         // Appendix-B receipt body (data_sm has no short_message), and jsmpp's parser is

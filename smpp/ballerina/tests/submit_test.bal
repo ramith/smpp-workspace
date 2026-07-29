@@ -16,6 +16,7 @@ const int SUBMIT_SHAPES_PORT_3 = 27812;
 const int SUBMIT_SHAPES_MIXED_PORT = 27813;
 const int SUBMIT_SHAPES_REJECT_PORT = 27814;
 const int SUBMIT_ERRORS_MAPPING_PORT = 27815;
+const int SUBMIT_DLR_TEST_PORT = 27816;
 
 // Cleanup state for the after: hooks (the house pattern - see data_sm_test.bal for why
 // @test:AfterEach is unusable). A listener leaked by a failed assertion would otherwise
@@ -66,13 +67,38 @@ isolated function dispatchCount() returns int {
     }
 }
 
-// Caller LAST - the common shape.
+isolated string? lastReceiptTlv = ();
+isolated string? lastReceiptBodyId = ();
+
+isolated function recordedReceiptTlv() returns string? {
+    lock {
+        return lastReceiptTlv;
+    }
+}
+
+isolated function recordedReceiptBodyId() returns string? {
+    lock {
+        return lastReceiptBodyId;
+    }
+}
+
+// Caller LAST - the common shape. Also records delivery receipts for the DLR tests.
 isolated service class CallerCapturingService {
     *Service;
 
     remote isolated function onDeliverSm(Sms sms, Caller caller) returns error? {
         lock {
             submitTestCaller = caller;
+        }
+        if sms.deliveryReceipt {
+            string? tlv = sms.receiptedMessageId;
+            lock {
+                lastReceiptTlv = tlv;
+            }
+            string? bodyId = sms.receipt?.id;
+            lock {
+                lastReceiptBodyId = bodyId;
+            }
         }
         lock {
             submitTestDispatches += 1;
@@ -506,6 +532,47 @@ function testSubmitWaitsBeyondHousekeepingTimer() returns error? {
     _ = check mockSmscAwaitNextSubmit(mockId, conn, 5000);
     check smsListener.gracefulStop();
     mockSmscClose(mockId);
+}
+
+@test:Config {after: cleanupSubmitTest, groups: ["submit"]}
+function testDlrCorrelatesWithReturnedMessageIdAndTlvSurfaced() returns error? {
+    var [mockId, conn, smsListener] = check startCapturingListener(
+            SUBMIT_DLR_TEST_PORT, new CallerCapturingService());
+    Caller caller = <Caller>capturedCaller();
+    SubmitResult r = check caller->submit({
+        destAddr: "264811234567",
+        shortMessage: "track me",
+        registeredDelivery: ON_SUCCESS_OR_FAILURE
+    });
+    _ = check mockSmscAwaitNextSubmit(mockId, conn, 5000);
+    // The SMSC's receipt carries the guaranteed key in the TLV and a DIFFERENT radix in
+    // the vendor-specific body id: - correlation must pin to the TLV (item 9 / 5.3.2.12).
+    string bodyStyleId = string `deadbeef`; // deliberately unlike the mock's decimal ids
+    check mockSmscSendDeliveryReceiptWithTlv(mockId, conn,
+            string `id:${bodyStyleId} sub:001 dlvrd:001 submit date:2607290000 done date:2607290001 stat:DELIVRD err:000 text:x`,
+            r.messageId);
+    test:assertTrue(pollUntil(isolated function() returns boolean {
+        return recordedReceiptTlv() !is ();
+    }, 5), "the receipt must reach onDeliverSm with the TLV surfaced");
+    test:assertEquals(recordedReceiptTlv(), r.messageId,
+            "receiptedMessageId (TLV 0x001E) must equal the id submit returned");
+    test:assertEquals(recordedReceiptBodyId(), bodyStyleId,
+            "the vendor-specific body id stays independently available on receipt.id");
+    // And a receipt WITHOUT the TLV leaves the field () - absence is meaningful.
+    lock {
+        lastReceiptTlv = "sentinel";
+    }
+    check mockSmscSendDeliveryReceipt(mockId, conn,
+            "id:0000000042 sub:001 dlvrd:001 submit date:2607290000 done date:2607290001 stat:DELIVRD err:000 text:x");
+    test:assertTrue(pollUntil(isolated function() returns boolean {
+        return recordedReceiptBodyId() == "0000000042";
+    }, 5), "second receipt must arrive");
+    test:assertEquals(recordedReceiptTlv(), (),
+            "no TLV on the wire must surface as (), never a stale or invented value");
+    check smsListener.gracefulStop();
+    mockSmscClose(mockId);
+    submitTestListener = ();
+    submitTestMockId = -1;
 }
 
 @test:Config {after: cleanupSubmitTest, groups: ["submit"]}
