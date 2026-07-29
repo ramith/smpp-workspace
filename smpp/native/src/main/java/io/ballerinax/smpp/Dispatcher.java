@@ -88,7 +88,7 @@ public class Dispatcher implements MessageReceiverListener {
      * goes ({@code -1} = the method did not declare one). Resolved once, at attach, by
      * TYPE — never re-derived per PDU.
      */
-    record MethodPlan(int smsIndex, int callerIndex, int arity) { }
+    record MethodPlan(int smsIndex, int callerIndex, int arity, boolean isolated) { }
 
     /**
      * Immutable (service, remote-method-set, per-method plans) triple published through a
@@ -96,7 +96,7 @@ public class Dispatcher implements MessageReceiverListener {
      * (the new service paired with the old method set or plans, or vice versa).
      */
     private record ServiceBinding(BObject service, Set<String> remoteMethods,
-            Map<String, MethodPlan> plans, boolean serviceIsolated) { }
+            Map<String, MethodPlan> plans, boolean onErrorIsolated) { }
 
     enum AttachResult { ATTACHED, ALREADY_ATTACHED, NO_REMOTE_METHODS, BAD_SIGNATURE }
 
@@ -172,7 +172,7 @@ public class Dispatcher implements MessageReceiverListener {
         ServiceBinding binding = this.binding;
         BError err = ModuleUtils.createError(message);
         boolean hasOnError = binding != null && binding.remoteMethods().contains(ON_ERROR);
-        StrandMetadata meta = new StrandMetadata(binding != null && binding.serviceIsolated(), null);
+        StrandMetadata meta = new StrandMetadata(binding != null && binding.onErrorIsolated(), null);
         // ALWAYS run on a virtual thread - BOTH the onError callback and the no-handler log
         // fallback. Both cross into the Ballerina runtime (callMethod / callFunction), and this
         // method is called from a jsmpp state-listener thread during a CLOSED transition, with
@@ -262,7 +262,12 @@ public class Dispatcher implements MessageReceiverListener {
             if (!name.equals(ON_DELIVER_SM) && !name.equals(ON_DATA_SM) && !name.equals(ON_ERROR)) {
                 continue; // unknown remote methods are ignored, as before
             }
-            String problem = validateAndPlan(name, method, plans);
+            // Per-METHOD isolation (the stdlib pattern): object-level isolation alone is
+            // over-permissive - an isolated object can still have a non-isolated method
+            // body (e.g. one mutating module state), and dispatching that concurrently
+            // would introduce races 1.0.1's serialization prevented (Phase 5 finding #1).
+            boolean methodIsolated = objType.isIsolated() && objType.isIsolated(name);
+            String problem = validateAndPlan(name, method, plans, methodIsolated);
             if (problem != null) {
                 // Reject the whole attach with NO state change (validate-before-assign,
                 // Sprint 1 semantics) - a bad signature must be loud at attach, not a
@@ -274,8 +279,10 @@ public class Dispatcher implements MessageReceiverListener {
         if (names.isEmpty()) {
             return new AttachOutcome(AttachResult.NO_REMOTE_METHODS, null);
         }
+        boolean onErrorIsolated = names.contains(ON_ERROR)
+                && objType.isIsolated() && objType.isIsolated(ON_ERROR);
         this.binding = new ServiceBinding(service, Set.copyOf(names), Map.copyOf(plans),
-                objType.isIsolated());
+                onErrorIsolated);
         return AttachOutcome.ATTACHED_OK;
     }
 
@@ -303,7 +310,7 @@ public class Dispatcher implements MessageReceiverListener {
      * </ul>
      */
     private static String validateAndPlan(String name, RemoteMethodType method,
-            Map<String, MethodPlan> plans) {
+            Map<String, MethodPlan> plans, boolean methodIsolated) {
         if (method.getType().getRestType() != null) {
             return name + " must not declare a rest parameter (the runtime would pad it "
                     + "with a value per dispatch and panic)";
@@ -320,6 +327,12 @@ public class Dispatcher implements MessageReceiverListener {
                 }
                 if (!p.isDefault) {
                     required++;
+                    Type referred = TypeUtils.getReferredType(p.type);
+                    if (!(referred instanceof io.ballerina.runtime.api.types.ErrorType)) {
+                        // Unchecked, dispatchError's callMethod would panic per drop and
+                        // LOSE the notification (Phase 5 finding #8).
+                        return "onError's parameter '" + p.name + "' must be an error type";
+                    }
                 }
             }
             if (required != 1) {
@@ -371,7 +384,7 @@ public class Dispatcher implements MessageReceiverListener {
         // Arity = the bound prefix only (Ballerina forces defaulted params to trail, so
         // everything past the last bound param is defaultable and runtime-padded).
         int arity = Math.max(smsIndex, callerIndex) + 1;
-        plans.put(name, new MethodPlan(smsIndex, callerIndex, arity));
+        plans.put(name, new MethodPlan(smsIndex, callerIndex, arity, methodIsolated));
         return null;
     }
 
@@ -792,7 +805,6 @@ public class Dispatcher implements MessageReceiverListener {
             // (concurrency-review finding #1). An isolated service (the norm, and what
             // every template shows) now dispatches concurrently; a non-isolated one
             // keeps the old serialized-but-safe behaviour.
-            StrandMetadata meta = new StrandMetadata(binding.serviceIsolated(), null);
             BMap<BString, Object> sms = toSms(pdu, fallback, deliveryReceipt);
             // Position the arguments per the plan resolved at attach: 1-arity services
             // (the 1.0.1 contract) get exactly the Sms; 2-arity services get the shared
@@ -806,6 +818,7 @@ public class Dispatcher implements MessageReceiverListener {
                 throw new ProcessRequestException(
                         "no dispatch plan for " + method, SMPPConstant.STAT_ESME_RSYSERR);
             }
+            StrandMetadata meta = new StrandMetadata(plan.isolated(), null);
             Object[] args = new Object[plan.arity()];
             args[plan.smsIndex()] = sms;
             if (plan.callerIndex() >= 0) {

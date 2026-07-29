@@ -520,6 +520,20 @@ public final class NativeListener {
         // drain, then unbind. (immediateStop skips the drain: in-flight submits surface
         // as LINK_DOWN when the socket closes under them - documented, tested.)
         sessionUsable(listener).set(false);
+        // Post-flip sweep (Phase 5 finding #2): a submit that incremented before the flip
+        // may still be in flight; with increment-before-check on the submit side, this
+        // bounded wait closes the reservation race - post-flip submits fail fast and
+        // decrement in microseconds, so the sweep only ever waits for real sends.
+        java.util.concurrent.atomic.AtomicInteger sweep = submitsInFlight(listener);
+        long sweepDeadline = System.currentTimeMillis() + 2000;
+        while (sweep.get() > 0 && System.currentTimeMillis() < sweepDeadline) {
+            try {
+                Thread.sleep(20);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
         Object result = closeSession(listener);  // null-safe; outside the lock (network I/O)
         synchronized (stateLock(listener)) {
             state.set(ListenerState.STOPPED);

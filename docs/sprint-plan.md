@@ -766,8 +766,10 @@ it; hunt with full-suite runs in the worktree harness.
   directly) carries a short internal housekeeping bound (2s, jsmpp's own historical default for
   exactly those paths), and the overridden getter routes by calling thread — jsmpp's
   `EnquireLinkSender-*`/`PDUReaderWorker-*` housekeeping threads get the short bound, every
-  caller thread (Ballerina strands AND jsmpp's `pool-N-thread-M` PDU-processor threads, where
-  SYNC handlers submit) gets the configured `transactionTimeout`. Net: submits keep 30s;
+  caller thread gets the configured `transactionTimeout`. **Superseded during Phase 5
+  remediation:** routing is now by a connector-owned ThreadLocal submit context (entered by
+  NativeCaller around submitShortMessage) — zero jsmpp thread-name coupling, and a missed
+  context fails LOUD (2s submit timeout, pinned) instead of silently degrading detection. Net: submits keep 30s;
   worst-case `gracefulStop` ≈ `gracefulStopTimeout` + 2s (was + 30s); blackhole detection back
   to ≈ `enquireLinkInterval` + 2s; a dead-link enquire probe burns 2s not 30s. No new public
   surface (internal constant; additive to expose later per the Sprint 4 precedent). Pinned by
@@ -787,7 +789,7 @@ deliberately not built, reason here.
 
 | Commitment | Disposition |
 |---|---|
-| Gate tests 1-15 (happy path, receiver-reject, rebind-survival x2 cycles, fail-fast, after-stop, onError-no-derail, shapes incl. caller-first + defaulted-extra + 3 traps, error mapping, concurrent-correlation+keepalive, throttle-starvation, item-12 pair, DLR/TLV pair, oversize+unencodable, config validation) | **BUILT** — 55 bal + 69 JUnit |
+| Gate tests 1-15 (happy path, receiver-reject, rebind-survival x2 cycles, fail-fast, after-stop, onError-no-derail, shapes incl. caller-first + defaulted-extra + 3 traps, error mapping, concurrent-correlation+keepalive, throttle-starvation, item-12 pair, DLR/TLV pair, oversize+unencodable, config validation) | **BUILT** — 55 bal + 69 JUnit. Two clause-level deviations RECORDED: the concurrency test asserts completion+correlation of N genuinely-overlapped handlers rather than a peak-concurrency gauge (no instrumentation surface without production changes); the onError-issued submit's own outcome is not asserted (its purpose is proving the rebind survives runtime work on that path, which is asserted) |
 | `testSubmitBeforeStartIsRejected` | **RECORDED** — untestable by construction (D1 blockquote); pre-check kept as defense in depth |
 | `testSubmitErrorMappingPerCommandStatus` "every status" | **RECORDED** — two statuses at the wire; the mapping is per exception class and exhaustively JUnit-covered; more wire statuses add no discrimination |
 | `testRejectedSubmitsDoNotLeakPendingResponses` | **RECORDED (deferred)** — needs a test-only accessor on the CONNECTOR session (`getUnacknowledgedRequests`), i.e. new production surface; the known orphan paths (oversize, validity_period) are locally unreachable since the remediation; the residual (D3's DefaultPDUSender NPE) is theoretical. Revisit if a leak is ever observed |
@@ -798,7 +800,7 @@ deliberately not built, reason here.
 | D6 joint `transactionTimeout`/`enquireLinkInterval` validation | **RECORDED (moot)** — the ConnectorSession split decoupled them; dead-link detection no longer depends on `transactionTimeout` at all |
 | D6 inbound-freeze doc line | **BUILT** (architecture.md outbound paragraph + Caller.submit docs) |
 | D8 no-false-retry-promise wording | **BUILT** (LINK_DOWN remap; wording promises only "per rebindPolicy, if enabled") |
-| D8 gracefulStop-vs-draining-handlers | **BUILT** (owner decision: submits legal while STOPPING; drain covers submits; `sessionUsable` flips before unbind) |
+| D8 gracefulStop-vs-draining-handlers | **BUILT** (owner decision: submits legal while STOPPING; drain covers submits via increment-before-liveness-check reservation ordering + a bounded post-flip sweep in `stop()` — Phase 5 caught the original check-then-increment TOCTOU). Dedicated stop-mid-submit test: **RECORDED (deferred)** — the reservation ordering is the mechanism; a deterministic test needs a submit parked exactly astride the flip, which the 20ms sweep granularity makes timing-fragile |
 | D8 `immediateStop` terminates mid-submit | **RECORDED** — immediateStop skips the drain; a parked submit surfaces LINK_DOWN when the socket closes (mapped path, `ioExceptionIsLinkDown`); dedicated test deferred as low-yield |
 | D9 raw-jsmpp harness promotion | **RECORDED (withdrawn)** — 15 green submit tests prove the harness end to end |
 | Item 13 (`smpp:encodeGsm7Unpacked` helper) | **RECORDED (not built)** — additive utility; unblocked by nothing and blocking nothing; next sprint candidate |

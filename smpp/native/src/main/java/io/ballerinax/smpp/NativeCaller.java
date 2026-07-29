@@ -381,20 +381,25 @@ public final class NativeCaller {
         @SuppressWarnings("unchecked")
         java.util.concurrent.atomic.AtomicBoolean usable =
                 (java.util.concurrent.atomic.AtomicBoolean) caller.getNativeData(SESSION_USABLE);
-        SMPPSession session = sessionRef.get();
-        if (session == null || !usable.get() || session.getSessionState() != SessionState.BOUND_TRX) {
-            return detailError("cannot submit: the SMSC session is down"
-                    + " (rebinding runs per rebindPolicy, if enabled)", "LINK_DOWN", null);
-        }
-
+        @SuppressWarnings("unchecked")
+        java.util.concurrent.atomic.AtomicInteger submitsInFlight =
+                (java.util.concurrent.atomic.AtomicInteger) caller.getNativeData(SUBMITS_IN_FLIGHT);
+        // RESERVATION ORDER (Phase 5 finding #2): increment FIRST, then check liveness.
+        // The other order is a TOCTOU: a submit passing the check could still be between
+        // check and increment when awaitDrain reads 0 and stop() unbinds under it. With
+        // increment-first, either the drain sees us, or we see the usable=false flip that
+        // stop() makes before its post-flip sweep - never neither.
+        submitsInFlight.incrementAndGet();
         try {
+            SMPPSession session = sessionRef.get();
+            if (session == null || !usable.get()
+                    || session.getSessionState() != SessionState.BOUND_TRX) {
+                return detailError("cannot submit: the SMSC session is down"
+                        + " (rebinding runs per rebindPolicy, if enabled)", "LINK_DOWN", null);
+            }
             SubmitSpec spec = specFrom(sms, config);
             SubmitRequest req = compose(spec);
-            @SuppressWarnings("unchecked")
-            java.util.concurrent.atomic.AtomicInteger submitsInFlight =
-                    (java.util.concurrent.atomic.AtomicInteger) caller.getNativeData(SUBMITS_IN_FLIGHT);
             SubmitSmResult result;
-            submitsInFlight.incrementAndGet();
             ConnectorSession.enterSubmitContext();
             try {
                 result = session.submitShortMessage(
@@ -408,7 +413,6 @@ public final class NativeCaller {
                         req.body);
             } finally {
                 ConnectorSession.exitSubmitContext();
-                submitsInFlight.decrementAndGet();
             }
             BMap<BString, Object> out = ValueCreator.createRecordValue(
                     ModuleUtils.getModule(), "SubmitResult");
@@ -422,6 +426,10 @@ public final class NativeCaller {
             // is inside this net too, so a malformed BMap cannot panic across interop.
             MappedFailure f = mapSubmitFailure(e);
             return detailError(f.message, f.failureMode, f.commandStatus);
+        } finally {
+            // The one decrement, on every path incl. throws - a leaked count would make
+            // every later gracefulStop burn its full timeout (Phase 5 finding #7).
+            submitsInFlight.decrementAndGet();
         }
     }
 

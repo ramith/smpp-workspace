@@ -194,11 +194,11 @@ reason, `bindType` is typed as `ListenerBindType`
 transmitter bind here is a compile-time error, not something that connects
 successfully and then silently never calls your service.
 
-`RECEIVER` and `TRANSCEIVER` behave identically for this connector's
-purposes: both receive `deliver_sm`/`data_sm`. `TRANSCEIVER` additionally
-allows submitting messages over the same session, but since this connector
-has no API for that, choosing it only matters if you separately intend the
-same bind to double as a submission path outside this connector.
+`RECEIVER` and `TRANSCEIVER` both receive `deliver_sm`/`data_sm` identically.
+`TRANSCEIVER` additionally allows submitting on the same session — it is the
+bind type `Caller.submit` requires: a service that replies must bind
+`TRANSCEIVER`, and a `RECEIVER` bind's Caller fails fast with an error naming
+the fix.
 
 ### Dispatch concurrency and response mode
 

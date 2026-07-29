@@ -93,6 +93,10 @@ isolated function recordedReceiptBodyId() returns string? {
 isolated service class CallerCapturingService {
     *Service;
 
+    remote isolated function onError(Error err) returns error? {
+        recordError(err);
+    }
+
     remote isolated function onDeliverSm(Sms sms, Caller caller) returns error? {
         lock {
             submitTestCaller = caller;
@@ -225,6 +229,10 @@ isolated function recordedReplyId(string text) returns string? {
 // the id ITS submit returned - the correlation the concurrency test pins.
 isolated service class CorrelatingReplyService {
     *Service;
+
+    remote isolated function onError(Error err) returns error? {
+        recordError(err);
+    }
 
     remote isolated function onDeliverSm(Sms sms, Caller caller) returns error? {
         string replyText = string `re:${sms.shortMessage}`;
@@ -372,6 +380,7 @@ function testSubmitHappyPathPinsWirePdu() returns error? {
 function testSubmitOnReceiverBindIsRejected() returns error? {
     clearCapturedCaller();
     int mockId = check mockSmscOpen(SUBMIT_RECEIVER_TEST_PORT);
+    submitTestMockId = mockId;
     Listener smsListener = check new ({
         host: "localhost",
         port: SUBMIT_RECEIVER_TEST_PORT,
@@ -379,6 +388,7 @@ function testSubmitOnReceiverBindIsRejected() returns error? {
         password: "test",
         bindType: RECEIVER
     });
+    submitTestListener = smsListener;
     check smsListener.attach(new CallerCapturingService());
     check smsListener.'start();
     int conn = check mockSmscAwaitNextBind(mockId, 5000);
@@ -422,6 +432,10 @@ function testSubmitSurvivesRebindOnNewSession() returns error? {
         test:assertEquals(mockSmscSubmitShortMessage(preSubmit), string `pre-sever ${cycle}`);
         test:assertTrue(before.messageId != previousId, "ids must differ across submits");
 
+        // Non-vacuous conn1 check (Phase 5 finding #3a): assert on the LIVE handle,
+        // BEFORE the sever forgets it - post-sever the accessor returns -1 forever.
+        test:assertEquals(mockSmscPendingSubmitCount(mockId, previousConn), 0,
+                "gate: submitCount(conn1) unchanged - all captures drained, nothing extra");
         check mockSmscSever(mockId, previousConn);
         int newConn = check mockSmscAwaitNextBind(mockId, 10000);
 
@@ -445,8 +459,6 @@ function testSubmitSurvivesRebindOnNewSession() returns error? {
         }
         SubmitResult confirmed = <SubmitResult>after;
         int postSubmit = check mockSmscAwaitNextSubmit(mockId, newConn, 5000);
-        test:assertTrue(mockSmscPendingSubmitCount(mockId, previousConn) <= 0,
-                "nothing may land on the severed connection (gate: submitCount(conn1) unchanged)");
         test:assertEquals(mockSmscSubmitShortMessage(postSubmit),
                 string `post-rebind ${cycle}`, "the post-rebind submit must land on the NEW connection");
         test:assertTrue(confirmed.messageId != before.messageId, "ids must differ");
@@ -523,6 +535,7 @@ function testCallerParamShapes() returns error? {
         portIndex += 1;
         clearCapturedCaller();
         int mockId = check mockSmscOpen(port);
+        submitTestMockId = mockId;
         Listener l = check new ({
             host: "localhost",
             port: port,
@@ -530,6 +543,7 @@ function testCallerParamShapes() returns error? {
             password: "test",
             bindType: TRANSCEIVER
         });
+        submitTestListener = l;
         check l.attach(svc);
         check l.'start();
         int conn = check mockSmscAwaitNextBind(mockId, 5000);
@@ -547,6 +561,7 @@ function testCallerParamShapes() returns error? {
     // is a separate dispatch site and must position the Caller independently.
     clearCapturedCaller();
     int mockId = check mockSmscOpen(SUBMIT_SHAPES_MIXED_PORT);
+    submitTestMockId = mockId;
     Listener mixed = check new ({
         host: "localhost",
         port: SUBMIT_SHAPES_MIXED_PORT,
@@ -554,6 +569,7 @@ function testCallerParamShapes() returns error? {
         password: "test",
         bindType: TRANSCEIVER
     });
+    submitTestListener = mixed;
     check mixed.attach(new MixedArityService());
     check mixed.'start();
     int conn = check mockSmscAwaitNextBind(mockId, 5000);
@@ -599,7 +615,7 @@ function testCallerParamShapes() returns error? {
 function testSubmitWaitsBeyondHousekeepingTimer() returns error? {
     // The split-timer behavioral pin: the mock delays its submit_sm_resp by 3s - longer
     // than ConnectorSession's 2s housekeeping bound, well under transactionTimeout (30s).
-    // If the thread-name routing ever mis-bucketed caller threads, this submit would
+    // If the submit-context routing ever mis-bucketed caller threads, this submit would
     // ResponseTimeout at 2s; success proves submits ride the configured long bound while
     // teardown/keepalive stay short (JUnit pins the routing itself).
     var [mockId, conn, smsListener] = check startCapturingListener(
