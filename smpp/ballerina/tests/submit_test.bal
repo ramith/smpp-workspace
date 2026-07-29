@@ -299,23 +299,33 @@ function testSubmitDuringRebindFailsFastAndAfterStopIsRejected() returns error? 
     // good, and submit must fail fast with the connector's own wording.
     mockSmscStopAccepting(mockId);
     check mockSmscSever(mockId, conn);
-    Error? sawRebindWording = ();
-    foreach int i in 1 ... 50 {
+    // The first error may be the MID-FLIGHT IOException path (a submit racing the sever);
+    // keep sampling until the fail-fast PRE-CHECK wording appears - the drop verdict
+    // (sessionUsable) flips within the ~1s transport-death grace, after which every
+    // submit must fail instantly without touching the dead socket.
+    Error? preCheckError = ();
+    foreach int i in 1 ... 100 {
         SubmitResult|Error r = caller->submit({destAddr: "264811234567", shortMessage: "x"});
         if r is Error {
-            sawRebindWording = r;
-            break;
+            // Every failure on a down link must be LINK_DOWN and must never leak jsmpp
+            // state names, regardless of which path (mid-flight or pre-check) produced it.
+            test:assertEquals(r.detail().failureMode, LINK_DOWN);
+            test:assertFalse(r.message().includes("CLOSED"),
+                    string `jsmpp state names must not leak: ${r.message()}`);
+            if r.message().includes("session is down") {
+                preCheckError = r;
+                break;
+            }
         }
-        // A submit that still succeeded raced the sever - the wire may buffer briefly.
         runtime:sleep(0.1);
     }
-    test:assertTrue(sawRebindWording !is (), "submit must start failing once the link is down");
-    Error e = <Error>sawRebindWording;
-    string msg = e.message();
-    test:assertTrue(msg.includes("rebind") || msg.includes("not currently bound"),
-            string `the connector's own wording, not jsmpp's: ${msg}`);
-    test:assertFalse(msg.includes("CLOSED"), string `jsmpp state names must not leak: ${msg}`);
-    test:assertEquals(e.detail().failureMode, INVALID_REQUEST);
+    test:assertTrue(preCheckError !is (),
+            "the fail-fast pre-check wording must appear once the drop verdict lands");
+    Error e = <Error>preCheckError;
+    // Both phrases asserted (not OR - a regression dropping either must fail), and the
+    // wording promises nothing a disabled/exhausted rebind cannot deliver (D8).
+    test:assertTrue(e.message().includes("session is down") && e.message().includes("rebindPolicy"),
+            string `the connector's own wording: ${e.message()}`);
 
     // After a graceful stop the message names the lifecycle, not the session.
     check smsListener.gracefulStop();

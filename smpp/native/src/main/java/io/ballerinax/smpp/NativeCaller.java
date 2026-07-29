@@ -55,8 +55,7 @@ import java.util.concurrent.atomic.AtomicReference;
  *       value; jsmpp's validator becomes a never-fires backstop. The pre-check also
  *       prevents an orphaned {@code pendingResponses} entry: a {@code PDUStringException}
  *       escapes {@code executeSendCommand}'s IOException-only catch and would leak the
- *       registered response slot on every locally-invalid submit
- *       ({@code testRejectedSubmitsDoNotLeakPendingResponses}).</li>
+ *       registered response slot on every locally-invalid submit.</li>
  *   <li><b>Limits are read from jsmpp, not transcribed.</b> {@code StringParameter}
  *       exposes {@code getMax()}/{@code getType()}; the comparisons are asymmetric
  *       (C-octet strings reject {@code length >= max} because max includes the NUL,
@@ -73,6 +72,8 @@ public final class NativeCaller {
     static final String SESSION_REF = "smpp.caller.sessionRef";
     static final String STATE_REF = "smpp.caller.stateRef";
     static final String CONFIG = "smpp.caller.config";
+    static final String SESSION_USABLE = "smpp.caller.sessionUsable";
+    static final String SUBMITS_IN_FLIGHT = "smpp.caller.submitsInFlight";
 
     private NativeCaller() {}
 
@@ -83,11 +84,11 @@ public final class NativeCaller {
     /** The submit request as extracted from Ballerina values — still unvalidated. */
     static final class SubmitSpec {
         String destAddr;
-        String destTon = "INTERNATIONAL";
-        String destNpi = "ISDN";
+        String destTon = "TON_INTERNATIONAL";
+        String destNpi = "NPI_ISDN";
         String sourceAddr = "";
-        String sourceTon = "INTERNATIONAL";
-        String sourceNpi = "ISDN";
+        String sourceTon = "TON_INTERNATIONAL";
+        String sourceNpi = "NPI_ISDN";
         String shortMessage;          // XOR shortMessageBytes
         String encoding = "LATIN1";   // ASCII | LATIN1 | UCS2
         byte[] shortMessageBytes;     // escape hatch; requires dataCoding
@@ -193,15 +194,36 @@ public final class NativeCaller {
         req.dstNpi = npi(spec.destNpi, "destAddr.npi");
         req.srcAddr = spec.sourceAddr == null ? "" : spec.sourceAddr;
         checkLength("sourceAddr", req.srcAddr, StringParameter.SOURCE_ADDR);
-        req.srcTon = ton(spec.sourceTon, "sourceAddr.ton");
-        req.srcNpi = npi(spec.sourceNpi, "sourceAddr.npi");
+        if (req.srcAddr.isEmpty()) {
+            // SMPP v3.4 section 4.4.1: a NULL source address and its TON/NPI move
+            // together - "if not known, set to NULL (Unknown)". An empty address tagged
+            // INTERNATIONAL/ISDN (the Address defaults) is internally inconsistent and a
+            // plausible ESME_RINVSRCADR/ESME_RINVSRCTON on strict SMSCs (protocol audit).
+            req.srcTon = TypeOfNumber.UNKNOWN;
+            req.srcNpi = NumberingPlanIndicator.UNKNOWN;
+        } else {
+            req.srcTon = ton(spec.sourceTon, "sourceAddr.ton");
+            req.srcNpi = npi(spec.sourceNpi, "sourceAddr.npi");
+        }
 
         // --- the rest ---
         req.serviceType = spec.serviceType == null ? "" : spec.serviceType;
         checkLength("serviceType", req.serviceType, StringParameter.SERVICE_TYPE);
         req.validityPeriod = spec.validityPeriod;
         if (req.validityPeriod != null) {
-            checkLength("validityPeriod", req.validityPeriod, StringParameter.VALIDITY_PERIOD);
+            // VALIDITY_PERIOD is the one pre-checked parameter with isRangeMinAndMax ==
+            // false: jsmpp (correctly modelling SMPP v3.4 section 7.1.1) accepts only the
+            // empty string or EXACTLY 16 characters - a range check here would let a
+            // 1-15 char value through to jsmpp's validator, which throws AFTER
+            // pendingResponses.put (orphaning the entry) and echoes the raw value
+            // (protocol-audit finding, 2026-07-29). Validate the exact shape locally,
+            // naming nothing but the field.
+            if (!isValidSmppTime(req.validityPeriod)) {
+                throw new InvalidRequest("validityPeriod must be empty or exactly 16 "
+                        + "characters in the SMPP time format YYMMDDhhmmsstnnp "
+                        + "(section 7.1.1), e.g. absolute 240115143000000+ or relative "
+                        + "000000020000000R");
+            }
         }
         req.registeredDelivery = switch (spec.registeredDelivery) {
             case "NONE" -> 0x00;
@@ -321,16 +343,18 @@ public final class NativeCaller {
         @SuppressWarnings("unchecked")
         BMap<BString, Object> config = (BMap<BString, Object>) caller.getNativeData(CONFIG);
 
-        // Pre-check 1: lifecycle. Names the state so "before start" and "after stop"
-        // read differently.
+        // Pre-check 1: lifecycle. STOPPING is deliberately ALLOWED (owner decision,
+        // 2026-07-29): gracefulStop drains in-flight handlers, and rejecting submits
+        // from the very handlers being drained would drop every reply-style service's
+        // replies on shutdown. Submits stay legal until the session actually unbinds;
+        // the drain tracks them (submitsInFlight below).
         NativeListener.ListenerState st = stateRef.get();
-        if (st != NativeListener.ListenerState.STARTED) {
-            String when = switch (st) {
-                case INIT, STARTING -> "the listener has not started yet - call 'start() first";
-                case STOPPING, STOPPED -> "the listener has been stopped";
-                default -> "the listener is not started (state: " + st + ")";
-            };
-            return detailError("cannot submit: " + when, "INVALID_REQUEST", null);
+        if (st == NativeListener.ListenerState.INIT || st == NativeListener.ListenerState.STARTING) {
+            return detailError("cannot submit: the listener has not started yet - call 'start() first",
+                    "INVALID_REQUEST", null);
+        }
+        if (st == NativeListener.ListenerState.STOPPED) {
+            return detailError("cannot submit: the listener has been stopped", "INVALID_REQUEST", null);
         }
 
         // Pre-check 2: bind type. Deliberately names the config field and the fix, and
@@ -342,40 +366,61 @@ public final class NativeCaller {
                     + "bindType: TRANSCEIVER in the ConnectionConfig", "INVALID_REQUEST", null);
         }
 
-        // Pre-check 3: session liveness, through the AtomicReference - never cached.
+        // Pre-check 3: session liveness. Two signals, both required:
+        // - sessionUsable is the connector's OWN drop decision (set false in
+        //   onUnexpectedDrop, true at install). It is what makes the wedge visible here:
+        //   a wedged session still CLAIMS BOUND_TRX forever, so getSessionState() alone
+        //   would accept submits onto a dead socket for the whole rebind window
+        //   (architecture-review finding #3).
+        // - getSessionState() covers the inverse sliver (a stop closed the session but
+        //   the flag flip has not been observed yet).
+        // Classified LINK_DOWN, not INVALID_REQUEST (owner decision, 2026-07-29): an
+        // already-down link and a mid-submit link death are the same operational
+        // condition and must land in one FailureMode bucket. The wording promises
+        // nothing a disabled/exhausted rebind cannot deliver (D8).
+        @SuppressWarnings("unchecked")
+        java.util.concurrent.atomic.AtomicBoolean usable =
+                (java.util.concurrent.atomic.AtomicBoolean) caller.getNativeData(SESSION_USABLE);
         SMPPSession session = sessionRef.get();
-        if (session == null || session.getSessionState() != SessionState.BOUND_TRX) {
-            return detailError("cannot submit: the SMSC session is not currently bound "
-                    + "(dropped and rebinding?) - retry after the rebind completes",
-                    "INVALID_REQUEST", null);
-        }
-
-        SubmitSpec spec;
-        try {
-            spec = specFrom(sms, config);
-        } catch (InvalidRequest e) {
-            return detailError(e.getMessage(), "INVALID_REQUEST", null);
+        if (session == null || !usable.get() || session.getSessionState() != SessionState.BOUND_TRX) {
+            return detailError("cannot submit: the SMSC session is down"
+                    + " (rebinding runs per rebindPolicy, if enabled)", "LINK_DOWN", null);
         }
 
         try {
+            SubmitSpec spec = specFrom(sms, config);
             SubmitRequest req = compose(spec);
-            SubmitSmResult result = session.submitShortMessage(
-                    req.serviceType,
-                    req.srcTon, req.srcNpi, req.srcAddr,
-                    req.dstTon, req.dstNpi, req.dstAddr,
-                    new ESMClass(req.esmClass), req.protocolId, req.priorityFlag,
-                    req.scheduleDeliveryTime, req.validityPeriod,
-                    new RegisteredDelivery(req.registeredDelivery), req.replaceIfPresent,
-                    new RawDataCoding(req.dataCoding), req.smDefaultMsgId,
-                    req.body);
+            @SuppressWarnings("unchecked")
+            java.util.concurrent.atomic.AtomicInteger submitsInFlight =
+                    (java.util.concurrent.atomic.AtomicInteger) caller.getNativeData(SUBMITS_IN_FLIGHT);
+            SubmitSmResult result;
+            submitsInFlight.incrementAndGet();
+            ConnectorSession.enterSubmitContext();
+            try {
+                result = session.submitShortMessage(
+                        req.serviceType,
+                        req.srcTon, req.srcNpi, req.srcAddr,
+                        req.dstTon, req.dstNpi, req.dstAddr,
+                        new ESMClass(req.esmClass), req.protocolId, req.priorityFlag,
+                        req.scheduleDeliveryTime, req.validityPeriod,
+                        new RegisteredDelivery(req.registeredDelivery), req.replaceIfPresent,
+                        new RawDataCoding(req.dataCoding), req.smDefaultMsgId,
+                        req.body);
+            } finally {
+                ConnectorSession.exitSubmitContext();
+                submitsInFlight.decrementAndGet();
+            }
             BMap<BString, Object> out = ValueCreator.createRecordValue(
                     ModuleUtils.getModule(), "SubmitResult");
             String messageId = result == null || result.getMessageId() == null
                     ? "" : result.getMessageId();
             out.put(StringUtils.fromString("messageId"), StringUtils.fromString(messageId));
             return out;
-        } catch (Throwable t) {
-            MappedFailure f = mapSubmitFailure(t);
+        } catch (Exception e) {
+            // Exception, not Throwable: every failure D3 named is an Exception, and a
+            // VirtualMachineError must panic, not become a returned smpp:Error. specFrom
+            // is inside this net too, so a malformed BMap cannot panic across interop.
+            MappedFailure f = mapSubmitFailure(e);
             return detailError(f.message, f.failureMode, f.commandStatus);
         }
     }
@@ -415,7 +460,15 @@ public final class NativeCaller {
         Object bytes = sms.get(StringUtils.fromString("shortMessageBytes"));
         spec.shortMessageBytes = bytes == null ? null : ((BArray) bytes).getBytes();
         Object dc = sms.get(StringUtils.fromString("dataCoding"));
-        spec.dataCoding = dc == null ? null : (int) (long) (Long) dc;
+        if (dc != null) {
+            long dcLong = (Long) dc;
+            // Range-check BEFORE narrowing: (int) 4294967296L is 0, which would silently
+            // send data_coding 0x00 instead of erroring (concurrency-review finding #6).
+            if (dcLong < 0 || dcLong > 0xFF) {
+                throw new InvalidRequest("dataCoding must be 0-255, got " + dcLong);
+            }
+            spec.dataCoding = (int) dcLong;
+        }
         spec.registeredDelivery = str(sms, "registeredDelivery", "NONE");
         spec.serviceType = str(sms, "serviceType", "");
         BString validity = sms.getStringValue(StringUtils.fromString("validityPeriod"));
@@ -428,8 +481,8 @@ public final class NativeCaller {
     private static void applyAddress(SubmitSpec spec, Object value, boolean isDest)
             throws InvalidRequest {
         String addr;
-        String tonName = "INTERNATIONAL";
-        String npiName = "ISDN";
+        String tonName = "TON_INTERNATIONAL";
+        String npiName = "NPI_ISDN";
         if (value == null) {
             if (isDest) {
                 throw new InvalidRequest("destAddr is required");
@@ -467,6 +520,29 @@ public final class NativeCaller {
     }
 
     /**
+     * SMPP v3.4 section 7.1.1 time format: 15 digits then one of {@code + - R}. jsmpp's
+     * StringValidator only checks the length (0 or exactly 16); the shape check here is
+     * stricter so a malformed-but-16-char value fails locally (non-echoing) instead of
+     * drawing ESME_RINVEXPIRY from the SMSC.
+     */
+    static boolean isValidSmppTime(String value) {
+        if (value.isEmpty()) {
+            return true;
+        }
+        if (value.length() != 16) {
+            return false;
+        }
+        for (int i = 0; i < 15; i++) {
+            char c = value.charAt(i);
+            if (c < '0' || c > '9') {
+                return false;
+            }
+        }
+        char last = value.charAt(15);
+        return last == '+' || last == '-' || last == 'R';
+    }
+
+    /**
      * jsmpp's limit for the parameter, adjusted for the C-octet asymmetry: a C-octet
      * string's max INCLUDES the terminating NUL (its validator rejects
      * {@code length >= max}), an octet string's does not (rejects {@code > max}).
@@ -486,10 +562,12 @@ public final class NativeCaller {
     }
 
     private static TypeOfNumber ton(String name, String field) throws InvalidRequest {
-        // The Ballerina Ton enum's VALUES are the jsmpp constant names (types.bal keeps
-        // the mapping table in exactly one place), so valueOf is the entire mapping.
+        // The Ballerina Ton enum's values equal its member names (TON_INTERNATIONAL), so
+        // Config.toml matches the docs and jsmpp's identifier spelling stays OUT of the
+        // published contract (owner decision, 2026-07-29). Stripping the prefix here is
+        // the entire jsmpp mapping.
         try {
-            return TypeOfNumber.valueOf(name);
+            return TypeOfNumber.valueOf(stripPrefix(name, "TON_", field));
         } catch (IllegalArgumentException e) {
             throw new InvalidRequest(field + ": unknown type-of-number '" + name + "'");
         }
@@ -497,9 +575,16 @@ public final class NativeCaller {
 
     private static NumberingPlanIndicator npi(String name, String field) throws InvalidRequest {
         try {
-            return NumberingPlanIndicator.valueOf(name);
+            return NumberingPlanIndicator.valueOf(stripPrefix(name, "NPI_", field));
         } catch (IllegalArgumentException e) {
             throw new InvalidRequest(field + ": unknown numbering-plan indicator '" + name + "'");
         }
+    }
+
+    private static String stripPrefix(String name, String prefix, String field) throws InvalidRequest {
+        if (!name.startsWith(prefix)) {
+            throw new InvalidRequest(field + ": unknown value '" + name + "'");
+        }
+        return name.substring(prefix.length());
     }
 }

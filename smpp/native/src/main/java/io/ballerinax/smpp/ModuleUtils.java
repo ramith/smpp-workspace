@@ -20,10 +20,13 @@ import java.util.Map;
 public final class ModuleUtils {
 
     // Must match the distinct error type name declared in types.bal
-    // (`public type Error distinct error;`).
+    // (`public type Error distinct error<ErrorDetail>;`).
     private static final String ERROR_TYPE_NAME = "Error";
 
-    private static Module smppModule;
+    // volatile: written once from the module-init strand, read from jsmpp reader/pool
+    // threads and the rebind executor. The happens-before edges exist incidentally today;
+    // volatile makes the publication explicit and free (concurrency review, minor).
+    private static volatile Module smppModule;
 
     private ModuleUtils() {}
 
@@ -50,7 +53,7 @@ public final class ModuleUtils {
 
     /**
      * As {@link #createError(String)}, additionally carrying an {@code ErrorDetail}
-     * record (failureMode / commandStatus / sequenceNumber — all-optional fields of the
+     * record (failureMode / commandStatus — all-optional fields of the
      * open detail record in types.bal). The submit path uses this so callers can branch
      * retry logic on {@code e.detail().failureMode}; every other error site keeps the
      * no-detail overload.

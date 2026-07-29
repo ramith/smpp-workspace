@@ -43,6 +43,8 @@ public final class NativeListener {
     private static final String NATIVE_STATE = "smpp.state";
     private static final String NATIVE_STATE_LOCK = "smpp.stateLock";
     private static final String NATIVE_REBIND_EXECUTOR = "smpp.rebindExecutor";
+    private static final String NATIVE_SESSION_USABLE = "smpp.sessionUsable";
+    private static final String NATIVE_SUBMITS_IN_FLIGHT = "smpp.submitsInFlight";
 
     /**
      * Extra jsmpp PDU-processor threads kept beyond {@code maxConcurrentDispatch} in SYNC
@@ -102,6 +104,19 @@ public final class NativeListener {
         caller.addNativeData(NativeCaller.SESSION_REF, sessionRef);
         caller.addNativeData(NativeCaller.STATE_REF, stateRef);
         caller.addNativeData(NativeCaller.CONFIG, config);
+        // The connector's OWN drop verdict, readable by the submit path. getSessionState()
+        // cannot serve: a wedged session claims BOUND_TRX forever (the reader-death wedge),
+        // so without this flag submits would be accepted onto a dead socket for the whole
+        // rebind window. Set true at install, false on drop/stop.
+        AtomicBoolean sessionUsable = new AtomicBoolean(false);
+        caller.addNativeData(NativeCaller.SESSION_USABLE, sessionUsable);
+        listener.addNativeData(NATIVE_SESSION_USABLE, sessionUsable);
+        // Submits in flight, for the drain: gracefulStop must not unbind the session
+        // under a parked submit (owner decision: submits stay legal while STOPPING).
+        java.util.concurrent.atomic.AtomicInteger submitsInFlight =
+                new java.util.concurrent.atomic.AtomicInteger();
+        caller.addNativeData(NativeCaller.SUBMITS_IN_FLIGHT, submitsInFlight);
+        listener.addNativeData(NATIVE_SUBMITS_IN_FLIGHT, submitsInFlight);
         listener.addNativeData(NATIVE_DISPATCHER,
                 new Dispatcher(env.getRuntime(), maxConcurrentDispatch, decodeGsm7, caller));
         listener.addNativeData(NATIVE_STATE, stateRef);
@@ -276,6 +291,7 @@ public final class NativeListener {
             // stays STARTED across a drop; only sessions come and go).
             if (st == ListenerState.STARTING || st == ListenerState.STARTED) {
                 session(listener).set(session);
+                sessionUsable(listener).set(true);
                 installed.set(true);
                 state(listener).set(ListenerState.STARTED);
                 // Bound-race check: if the session died in the sliver between
@@ -328,8 +344,20 @@ public final class NativeListener {
     }
 
     private static void onUnexpectedDrop(BObject listener, String description) {
+        // Before anything else: flip the connector's own drop verdict so the submit
+        // path fails fast with LINK_DOWN instead of stalling transactionTimeout against
+        // a dead (or wedged, still-claiming-BOUND) session.
+        sessionUsable(listener).set(false);
         dispatcher(listener).dispatchError(description);
         scheduleRebind(listener, 1);
+    }
+
+    private static AtomicBoolean sessionUsable(BObject listener) {
+        return (AtomicBoolean) listener.getNativeData(NATIVE_SESSION_USABLE);
+    }
+
+    private static java.util.concurrent.atomic.AtomicInteger submitsInFlight(BObject listener) {
+        return (java.util.concurrent.atomic.AtomicInteger) listener.getNativeData(NATIVE_SUBMITS_IN_FLIGHT);
     }
 
     /**
@@ -464,8 +492,17 @@ public final class NativeListener {
         }
         shutdownRebindExecutor(listener);   // no-op if never created
         if (graceful) {
+            // Submits stay LEGAL during the drain (owner decision, 2026-07-29): the
+            // session is bound and usable until closeSession below, and rejecting
+            // submits from the very handlers being drained would drop every reply-style
+            // service's replies on shutdown. The drain covers both dispatches and
+            // in-flight submits.
             awaitDrain(listener);           // also covers in-flight onError notifications
         }
+        // Point of no return for the send path: fail-fast any submit arriving after the
+        // drain, then unbind. (immediateStop skips the drain: in-flight submits surface
+        // as LINK_DOWN when the socket closes under them - documented, tested.)
+        sessionUsable(listener).set(false);
         Object result = closeSession(listener);  // null-safe; outside the lock (network I/O)
         synchronized (stateLock(listener)) {
             state.set(ListenerState.STOPPED);
@@ -481,7 +518,14 @@ public final class NativeListener {
         double timeoutSeconds = decimalValue(config(listener), "gracefulStopTimeout");
         long deadline = System.currentTimeMillis() + (long) (timeoutSeconds * 1000);
         Dispatcher dispatcher = dispatcher(listener);
-        while (dispatcher.inFlightCount() > 0 && System.currentTimeMillis() < deadline) {
+        // Two counters: dispatches (handlers + onError vthreads) AND submits. Submits are
+        // tracked separately because they can be issued from NON-handler strands (a
+        // stashed Caller), which inFlight cannot see - without this, stop() could unbind
+        // the session under a parked submit (concurrency-review finding #3). Submits stay
+        // legal while STOPPING (owner decision), so the drain must cover them.
+        java.util.concurrent.atomic.AtomicInteger submits = submitsInFlight(listener);
+        while ((dispatcher.inFlightCount() > 0 || submits.get() > 0)
+                && System.currentTimeMillis() < deadline) {
             try {
                 Thread.sleep(50);
             } catch (InterruptedException e) {

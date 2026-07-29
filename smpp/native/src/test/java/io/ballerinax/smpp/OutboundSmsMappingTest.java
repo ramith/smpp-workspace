@@ -35,6 +35,9 @@ class OutboundSmsMappingTest {
         assertEquals(TypeOfNumber.INTERNATIONAL, req.dstTon);
         assertEquals(NumberingPlanIndicator.ISDN, req.dstNpi);
         assertEquals("", req.srcAddr, "absent source address goes on the wire empty (spec-legal)");
+        assertEquals(TypeOfNumber.UNKNOWN, req.srcTon,
+                "an empty source forces TON Unknown - 4.4.1: NULL address and TON/NPI move together");
+        assertEquals(NumberingPlanIndicator.UNKNOWN, req.srcNpi);
         assertEquals((byte) 0x03, req.dataCoding, "LATIN1 default must stamp data_coding 0x03");
         assertArrayEquals("hello".getBytes(StandardCharsets.ISO_8859_1), req.body);
         assertEquals((byte) 0x00, req.registeredDelivery, "no receipt requested MUST be 0 - "
@@ -74,11 +77,11 @@ class OutboundSmsMappingTest {
     @Test
     void tonNpiResolveViaJsmppNames() throws Exception {
         NativeCaller.SubmitSpec spec = minimalText();
-        spec.destTon = "ALPHANUMERIC";
-        spec.destNpi = "UNKNOWN";
+        spec.destTon = "TON_ALPHANUMERIC";
+        spec.destNpi = "NPI_UNKNOWN";
         spec.sourceAddr = "INFO";
-        spec.sourceTon = "ALPHANUMERIC";
-        spec.sourceNpi = "UNKNOWN";
+        spec.sourceTon = "TON_ALPHANUMERIC";
+        spec.sourceNpi = "NPI_UNKNOWN";
         NativeCaller.SubmitRequest req = NativeCaller.compose(spec);
         assertEquals(TypeOfNumber.ALPHANUMERIC, req.dstTon);
         assertEquals(NumberingPlanIndicator.UNKNOWN, req.dstNpi);
@@ -184,6 +187,38 @@ class OutboundSmsMappingTest {
         NativeCaller.SubmitSpec noDest = new NativeCaller.SubmitSpec();
         noDest.shortMessage = "x";
         assertThrows(NativeCaller.InvalidRequest.class, () -> NativeCaller.compose(noDest));
+    }
+
+    @Test
+    void validityPeriodAcceptsOnlyEmptyOrExact16Shape() throws Exception {
+        // isRangeMinAndMax == false: jsmpp accepts ONLY 0 or exactly 16 chars. A 1-15
+        // char value passing local validation would orphan a pendingResponses entry and
+        // echo the user's value from jsmpp's validator (protocol-audit finding #1).
+        NativeCaller.SubmitSpec ok = minimalText();
+        ok.validityPeriod = "000000020000000R";
+        assertEquals("000000020000000R", NativeCaller.compose(ok).validityPeriod);
+        NativeCaller.SubmitSpec absolute = minimalText();
+        absolute.validityPeriod = "240115143000000+";
+        assertEquals("240115143000000+", NativeCaller.compose(absolute).validityPeriod);
+        // Distinctive digits so no bad value is a substring of the format EXAMPLES the
+        // error message legitimately contains.
+        for (String bad : new String[] {"7777777277777", "77777772777777777", "77777772777777RX",
+                "777777727777777X", "77777772777777R "}) {
+            NativeCaller.SubmitSpec spec = minimalText();
+            spec.validityPeriod = bad;
+            NativeCaller.InvalidRequest e = assertThrows(NativeCaller.InvalidRequest.class,
+                    () -> NativeCaller.compose(spec));
+            assertTrue(!e.getMessage().contains(bad), "must not echo the value: " + e.getMessage());
+        }
+    }
+
+    @Test
+    void dataCodingOutOfRangeRejected() {
+        NativeCaller.SubmitSpec spec = new NativeCaller.SubmitSpec();
+        spec.destAddr = "264811234567";
+        spec.shortMessageBytes = new byte[] {1};
+        spec.dataCoding = 300;
+        assertThrows(NativeCaller.InvalidRequest.class, () -> NativeCaller.compose(spec));
     }
 
     private static NativeCaller.SubmitRequest assertDoesNotThrowCompose(NativeCaller.SubmitSpec spec) {

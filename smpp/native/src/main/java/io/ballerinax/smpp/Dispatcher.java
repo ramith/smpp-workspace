@@ -96,7 +96,7 @@ public class Dispatcher implements MessageReceiverListener {
      * (the new service paired with the old method set or plans, or vice versa).
      */
     private record ServiceBinding(BObject service, Set<String> remoteMethods,
-            Map<String, MethodPlan> plans) { }
+            Map<String, MethodPlan> plans, boolean serviceIsolated) { }
 
     enum AttachResult { ATTACHED, ALREADY_ATTACHED, NO_REMOTE_METHODS, BAD_SIGNATURE }
 
@@ -172,7 +172,7 @@ public class Dispatcher implements MessageReceiverListener {
         ServiceBinding binding = this.binding;
         BError err = ModuleUtils.createError(message);
         boolean hasOnError = binding != null && binding.remoteMethods().contains(ON_ERROR);
-        StrandMetadata meta = new StrandMetadata(false, null);
+        StrandMetadata meta = new StrandMetadata(binding != null && binding.serviceIsolated(), null);
         // ALWAYS run on a virtual thread - BOTH the onError callback and the no-handler log
         // fallback. Both cross into the Ballerina runtime (callMethod / callFunction), and this
         // method is called from a jsmpp state-listener thread during a CLOSED transition, with
@@ -274,7 +274,8 @@ public class Dispatcher implements MessageReceiverListener {
         if (names.isEmpty()) {
             return new AttachOutcome(AttachResult.NO_REMOTE_METHODS, null);
         }
-        this.binding = new ServiceBinding(service, Set.copyOf(names), Map.copyOf(plans));
+        this.binding = new ServiceBinding(service, Set.copyOf(names), Map.copyOf(plans),
+                objType.isIsolated());
         return AttachOutcome.ATTACHED_OK;
     }
 
@@ -312,12 +313,18 @@ public class Dispatcher implements MessageReceiverListener {
             // onError stays 1-arity by design: it is invoked from drop paths where no
             // request context exists, and handing it a Caller invites submitting from a
             // session that is mid-teardown.
-            if (params.length != 1) {
-                return "onError must take exactly one parameter (the error); found "
-                        + params.length;
+            int required = 0;
+            for (Parameter p : params) {
+                if (isCallerType(p.type)) {
+                    return "onError must not declare an smpp:Caller parameter";
+                }
+                if (!p.isDefault) {
+                    required++;
+                }
             }
-            if (isCallerType(params[0].type)) {
-                return "onError must not declare an smpp:Caller parameter";
+            if (required != 1) {
+                return "onError must take exactly one required parameter (the error); found "
+                        + required;
             }
             return null;
         }
@@ -339,6 +346,19 @@ public class Dispatcher implements MessageReceiverListener {
                     return name + " declares more than one smpp:Sms parameter";
                 }
                 smsIndex = i;
+            } else if (involvesCallerType(param.type)) {
+                // D1's first trap, checked BEFORE the isDefault skip below: a union like
+                // `smpp:Caller? c = ()` is defaultable, and skipping it would silently
+                // strand the user's reply path with c always nil. Reject loudly instead.
+                return name + " parameter '" + param.name + "': smpp:Caller must be a "
+                        + "plain, non-defaultable parameter (smpp:Caller? is not accepted)";
+            } else if (param.isDefault) {
+                // 1.0.1 COMPATIBILITY (D5, restored after the architecture review caught
+                // its omission): `onDeliverSm(Sms sms, string extra = "x")` is a legal,
+                // working 1.0.1 program - the runtime pads trailing defaulted params when
+                // dispatch passes fewer args. Skipped, not rejected. (Caller-involving
+                // types were matched above, so no reply path can be skipped into nil.)
+                continue;
             } else {
                 return name + " parameter '" + param.name + "' has an unsupported type; "
                         + "expected smpp:Sms or smpp:Caller (note: smpp:Caller? is not "
@@ -348,12 +368,31 @@ public class Dispatcher implements MessageReceiverListener {
         if (smsIndex < 0) {
             return name + " must declare an smpp:Sms parameter";
         }
-        plans.put(name, new MethodPlan(smsIndex, callerIndex, params.length));
+        // Arity = the bound prefix only (Ballerina forces defaulted params to trail, so
+        // everything past the last bound param is defaultable and runtime-padded).
+        int arity = Math.max(smsIndex, callerIndex) + 1;
+        plans.put(name, new MethodPlan(smsIndex, callerIndex, arity));
         return null;
     }
 
     private static boolean isCallerType(Type type) {
         return isModuleType(type, "Caller");
+    }
+
+    /** True if the type IS Caller or is a union with Caller as a member (e.g. Caller?). */
+    private static boolean involvesCallerType(Type type) {
+        Type referred = TypeUtils.getReferredType(type);
+        if (isCallerType(referred)) {
+            return true;
+        }
+        if (referred instanceof io.ballerina.runtime.api.types.UnionType union) {
+            for (Type member : union.getMemberTypes()) {
+                if (isCallerType(member)) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     private static boolean isSmsType(Type type) {
@@ -737,13 +776,28 @@ public class Dispatcher implements MessageReceiverListener {
         boolean handOff = false;
         try {
             BObject svc = binding.service();
-            // isConcurrentSafe = false -> the runtime serializes dispatch; safe default.
-            StrandMetadata meta = new StrandMetadata(false, null);
+            // Derive strand isolation from the SERVICE's own isolation (the stdlib
+            // pattern), instead of hardcoding false: a non-isolated strand holds the
+            // runtime's PROCESS-WIDE lock for the whole handler - including a 30s
+            // caller->submit round trip - stalling every non-isolated strand in the
+            // program and nullifying maxConcurrentDispatch as a parallelism knob
+            // (concurrency-review finding #1). An isolated service (the norm, and what
+            // every template shows) now dispatches concurrently; a non-isolated one
+            // keeps the old serialized-but-safe behaviour.
+            StrandMetadata meta = new StrandMetadata(binding.serviceIsolated(), null);
             BMap<BString, Object> sms = toSms(pdu, fallback, deliveryReceipt);
             // Position the arguments per the plan resolved at attach: 1-arity services
             // (the 1.0.1 contract) get exactly the Sms; 2-arity services get the shared
             // Caller in whichever position their signature put it.
             MethodPlan plan = binding.plans().get(method);
+            if (plan == null) {
+                // Unreachable today (dispatch is only called with onDeliverSm/onDataSm,
+                // both of which always have plans when present in remoteMethods) - but an
+                // NPE here would escape PDUProcessTask.run() (IOException-only catch) and
+                // silently drop the PDU with no resp. Fail loud and answerable instead.
+                throw new ProcessRequestException(
+                        "no dispatch plan for " + method, SMPPConstant.STAT_ESME_RSYSERR);
+            }
             Object[] args = new Object[plan.arity()];
             args[plan.smsIndex()] = sms;
             if (plan.callerIndex() >= 0) {

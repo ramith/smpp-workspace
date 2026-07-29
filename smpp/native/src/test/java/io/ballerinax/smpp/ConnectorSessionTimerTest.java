@@ -8,50 +8,65 @@ import java.util.concurrent.atomic.AtomicLong;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
 /**
- * Pins {@link ConnectorSession}'s thread-name routing. The names are jsmpp 3.0.2 facts
- * (vendored source: {@code EnquireLinkSender} names itself
- * {@code "EnquireLinkSender-" + sessionId} at AbstractSession.java:517; the reader is
- * {@code "PDUReaderWorker-" + sessionId}) — if a jsmpp upgrade renames either, this test
- * still passes (it constructs the names itself), so the UPGRADE CHECKLIST in the class
- * doc is the real guard; this test guards against regressions in OUR routing logic.
+ * Pins {@link ConnectorSession}'s ThreadLocal submit-context routing: the configured
+ * submit bound applies ONLY between enter/exit (which {@code NativeCaller} wraps around
+ * {@code submitShortMessage}); everything else — including all of jsmpp's housekeeping
+ * threads, which never enter the context — sees the short field value. There is no
+ * dependency on jsmpp thread names, so nothing here breaks on a jsmpp upgrade; the
+ * remaining version coupling (getter-vs-field call sites) is audited via javap per the
+ * Sprint 8 plan.
  */
 class ConnectorSessionTimerTest {
 
     private static final long SUBMIT_MS = 30_000;
 
-    private static long timerSeenFrom(ConnectorSession session, String threadName)
-            throws InterruptedException {
+    private static ConnectorSession session() {
+        return new ConnectorSession((host, port) -> {
+            throw new java.io.IOException("never connects in this test");
+        }, SUBMIT_MS);
+    }
+
+    @Test
+    void outsideSubmitContextIsTheHousekeepingBound() throws Exception {
+        ConnectorSession s = session();
+        assertEquals(ConnectorSession.HOUSEKEEPING_TIMER_MS, s.getTransactionTimer(),
+                "any thread outside the submit context (jsmpp housekeeping included) "
+                        + "must see the short bound");
+        // And from a differently-named thread, same answer - names are irrelevant now.
         AtomicLong seen = new AtomicLong(-1);
-        Thread t = new Thread(() -> seen.set(session.getTransactionTimer()), threadName);
+        Thread t = new Thread(() -> seen.set(s.getTransactionTimer()), "EnquireLinkSender-cafebabe");
         t.start();
         t.join(5_000);
-        return seen.get();
+        assertEquals(ConnectorSession.HOUSEKEEPING_TIMER_MS, seen.get());
     }
 
     @Test
-    void housekeepingThreadsGetTheShortBound() throws Exception {
-        ConnectorSession session = new ConnectorSession((host, port) -> {
-            throw new java.io.IOException("never connects in this test");
-        }, SUBMIT_MS);
-        assertEquals(ConnectorSession.HOUSEKEEPING_TIMER_MS,
-                timerSeenFrom(session, "EnquireLinkSender-cafebabe"),
-                "the enquire-link probe wait must use the housekeeping bound");
-        assertEquals(ConnectorSession.HOUSEKEEPING_TIMER_MS,
-                timerSeenFrom(session, "PDUReaderWorker-cafebabe"),
-                "the reader's exit drain must use the housekeeping bound");
+    void insideSubmitContextIsTheConfiguredBound() {
+        ConnectorSession s = session();
+        ConnectorSession.enterSubmitContext();
+        try {
+            assertEquals(SUBMIT_MS, s.getTransactionTimer());
+        } finally {
+            ConnectorSession.exitSubmitContext();
+        }
+        assertEquals(ConnectorSession.HOUSEKEEPING_TIMER_MS, s.getTransactionTimer(),
+                "exit must restore the short bound - a leaked context would silently "
+                        + "lengthen housekeeping waits on this thread");
     }
 
     @Test
-    void callerThreadsGetTheConfiguredSubmitBound() throws Exception {
-        ConnectorSession session = new ConnectorSession((host, port) -> {
-            throw new java.io.IOException("never connects in this test");
-        }, SUBMIT_MS);
-        assertEquals(SUBMIT_MS, timerSeenFrom(session, "main"));
-        // jsmpp's PDU-processor pool threads - where SYNC handlers (and therefore their
-        // submits) actually run - are pool-N-thread-M, NOT PDUReaderWorker-*: they must
-        // get the submit bound, or a SYNC handler's reply would time out at 2s.
-        assertEquals(SUBMIT_MS, timerSeenFrom(session, "pool-7-thread-3"));
-        // Ballerina strands (virtual threads, arbitrary/empty names) likewise.
-        assertEquals(SUBMIT_MS, timerSeenFrom(session, ""));
+    void contextIsPerThread() throws Exception {
+        ConnectorSession s = session();
+        ConnectorSession.enterSubmitContext();
+        try {
+            AtomicLong seen = new AtomicLong(-1);
+            Thread t = new Thread(() -> seen.set(s.getTransactionTimer()));
+            t.start();
+            t.join(5_000);
+            assertEquals(ConnectorSession.HOUSEKEEPING_TIMER_MS, seen.get(),
+                    "another thread must not inherit this thread's submit context");
+        } finally {
+            ConnectorSession.exitSubmitContext();
+        }
     }
 }

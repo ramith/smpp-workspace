@@ -21,13 +21,11 @@ import org.jsmpp.session.connection.ConnectionFactory;
  *       constructor, never via the public setter afterwards) holds the SHORT housekeeping
  *       bound, and stop paths stay snappy;</li>
  *   <li>{@code sendEnquireLink()}, {@code pduExecutor.awaitTermination}, and all five
- *       submit-family operations call the <b>getter</b> — which this class overrides to
- *       route by the calling thread: jsmpp's own housekeeping threads
- *       ({@code EnquireLinkSender-*}, {@code PDUReaderWorker-*} — names pinned by
- *       {@code ConnectorSessionTimerTest} against the vendored 3.0.2 source) get the
- *       SHORT bound, and every other thread — Ballerina strands and jsmpp's PDU-processor
- *       pool threads ({@code pool-N-thread-M}), i.e. everywhere a submit can run — gets
- *       the configured {@code transactionTimeout}.</li>
+ *       submit-family operations call the <b>getter</b> — overridden to return the
+ *       configured {@code transactionTimeout} only inside a connector-owned
+ *       {@code ThreadLocal} submit context (entered by {@code NativeCaller} around
+ *       {@code submitShortMessage}); every read outside that context — including all of
+ *       jsmpp's own housekeeping threads — gets the SHORT bound.</li>
  * </ul>
  *
  * <p>Net effect with defaults: submits wait up to 30s for their response; a graceful stop
@@ -35,10 +33,11 @@ import org.jsmpp.session.connection.ConnectionFactory;
  * {@code gracefulStopTimeout} + 2s instead of + 30s); a dead-link enquire probe burns 2s
  * instead of 30s; silent-peer detection stays ≈ {@code enquireLinkInterval} + 2s.
  *
- * <p><b>Version coupling, stated plainly:</b> the getter-vs-field split and the thread
- * names are jsmpp 3.0.2 facts. A jsmpp upgrade must re-verify both (the timer test pins
- * the name-routing logic; re-run the {@code javap} audit from the Sprint 8 plan for the
- * call sites).
+ * <p><b>Version coupling, stated plainly:</b> the getter-vs-field split is a jsmpp 3.0.2
+ * bytecode fact (unbind() reads the field; the submit family, sendEnquireLink and the
+ * reader's awaitTermination call the getter). A jsmpp upgrade must re-run the
+ * {@code javap} call-site audit from the Sprint 8 plan. There is deliberately no
+ * dependency on jsmpp's thread names.
  */
 final class ConnectorSession extends SMPPSession {
 
@@ -50,24 +49,41 @@ final class ConnectorSession extends SMPPSession {
      */
     static final long HOUSEKEEPING_TIMER_MS = 2000;
 
+    /**
+     * Marks the current thread as executing a connector-issued submit-family operation.
+     * Routing by OUR OWN ThreadLocal instead of by jsmpp's thread names (owner decision,
+     * 2026-07-29, on the architecture review's recommendation) removes the version
+     * coupling on jsmpp's thread-naming entirely and inverts the failure direction: if
+     * the context is ever missed, submits get the SHORT bound and time out loudly at 2s
+     * - which {@code testSubmitWaitsBeyondHousekeepingTimer} already catches - instead
+     * of dead-link detection silently degrading. jsmpp's housekeeping threads never
+     * enter this context, so they always see the short field value.
+     */
+    private static final ThreadLocal<Boolean> SUBMIT_CONTEXT = new ThreadLocal<>();
+
+    static void enterSubmitContext() {
+        SUBMIT_CONTEXT.set(Boolean.TRUE);
+    }
+
+    static void exitSubmitContext() {
+        SUBMIT_CONTEXT.remove();
+    }
+
     private final long submitTransactionTimerMs;
 
     ConnectorSession(ConnectionFactory connectionFactory, long submitTransactionTimerMs) {
         super(connectionFactory);
         this.submitTransactionTimerMs = submitTransactionTimerMs;
         // The FIELD carries the short bound: unbind() reads it directly, and
-        // super.getTransactionTimer() returns it for the housekeeping threads below.
+        // super.getTransactionTimer() returns it everywhere outside a submit context.
         // Nothing may call setTransactionTimer() with the submit value after this.
         super.setTransactionTimer(HOUSEKEEPING_TIMER_MS);
     }
 
     @Override
     public long getTransactionTimer() {
-        String thread = Thread.currentThread().getName();
-        if (thread != null && (thread.startsWith("EnquireLinkSender-")
-                || thread.startsWith("PDUReaderWorker-"))) {
-            return super.getTransactionTimer();
-        }
-        return submitTransactionTimerMs;
+        return Boolean.TRUE.equals(SUBMIT_CONTEXT.get())
+                ? submitTransactionTimerMs
+                : super.getTransactionTimer();
     }
 }

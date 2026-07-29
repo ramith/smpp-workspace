@@ -183,7 +183,9 @@ public type ConnectionConfig record {|
 public type Address record {|
     # The address itself. For `TON_INTERNATIONAL` this is E.164 **without** a leading `+`
     # (the `ton` field is what carries that meaning on the wire). Empty means "absent",
-    # which is spec-legal for a source address.
+    # which is spec-legal for a source address — and when it is empty, the connector
+    # sends TON/NPI as Unknown/Unknown regardless of the fields below (§4.4.1: a NULL
+    # address and its TON/NPI move together).
     string value;
     # Type of number. Defaults to `TON_INTERNATIONAL`, the right answer for an ordinary
     # MSISDN; short codes and alphanumeric sender IDs need an explicit value.
@@ -200,49 +202,50 @@ public type Address record {|
 # `DeliveryReceiptStatus.UNKNOWN` and `NATIONAL` would collide with `Npi`, producing build
 # warnings — one of them retroactively on a shipped doc comment.
 #
-# Each member's *value* is the corresponding `org.jsmpp.bean.TypeOfNumber` constant name,
-# so the Ballerina-member → jsmpp-member table lives here and nowhere else; the native
-# layer resolves it with `valueOf` rather than carrying a second copy of the mapping.
+# Each member's value equals its member name, so what a `Config.toml` author writes is
+# exactly what the docs show (owner decision, 2026-07-29 — this also keeps jsmpp's
+# identifier spelling out of the published contract). The native layer strips the
+# `TON_` prefix and resolves the remainder against `org.jsmpp.bean.TypeOfNumber`.
 public enum Ton {
     # `TypeOfNumber.UNKNOWN` (0) — let the SMSC decide.
-    TON_UNKNOWN = "UNKNOWN",
+    TON_UNKNOWN = "TON_UNKNOWN",
     # `TypeOfNumber.INTERNATIONAL` (1) — E.164 without a leading `+`.
-    TON_INTERNATIONAL = "INTERNATIONAL",
+    TON_INTERNATIONAL = "TON_INTERNATIONAL",
     # `TypeOfNumber.NATIONAL` (2).
-    TON_NATIONAL = "NATIONAL",
+    TON_NATIONAL = "TON_NATIONAL",
     # `TypeOfNumber.NETWORK_SPECIFIC` (3).
-    TON_NETWORK_SPECIFIC = "NETWORK_SPECIFIC",
+    TON_NETWORK_SPECIFIC = "TON_NETWORK_SPECIFIC",
     # `TypeOfNumber.SUBSCRIBER_NUMBER` (4).
-    TON_SUBSCRIBER_NUMBER = "SUBSCRIBER_NUMBER",
+    TON_SUBSCRIBER_NUMBER = "TON_SUBSCRIBER_NUMBER",
     # `TypeOfNumber.ALPHANUMERIC` (5) — an alphanumeric sender ID rather than digits.
-    TON_ALPHANUMERIC = "ALPHANUMERIC",
+    TON_ALPHANUMERIC = "TON_ALPHANUMERIC",
     # `TypeOfNumber.ABBREVIATED` (6) — short codes.
-    TON_ABBREVIATED = "ABBREVIATED"
+    TON_ABBREVIATED = "TON_ABBREVIATED"
 }
 
-# Numbering plan indicator, per SMPP v3.4 §5.2.6. Prefixed and value-mapped for the same
-# reasons as `Ton`.
+# Numbering plan indicator, per SMPP v3.4 §5.2.6. Prefixed, value-equals-member-name,
+# and prefix-stripped natively — for the same reasons as `Ton`.
 public enum Npi {
     # `NumberingPlanIndicator.UNKNOWN` (0).
-    NPI_UNKNOWN = "UNKNOWN",
+    NPI_UNKNOWN = "NPI_UNKNOWN",
     # `NumberingPlanIndicator.ISDN` (1) — E.163/E.164, the usual choice for an MSISDN.
-    NPI_ISDN = "ISDN",
+    NPI_ISDN = "NPI_ISDN",
     # `NumberingPlanIndicator.DATA` (3) — X.121.
-    NPI_DATA = "DATA",
+    NPI_DATA = "NPI_DATA",
     # `NumberingPlanIndicator.TELEX` (4) — F.69.
-    NPI_TELEX = "TELEX",
+    NPI_TELEX = "NPI_TELEX",
     # `NumberingPlanIndicator.LAND_MOBILE` (6) — E.212.
-    NPI_LAND_MOBILE = "LAND_MOBILE",
+    NPI_LAND_MOBILE = "NPI_LAND_MOBILE",
     # `NumberingPlanIndicator.NATIONAL` (8).
-    NPI_NATIONAL = "NATIONAL",
+    NPI_NATIONAL = "NPI_NATIONAL",
     # `NumberingPlanIndicator.PRIVATE` (9).
-    NPI_PRIVATE = "PRIVATE",
+    NPI_PRIVATE = "NPI_PRIVATE",
     # `NumberingPlanIndicator.ERMES` (10).
-    NPI_ERMES = "ERMES",
+    NPI_ERMES = "NPI_ERMES",
     # `NumberingPlanIndicator.INTERNET` (14) — IP.
-    NPI_INTERNET = "INTERNET",
+    NPI_INTERNET = "NPI_INTERNET",
     # `NumberingPlanIndicator.WAP` (18) — WAP client id.
-    NPI_WAP = "WAP"
+    NPI_WAP = "NPI_WAP"
 }
 
 # How an outbound message's text is encoded, and hence the `data_coding` it is sent with.
@@ -256,7 +259,10 @@ public enum Encoding {
     # IA5/ASCII — `data_coding 0x01`. 7-bit US-ASCII only; anything else is rejected.
     ASCII,
     # Latin-1 — `data_coding 0x03`. The default: covers English, Afrikaans and most
-    # Western European text.
+    # Western European text. Note some carriers/aggregators accept only `0x00`
+    # (their provisioned default) and `0x08`, and may reject or transcode `0x03`; for
+    # pure-ASCII text, `ASCII` produces byte-identical payloads under `data_coding
+    # 0x01` — a zero-cost switch if your SMSC dislikes `0x03`.
     LATIN1,
     # UCS-2 big-endian — `data_coding 0x08`. Any script, at half the characters per PDU.
     UCS2
@@ -306,8 +312,11 @@ public type OutboundSms record {|
     DeliveryReceiptRequest registeredDelivery = NONE;
     # SMPP `service_type`. Empty (the default) means the SMSC's default service.
     string serviceType = "";
-    # SMPP `validity_period`: how long the SMSC should keep trying, as an absolute or
-    # relative SMPP time string. Omitted means the SMSC's own default.
+    # SMPP `validity_period`: how long the SMSC should keep trying. Omitted means the
+    # SMSC's own default. When set, it must be EXACTLY 16 characters in the §7.1.1 time
+    # format `YYMMDDhhmmsstnnp` — absolute, e.g. `240115143000000+` (UTC+offset), or
+    # relative, e.g. `000000020000000R` (2 hours). Any other length or shape is rejected
+    # locally before anything reaches the wire.
     string validityPeriod?;
 |};
 
@@ -483,14 +492,18 @@ public enum FailureMode {
     # subscriber. Decide per use case; for billing-relevant traffic, prefer reconciling
     # via delivery receipts over blind retry.
     TIMEOUT_DELIVERY_UNKNOWN,
-    # The connection died while sending or waiting. The message may or may not have
-    # reached the SMSC (same duplicate caveat as `TIMEOUT_DELIVERY_UNKNOWN` if it did).
-    # The listener's rebind machinery is already reacting; retry after the rebind.
+    # The link is the problem: it died while sending or waiting, OR it was already
+    # down/rebinding when the submit was attempted (one bucket for one operational
+    # condition — owner decision, 2026-07-29). For a mid-flight death the message may
+    # or may not have reached the SMSC (same duplicate caveat as
+    # `TIMEOUT_DELIVERY_UNKNOWN`); for an already-down link nothing was sent. If
+    # `rebindPolicy` is enabled, retry once rebound; if rebinding is disabled or
+    # exhausted, the link stays down until you restart the listener.
     LINK_DOWN,
     # This connector refused to send: the request failed local validation (oversize,
-    # unencodable character, bad field) or the session/lifecycle state does not permit
-    # a submit (not started, stopped, mid-rebind, RECEIVER bind). Nothing reached the
-    # wire; fix the request or the timing and retry safely.
+    # unencodable character, bad field) or the lifecycle/config does not permit a
+    # submit (not started, stopped, RECEIVER bind). Nothing reached the wire; fix the
+    # request or the configuration. (A down/rebinding LINK is `LINK_DOWN`, not this.)
     INVALID_REQUEST,
     # jsmpp raised something outside the four categories above (a malformed response,
     # an unexpected runtime failure inside the client). Not safely classifiable;
@@ -508,9 +521,6 @@ public type ErrorDetail record {
     # The SMPP `command_status` from the negative response, when `failureMode` is
     # `REJECTED`. Compare against SMPP v3.4 §5.1.3 (e.g. 0x00000058 = ESME_RTHROTTLED).
     int commandStatus?;
-    # The failed request's SMPP `sequence_number`, when one was assigned before the
-    # failure — correlates with SMSC-side logs during carrier support escalations.
-    int sequenceNumber?;
 };
 
 # The distinct error type raised by the SMPP connector. Returned from `Listener` init on

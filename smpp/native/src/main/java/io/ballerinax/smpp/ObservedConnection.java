@@ -91,7 +91,15 @@ final class ObservedConnection implements Connection {
         if (fired.compareAndSet(false, true)) {
             Runnable handler = onTransportDeath.get();
             if (handler != null) {
-                handler.run();
+                try {
+                    handler.run();
+                } catch (Throwable t) {
+                    // Never let the death signal kill jsmpp's reader thread - a throw
+                    // propagating out of read() IS the wedge this class exists to survive.
+                    // The signal is one-shot and now consumed; log rather than rethrow.
+                    java.util.logging.Logger.getLogger(ObservedConnection.class.getName())
+                            .warning("transport-death handler threw: " + t);
+                }
             }
         }
     }
