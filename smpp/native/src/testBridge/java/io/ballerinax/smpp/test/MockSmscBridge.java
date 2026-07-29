@@ -36,7 +36,21 @@ public final class MockSmscBridge {
 
     /** Opens a plaintext listening socket and starts the accept-loop; returns the handle. */
     public static long openMock(int port) throws Exception {
-        return register(new MockSmsc(port));
+        // Bounded retry for close-reopen races: a previous test's listener socket on the
+        // SAME port can linger for a beat after closeMock() returns, and the recorded
+        // "BindException: Address in use" flake got frequent as the suite grew. Distinct
+        // ports never collide, so this absorbs only the lingering-close race - a genuine
+        // double-allocation still fails, after ~5s instead of instantly.
+        java.net.BindException last = null;
+        for (int attempt = 0; attempt < 20; attempt++) {
+            try {
+                return register(new MockSmsc(port));
+            } catch (java.net.BindException e) {
+                last = e;
+                Thread.sleep(250);
+            }
+        }
+        throw last;
     }
 
     /**

@@ -20,6 +20,8 @@ const int SUBMIT_DLR_TEST_PORT = 27816;
 const int SUBMIT_ONERROR_TEST_PORT = 27817;
 const int SUBMIT_THROTTLE_TEST_PORT = 27818;
 const int SUBMIT_REBIND_TIMER_PORT = 27819;
+const int SUBMIT_CONCURRENT_TEST_PORT = 27820;
+const int SUBMIT_STALL_TEST_PORT = 27821;
 
 // Cleanup state for the after: hooks (the house pattern - see data_sm_test.bal for why
 // @test:AfterEach is unusable). A listener leaked by a failed assertion would otherwise
@@ -198,6 +200,37 @@ isolated service class OnErrorSubmittingService {
                 lock {
                     submitTestDispatches += 0; // outcome irrelevant; must simply not panic
                 }
+            }
+        }
+    }
+}
+
+isolated map<string> concurrentReplies = {};
+
+isolated function recordedReplyCount() returns int {
+    lock {
+        return concurrentReplies.length();
+    }
+}
+
+isolated function recordedReplyId(string text) returns string? {
+    lock {
+        return concurrentReplies[text];
+    }
+}
+
+// Each dispatch replies inline with text derived from the inbound message and records
+// the id ITS submit returned - the correlation the concurrency test pins.
+isolated service class CorrelatingReplyService {
+    *Service;
+
+    remote isolated function onDeliverSm(Sms sms, Caller caller) returns error? {
+        string replyText = string `re:${sms.shortMessage}`;
+        SubmitResult|Error r = caller->submit({destAddr: "264811234567", shortMessage: replyText});
+        if r is SubmitResult {
+            string id = r.messageId;
+            lock {
+                concurrentReplies[replyText] = id;
             }
         }
     }
@@ -666,6 +699,92 @@ function testSubmitTimerReappliedOnRebind() returns error? {
     test:assertTrue(postRebind !is (),
             "a 3s-delayed submit must succeed on the REBOUND session - the configured "
             + "transactionTimeout must be re-applied, not jsmpp's or the housekeeping default");
+    mockSmscSetSubmitDelay(mockId, 0);
+    check smsListener.gracefulStop();
+    mockSmscClose(mockId);
+    submitTestListener = ();
+    submitTestMockId = -1;
+}
+
+@test:Config {after: cleanupSubmitTest, groups: ["submit"]}
+function testConcurrentSubmitsCorrelateAndKeepaliveAnswered() returns error? {
+    // N concurrent SYNC handlers each blocked ~500ms in submit; every handler must get
+    // the id for ITS OWN text (jsmpp correlates by sequence_number - this is the
+    // regression guard for that machinery and for the pool reserve that keeps responses
+    // flowing while all dispatch permits are held). recordedErrorCount()==0 doubles as
+    // the keepalive assertion: a missed enquire_link would drop the link mid-test.
+    lock {
+        concurrentReplies = {};
+    }
+    clearCapturedCaller();
+    clearRecordedErrors();
+    int mockId = check mockSmscOpen(SUBMIT_CONCURRENT_TEST_PORT);
+    submitTestMockId = mockId;
+    Listener smsListener = check new ({
+        host: "localhost",
+        port: SUBMIT_CONCURRENT_TEST_PORT,
+        systemId: "test",
+        password: "test",
+        bindType: TRANSCEIVER,
+        maxConcurrentDispatch: 4
+    });
+    submitTestListener = smsListener;
+    check smsListener.attach(new CorrelatingReplyService());
+    check smsListener.'start();
+    int conn = check mockSmscAwaitNextBind(mockId, 5000);
+    check mockSmscSetTransactionTimer(mockId, conn, 15000);
+    mockSmscSetSubmitDelay(mockId, 500);
+    future<error?>[] sends = [];
+    foreach int i in 1 ... 4 {
+        future<error?> f = start mockSmscSendDeliverSm(mockId, conn, string `msg${i}`, "", 0);
+        sends.push(f);
+    }
+    foreach var f in sends {
+        error? outcome = wait f;
+        test:assertTrue(outcome is (), outcome is error ? (<error>outcome).message() : "");
+    }
+    test:assertEquals(recordedReplyCount(), 4, "every concurrent handler must complete its reply");
+    mockSmscSetSubmitDelay(mockId, 0);
+    // Correlation: drain the four captures; each captured reply's minted id must equal
+    // the id the handler that SENT that text received back.
+    foreach int i in 1 ... 4 {
+        int captured = check mockSmscAwaitNextSubmit(mockId, conn, 5000);
+        string text = mockSmscSubmitShortMessage(captured);
+        test:assertEquals(recordedReplyId(text), mockSmscSubmitMessageId(captured),
+                string `handler for '${text}' must hold the id minted for its own capture`);
+    }
+    test:assertEquals(recordedErrorCount(), 0, "no drops, no keepalive failures");
+    check smsListener.gracefulStop();
+    mockSmscClose(mockId);
+    submitTestListener = ();
+    submitTestMockId = -1;
+}
+
+isolated function submitBlocker(Caller caller) returns SubmitResult|Error {
+    return caller->submit({destAddr: "264811234567", shortMessage: "blocker"});
+}
+
+@test:Config {after: cleanupSubmitTest, groups: ["submit"]}
+function testSubmitDoesNotStallUnrelatedStrands() returns error? {
+    // Pins the strand-isolation fix (remediation wave 1): an isolated service's handler
+    // blocked ~3s inside submit must NOT hold the runtime's process-wide non-isolated
+    // lock - unrelated work must make progress while it waits.
+    var [mockId, conn, smsListener] = check startCapturingListener(
+            SUBMIT_STALL_TEST_PORT, new CallerCapturingService());
+    Caller caller = <Caller>capturedCaller();
+    check mockSmscSetTransactionTimer(mockId, conn, 15000);
+    mockSmscSetSubmitDelay(mockId, 3000);
+    future<SubmitResult|Error> blocked = start submitBlocker(caller);
+    decimal t0 = time:monotonicNow();
+    int progress = 0;
+    while time:monotonicNow() - t0 < 1.0d {
+        progress += 1;
+        runtime:sleep(0.05);
+    }
+    test:assertTrue(progress >= 10,
+            string `unrelated strand made only ${progress} iterations in 1s - a blocked submit is stalling the program`);
+    SubmitResult|Error blockedResult = wait blocked;
+    test:assertTrue(blockedResult is SubmitResult, "the blocked submit itself must still succeed");
     mockSmscSetSubmitDelay(mockId, 0);
     check smsListener.gracefulStop();
     mockSmscClose(mockId);

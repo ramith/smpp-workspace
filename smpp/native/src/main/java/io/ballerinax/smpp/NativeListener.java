@@ -80,6 +80,25 @@ public final class NativeListener {
 
     private NativeListener() {}
 
+    /**
+     * jsmpp PDU-processor pool sizing. Extracted (and JUnit-pinned: SYNC degree must
+     * STRICTLY exceed maxConcurrentDispatch) because the reserve became load-bearing for
+     * more than keepalives in Sprint 8: EVERY inbound PDU rides this pool - including
+     * {@code submit_sm_resp}. A SYNC handler blocked inside {@code Caller.submit}
+     * occupies one pool thread while its own completion depends on ANOTHER pool thread
+     * delivering the response; with no reserve, N blocked submitting handlers deadlock
+     * until transactionTimeout. The reserve is therefore a liveness requirement for the
+     * submit path, not just an enquire_link nicety. KEEPALIVE_RESERVE_THREADS is
+     * compiler-inlined, so no automated mutation test is possible - the manual check is:
+     * set it to 0, run testConcurrentSubmitsCorrelateAndKeepaliveAnswered, and expect N
+     * simultaneous TIMEOUT_DELIVERY_UNKNOWNs at transactionTimeout (a louder signature
+     * than the missed keepalive).
+     */
+    static int pduProcessorDegree(boolean async, int maxConcurrentDispatch) {
+        return async ? ASYNC_PDU_PROCESSOR_DEGREE
+                     : maxConcurrentDispatch + KEEPALIVE_RESERVE_THREADS;
+    }
+
     public static Object initListener(Environment env, BObject listener, BMap<BString, Object> config,
             Object tls) {
         listener.addNativeData(NATIVE_CONFIG, config);
@@ -229,9 +248,7 @@ public final class NativeListener {
         //  - ASYNC: handlers run on virtual threads, so pool threads only marshal each PDU
         //    and spawn - they never block. A small fixed pool is plenty and avoids spinning
         //    maxConcurrentDispatch *platform* threads that would only spawn vthreads.
-        int pduProcessorDegree = async
-                ? ASYNC_PDU_PROCESSOR_DEGREE
-                : maxConcurrentDispatch + KEEPALIVE_RESERVE_THREADS;
+        int pduProcessorDegree = pduProcessorDegree(async, maxConcurrentDispatch);
         session.setPduProcessorDegree(pduProcessorDegree);
 
         // Connector's own keepalive/idle-probe interval and socket read timeout (seconds ->
