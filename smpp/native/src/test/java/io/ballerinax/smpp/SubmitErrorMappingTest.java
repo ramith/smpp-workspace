@@ -90,6 +90,31 @@ class SubmitErrorMappingTest {
     }
 
     @Test
+    void selfClosedRemapsResponseTimeoutToLinkDownOnly() {
+        // H4/FD3: a submit parked in waitDone() is not woken by a connector-initiated
+        // close (jsmpp has no fail-pending-on-close); it runs the full transactionTimeout
+        // and, without the marker, would masquerade as an SMSC timeout whose docs point
+        // at delivery receipts that can never arrive on a stopped listener.
+        NativeCaller.MappedFailure f = NativeCaller.mapSubmitFailure(
+                new ResponseTimeoutException("no resp in 2000ms"), true);
+        assertEquals("LINK_DOWN", f.failureMode);
+        assertTrue(f.possiblySubmitted, "it WAS written; a retry may duplicate");
+        assertTrue(f.message.contains("closed the session"), f.message);
+        assertTrue(f.message.contains("retrying may duplicate"), f.message);
+        // Without the marker, the honest SMSC-timeout verdict is unchanged.
+        assertEquals("TIMEOUT_DELIVERY_UNKNOWN", NativeCaller.mapSubmitFailure(
+                new ResponseTimeoutException("t"), false).failureMode);
+        // The marker must not leak into ANY other branch: a rejection observed during a
+        // stop is still a rejection, an IO failure is LINK_DOWN either way.
+        assertEquals("REJECTED", NativeCaller.mapSubmitFailure(
+                new NegativeResponseException(0x58), true).failureMode);
+        assertEquals("LINK_DOWN", NativeCaller.mapSubmitFailure(
+                new IOException("pipe"), true).failureMode);
+        assertEquals("INVALID_REQUEST", NativeCaller.mapSubmitFailure(
+                new NativeCaller.InvalidRequest("x"), true).failureMode);
+    }
+
+    @Test
     void possiblySubmittedPartitionsByDuplicateRisk() {
         // The semantics are "can a retry duplicate?", NOT "did it reach the wire"
         // (design-review FINDING-6). REJECTED is the subtle row: the PDU WAS written,

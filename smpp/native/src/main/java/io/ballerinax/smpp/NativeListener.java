@@ -47,6 +47,7 @@ public final class NativeListener {
     private static final String NATIVE_SUBMITS_IN_FLIGHT = "smpp.submitsInFlight";
     private static final String NATIVE_REBIND_ABANDONED = "smpp.rebindAbandoned";
     private static final String NATIVE_OBSERVED_CONN = "smpp.observedConn";
+    private static final String NATIVE_SELF_CLOSED = "smpp.selfClosed";
 
     private static final java.util.logging.Logger LOGGER =
             java.util.logging.Logger.getLogger(NativeListener.class.getName());
@@ -167,6 +168,13 @@ public final class NativeListener {
         AtomicBoolean rebindAbandoned = new AtomicBoolean(false);
         caller.addNativeData(NativeCaller.REBIND_ABANDONED, rebindAbandoned);
         listener.addNativeData(NATIVE_REBIND_ABANDONED, rebindAbandoned);
+        // "This connector closed the session" marker (H4/FD3): set by stop() and by the
+        // wedge-declaration reclaim, cleared at install. The submit path consults it in
+        // the response-timeout branch only, to remap a parked submit's masquerading
+        // TIMEOUT_DELIVERY_UNKNOWN into an honest LINK_DOWN.
+        AtomicBoolean selfClosed = new AtomicBoolean(false);
+        caller.addNativeData(NativeCaller.SELF_CLOSED, selfClosed);
+        listener.addNativeData(NATIVE_SELF_CLOSED, selfClosed);
         listener.addNativeData(NATIVE_DISPATCHER,
                 new Dispatcher(env.getRuntime(), maxConcurrentDispatch, decodeGsm7, caller));
         listener.addNativeData(NATIVE_STATE, stateRef);
@@ -360,6 +368,7 @@ public final class NativeListener {
                 observedConn(listener).set(attemptConn.get());
                 sessionUsable(listener).set(true);
                 rebindAbandoned(listener).set(false);
+                selfClosed(listener).set(false);
                 installed.set(true);
                 state(listener).set(ListenerState.STARTED);
                 // Bound-race check: if the session died in the sliver between
@@ -446,6 +455,10 @@ public final class NativeListener {
         return (AtomicBoolean) listener.getNativeData(NATIVE_REBIND_ABANDONED);
     }
 
+    private static AtomicBoolean selfClosed(BObject listener) {
+        return (AtomicBoolean) listener.getNativeData(NATIVE_SELF_CLOSED);
+    }
+
     private static java.util.concurrent.atomic.AtomicInteger submitsInFlight(BObject listener) {
         return (java.util.concurrent.atomic.AtomicInteger) listener.getNativeData(NATIVE_SUBMITS_IN_FLIGHT);
     }
@@ -514,6 +527,12 @@ public final class NativeListener {
                         // runs fine on this rebind-executor thread, outside the monitor),
                         // THEN close() on a throwaway daemon thread (can park in jsmpp's
                         // untimed join at worst - a thread we are willing to lose).
+                        // Same marker as stop(): a submit parked on THIS dying session
+                        // reports "connector closed it", not an SMSC timeout. A racing
+                        // rebind that installs a fresh session clears it again - and a
+                        // submit that lands on the fresh session never times out on
+                        // this one, so the clear cannot mislabel anything.
+                        selfClosed(listener).set(true);
                         if (conn != null) {
                             conn.forceClose();
                         }
@@ -642,6 +661,10 @@ public final class NativeListener {
         // depend on it, and the whole increment-before-check reservation argument on the
         // submit side is ordered against it.
         sessionUsable(listener).set(false);
+        // BEFORE closeSession: a submit parked awaiting its response when the close
+        // lands must observe this at failure time and report LINK_DOWN, not a
+        // masquerading SMSC timeout (H4/FD3).
+        selfClosed(listener).set(true);
         if (graceful) {
             // Post-flip sweep (Phase 5 finding #2): a submit that incremented before the
             // flip may still be in flight; with increment-before-check on the submit

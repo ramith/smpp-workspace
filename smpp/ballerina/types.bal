@@ -111,9 +111,17 @@ public type ConnectionConfig record {|
     # seconds. The drain covers dispatches to the attached service AND in-flight
     # `Caller.submit` calls (including from non-handler code holding a `Caller`); submits
     # stay legal for the whole drain window - a reply-style service's in-flight replies
-    # complete rather than being dropped on shutdown. `immediateStop` does not wait at
-    # all: a parked submit then surfaces `LINK_DOWN` when the socket closes under it.
-    # Must not be negative (validated at `Listener` init).
+    # complete rather than being dropped on shutdown. After the drain, `gracefulStop`
+    # also runs a ≤2s reservation sweep (correctness, not grace: it closes the race with
+    # a submit that reserved its slot just before the cutoff) - so `0` here means "no
+    # drain wait", with the sweep still applying. `immediateStop` skips both. Either
+    # stop's unbind/close is itself bounded (~4s worst case) by a force-close watchdog,
+    # even against an unresponsive peer. One caveat for both flavours: a submit already
+    # awaiting its `submit_sm_resp` when the close lands is NOT woken (the underlying
+    # library has no fail-pending-on-close) - mid-write it fails immediately with
+    # `LINK_DOWN`, but once parked it completes only at `transactionTimeout`, with
+    # `LINK_DOWN` and `possiblySubmitted: true`, so a submitting strand can outlive the
+    # stop by up to that long. Must not be negative (validated at `Listener` init).
     decimal gracefulStopTimeout = 30;
     # Controls automatic rebinding after an unexpected session drop. Defaults to retrying
     # indefinitely with exponential backoff; set `maxRebindAttempts: 0` to disable.
@@ -145,9 +153,14 @@ public type ConnectionConfig record {|
     # separately at a short internal timer (~2s, jsmpp's own historical default for
     # exactly those paths), so raising this value does NOT slow stops or dead-link
     # detection. (jsmpp itself has one shared timer; the connector splits it — see
-    # `ConnectorSession` in the native layer.) Worst-case `gracefulStop` latency is
-    # therefore ≈ `gracefulStopTimeout` + 2s, and silent-peer detection stays ≈
-    # `enquireLinkInterval` + 2s, regardless of this setting.
+    # `ConnectorSession` in the native layer — and additionally bounds the whole close
+    # choreography with a ~4s force-close watchdog, because the unbind write itself is
+    # untimed against a pathological peer.) Worst-case `gracefulStop` ≈
+    # `gracefulStopTimeout` + ~2s (sweep) + ~4s (bounded close); `immediateStop` ≈ ~4s;
+    # silent-peer detection stays ≈ `enquireLinkInterval` + 2s, regardless of this
+    # setting. The one exception: a submit already awaiting its response when a stop
+    # closes the session completes only at THIS timeout (with `LINK_DOWN`,
+    # `possiblySubmitted: true`) — the single place this value can stretch past a stop.
     #
     # The default is 30s rather than jsmpp's own 2s. Two seconds is too short for a
     # `submit_sm` under load, and a timed-out submit is the worst outcome the send path

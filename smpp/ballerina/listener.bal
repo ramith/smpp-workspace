@@ -66,18 +66,25 @@ public isolated class Listener {
     } external;
 
     # Cancels any pending rebind attempt, waits up to `ConnectionConfig.gracefulStopTimeout`
-    # for in-flight dispatches (including `onError` notifications) to finish, then unbinds
-    # and closes the SMSC session. Idempotent: stopping an already-stopped (or
-    # never-started) listener is a no-op. A stopped listener cannot be restarted.
+    # for in-flight dispatches (including `onError` notifications) and submits to finish,
+    # runs a ≤2s reservation sweep, then unbinds and closes the SMSC session — the
+    # unbind/close bounded at ~4s worst case by a force-close watchdog, even against an
+    # unresponsive peer. Whole-call worst case ≈ `gracefulStopTimeout` + ~2s + ~4s.
+    # Idempotent: stopping an already-stopped (or never-started) listener is a no-op.
+    # A stopped listener cannot be restarted.
     public isolated function gracefulStop() returns error? = @java:Method {
         'class: "io.ballerinax.smpp.NativeListener",
         name: "gracefulStop"
     } external;
 
     # Cancels any pending rebind attempt and immediately unbinds and closes the SMSC
-    # session, without waiting for in-flight dispatches to finish. Idempotent: stopping
-    # an already-stopped (or never-started) listener is a no-op. A stopped listener
-    # cannot be restarted.
+    # session, without waiting for in-flight dispatches or submits (no drain, no sweep);
+    # the unbind/close is bounded at ~4s worst case by a force-close watchdog. An
+    # in-flight submit is NOT woken by the close: mid-write it fails immediately with
+    # `LINK_DOWN`; already awaiting its `submit_sm_resp`, it completes only at
+    # `transactionTimeout`, with `LINK_DOWN` and `possiblySubmitted: true`. Idempotent:
+    # stopping an already-stopped (or never-started) listener is a no-op. A stopped
+    # listener cannot be restarted.
     public isolated function immediateStop() returns error? = @java:Method {
         'class: "io.ballerinax.smpp.NativeListener",
         name: "immediateStop"

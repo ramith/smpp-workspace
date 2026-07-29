@@ -75,6 +75,7 @@ public final class NativeCaller {
     static final String SESSION_USABLE = "smpp.caller.sessionUsable";
     static final String SUBMITS_IN_FLIGHT = "smpp.caller.submitsInFlight";
     static final String REBIND_ABANDONED = "smpp.caller.rebindAbandoned";
+    static final String SELF_CLOSED = "smpp.caller.selfClosed";
 
     private NativeCaller() {}
 
@@ -324,6 +325,21 @@ public final class NativeCaller {
      * checked branch of their own (D3).
      */
     static MappedFailure mapSubmitFailure(Throwable t) {
+        return mapSubmitFailure(t, false);
+    }
+
+    /**
+     * @param selfClosed whether THIS CONNECTOR closed the session (a stop, or the
+     *     reclaim of an abandoned dead link) — consulted ONLY in the response-timeout
+     *     branch. jsmpp has no fail-pending-on-close: a submit already parked awaiting
+     *     its {@code submit_sm_resp} is not woken when the socket closes under it, runs
+     *     its full {@code transactionTimeout}, and would otherwise masquerade as an SMSC
+     *     timeout — whose docs point the operator at delivery receipts that can never
+     *     arrive on a stopped listener (H4). Keyed off an explicit connector-set marker,
+     *     NEVER off {@code sessionUsable}: that flag also flips on genuine drops, where
+     *     TIMEOUT_DELIVERY_UNKNOWN is the truthful verdict.
+     */
+    static MappedFailure mapSubmitFailure(Throwable t, boolean selfClosed) {
         String msg = t.getMessage() != null ? t.getMessage() : t.getClass().getSimpleName();
         if (t instanceof InvalidRequest) {
             // Local refusal: provably never wrote.
@@ -341,6 +357,15 @@ public final class NativeCaller {
                     e.getCommandStatus(), false);
         }
         if (t instanceof ResponseTimeoutException) {
+            if (selfClosed) {
+                // Names the connector's own close, not a network fault or SMSC
+                // slowness - and not "stop" alone, because the abandoned-dead-link
+                // reclaim sets the same marker (design-review FD3 change 1).
+                return new MappedFailure("this connector closed the session (a stop, or the "
+                        + "reclaim of a dead link) while the submit was awaiting its response: "
+                        + msg + " (the SMSC may have accepted the message before the close - "
+                        + "retrying may duplicate it)", "LINK_DOWN", null, true);
+            }
             return new MappedFailure("no submit_sm_resp within transactionTimeout: " + msg
                     + " (the SMSC may still have accepted the message - retrying may duplicate it)",
                     "TIMEOUT_DELIVERY_UNKNOWN", null, true);
@@ -477,7 +502,11 @@ public final class NativeCaller {
             // Exception, not Throwable: every failure D3 named is an Exception, and a
             // VirtualMachineError must panic, not become a returned smpp:Error. specFrom
             // is inside this net too, so a malformed BMap cannot panic across interop.
-            MappedFailure f = mapSubmitFailure(e);
+            // The selfClosed marker is read AT FAILURE TIME, deliberately: a stop that
+            // raced in while this submit was parked is exactly what it must observe.
+            java.util.concurrent.atomic.AtomicBoolean selfClosed =
+                    (java.util.concurrent.atomic.AtomicBoolean) caller.getNativeData(SELF_CLOSED);
+            MappedFailure f = mapSubmitFailure(e, selfClosed.get());
             return detailError(f.message, f.failureMode, f.commandStatus, f.possiblySubmitted);
         } finally {
             // The one decrement, on every path incl. throws - a leaked count would make
