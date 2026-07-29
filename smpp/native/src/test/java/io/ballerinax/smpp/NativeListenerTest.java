@@ -68,6 +68,31 @@ class NativeListenerTest {
         assertEquals("systemType exceeds the maximum length of 12 characters", e.getMessage());
     }
 
+    // ---- ASCII gate (stage-2 finding H2): jsmpp counts these fields in UTF-16 code
+    // units but writes them via String.getBytes() in the platform default charset, so a
+    // single non-ASCII character overflows the C-octet field on the wire - and the
+    // operator would only see a bare "failed to connect/bind" with no hint. ----
+
+    @Test
+    void validateCredentials_nonAsciiPassword_throwsNamingFieldAndIndexOnly() {
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class, () ->
+                NativeListener.validateCredentials(VALID_SYSTEM_ID, "pässword", VALID_SYSTEM_TYPE));
+        assertEquals("password contains a non-ASCII character at index 1; "
+                + "SMPP C-octet fields must be ASCII", e.getMessage());
+        assert !e.getMessage().contains("ä");
+    }
+
+    @Test
+    void validateCredentials_nonAsciiCheckedBeforeLength() {
+        // 16-char systemId with an accent: the ASCII violation is the real problem
+        // (the length arithmetic is only exact FOR ascii), so it must be named first.
+        String tooLongAndNonAscii = "é".repeat(16);
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class, () ->
+                NativeListener.validateCredentials(tooLongAndNonAscii, VALID_PASSWORD, VALID_SYSTEM_TYPE));
+        assertEquals("systemId contains a non-ASCII character at index 0; "
+                + "SMPP C-octet fields must be ASCII", e.getMessage());
+    }
+
     @Test
     void validateCredentials_checksSystemIdBeforePasswordBeforeSystemType() {
         // All three invalid at once: systemId's violation should be reported first, since

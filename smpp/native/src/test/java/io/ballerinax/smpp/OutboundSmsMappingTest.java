@@ -244,6 +244,44 @@ class OutboundSmsMappingTest {
     }
 
     @Test
+    void nonAsciiAddressFieldsRejectedNamingIndexNotValue() {
+        // jsmpp counts address/C-octet fields in UTF-16 code units (StringValidator uses
+        // value.length()) but WRITES them with String.getBytes() in the platform default
+        // charset (PDUByteBuffer.append(String)) - so a non-ASCII sender ID passes both
+        // validators and overflows the field on the wire, with bytes that vary by
+        // -Dfile.encoding (stage-2 finding H2). ASCII-only makes the length checks exact.
+        NativeCaller.SubmitSpec dest = minimalText();
+        dest.destAddr = "2648É1234";
+        NativeCaller.InvalidRequest e1 =
+                assertThrows(NativeCaller.InvalidRequest.class, () -> NativeCaller.compose(dest));
+        assertTrue(e1.getMessage().contains("destAddr"), e1.getMessage());
+        assertTrue(e1.getMessage().contains("index 4"), e1.getMessage());
+        assertTrue(!e1.getMessage().contains("É"), "must not echo the value");
+
+        // The exposure the docs actively recommend: an alphanumeric sender ID.
+        NativeCaller.SubmitSpec src = minimalText();
+        src.sourceAddr = "Café";
+        src.sourceTon = "TON_ALPHANUMERIC";
+        NativeCaller.InvalidRequest e2 =
+                assertThrows(NativeCaller.InvalidRequest.class, () -> NativeCaller.compose(src));
+        assertTrue(e2.getMessage().contains("sourceAddr"), e2.getMessage());
+        assertTrue(e2.getMessage().contains("index 3"), e2.getMessage());
+
+        // Cyrillic Т in serviceType - visually identical to ASCII T, wire-different.
+        NativeCaller.SubmitSpec svc = minimalText();
+        svc.serviceType = "CMТ";
+        NativeCaller.InvalidRequest e3 =
+                assertThrows(NativeCaller.InvalidRequest.class, () -> NativeCaller.compose(svc));
+        assertTrue(e3.getMessage().contains("serviceType"), e3.getMessage());
+
+        // ASCII alphanumeric sender IDs stay legal - the restriction is charset, not shape.
+        NativeCaller.SubmitSpec ok = minimalText();
+        ok.sourceAddr = "INFO";
+        ok.sourceTon = "TON_ALPHANUMERIC";
+        assertEquals("INFO", assertDoesNotThrowCompose(ok).srcAddr);
+    }
+
+    @Test
     void dataCodingOutOfRangeRejected() {
         NativeCaller.SubmitSpec spec = new NativeCaller.SubmitSpec();
         spec.destAddr = "264811234567";

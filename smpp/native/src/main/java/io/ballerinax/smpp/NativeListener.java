@@ -290,6 +290,12 @@ public final class NativeListener {
             }
         });
 
+        // addressRange stays null, deliberately. jsmpp's connectAndBind has exactly one
+        // failure branch that does NOT close the socket - the PDUException catch
+        // (SMPPSession.java:284-286) rethrows as IOException while leaving the socket
+        // open and the started PDUReaderWorker running (per-attempt FD + thread leak).
+        // validateCredentials makes that branch unreachable for systemId/password/
+        // systemType; a non-null addressRange would reopen it (stage-2 review, N6).
         session.connectAndBind(host, port, bindType, systemId, password, systemType,
                 TypeOfNumber.UNKNOWN, NumberingPlanIndicator.UNKNOWN, null, bindTimeoutMillis);
 
@@ -346,6 +352,15 @@ public final class NativeListener {
     // package-private (not private): exercised directly by NativeListenerTest, a pure-logic
     // JUnit suite that needs no jsmpp session or Ballerina runtime.
     static void validateCredentials(String systemId, String password, String systemType) {
+        // ASCII first, then length. jsmpp counts these fields in UTF-16 code units but
+        // writes them with String.getBytes() in the JVM default charset (PDUByteBuffer),
+        // so a single non-ASCII character silently overflows the C-octet field on the
+        // wire - and the bind failure would surface as a bare "failed to connect/bind"
+        // with no hint (stage-2 code review, H2). ASCII-only makes the length checks
+        // exact. Message names the field and index, never the value - it's a credential.
+        requireAscii("systemId", systemId);
+        requireAscii("password", password);
+        requireAscii("systemType", systemType);
         if (systemId.length() > MAX_SYSTEM_ID_LENGTH) {
             throw new IllegalArgumentException(
                     "systemId exceeds the maximum length of " + MAX_SYSTEM_ID_LENGTH + " characters");
@@ -357,6 +372,15 @@ public final class NativeListener {
         if (systemType.length() > MAX_SYSTEM_TYPE_LENGTH) {
             throw new IllegalArgumentException(
                     "systemType exceeds the maximum length of " + MAX_SYSTEM_TYPE_LENGTH + " characters");
+        }
+    }
+
+    private static void requireAscii(String field, String value) {
+        for (int i = 0; i < value.length(); i++) {
+            if (value.charAt(i) > 0x7F) {
+                throw new IllegalArgumentException(field + " contains a non-ASCII character at index "
+                        + i + "; SMPP C-octet fields must be ASCII");
+            }
         }
     }
 

@@ -189,10 +189,12 @@ public final class NativeCaller {
 
         // --- addresses ---
         req.dstAddr = required(spec.destAddr, "destAddr");
+        checkAscii("destAddr", req.dstAddr);
         checkLength("destAddr", req.dstAddr, StringParameter.DESTINATION_ADDR);
         req.dstTon = ton(spec.destTon, "destAddr.ton");
         req.dstNpi = npi(spec.destNpi, "destAddr.npi");
         req.srcAddr = spec.sourceAddr == null ? "" : spec.sourceAddr;
+        checkAscii("sourceAddr", req.srcAddr);
         checkLength("sourceAddr", req.srcAddr, StringParameter.SOURCE_ADDR);
         if (req.srcAddr.isEmpty()) {
             // SMPP v3.4 section 4.4.1: a NULL source address and its TON/NPI move
@@ -208,6 +210,7 @@ public final class NativeCaller {
 
         // --- the rest ---
         req.serviceType = spec.serviceType == null ? "" : spec.serviceType;
+        checkAscii("serviceType", req.serviceType);
         checkLength("serviceType", req.serviceType, StringParameter.SERVICE_TYPE);
         req.validityPeriod = spec.validityPeriod;
         if (req.validityPeriod != null) {
@@ -551,9 +554,33 @@ public final class NativeCaller {
     }
 
     /**
+     * Rejects any character above 0x7F in an address/C-octet field. jsmpp validates
+     * these fields in UTF-16 code units ({@code StringValidator} counts
+     * {@code value.length()}) but WRITES them with {@code String.getBytes()} in the JVM
+     * default charset ({@code PDUByteBuffer.append(String)}) — so a non-ASCII character
+     * ships more octets than either validator counted, silently overflowing the field
+     * on the wire, and the emitted bytes change with {@code -Dfile.encoding}
+     * (stage-2 code review, H2). Restricting these fields to ASCII makes code-unit
+     * count == octet count true by construction on every ASCII-transparent platform
+     * charset, which is what makes {@link #checkLength} exact rather than accidental.
+     * Runs BEFORE the length check so the diagnostic names the real problem. Names the
+     * field and the index, never the value (MSISDNs/sender IDs).
+     */
+    static void checkAscii(String field, String value) throws InvalidRequest {
+        for (int i = 0; i < value.length(); i++) {
+            if (value.charAt(i) > 0x7F) {
+                throw new InvalidRequest(field + " contains a non-ASCII character at index " + i
+                        + "; SMPP address and C-octet fields must be ASCII");
+            }
+        }
+    }
+
+    /**
      * jsmpp's limit for the parameter, adjusted for the C-octet asymmetry: a C-octet
      * string's max INCLUDES the terminating NUL (its validator rejects
      * {@code length >= max}), an octet string's does not (rejects {@code > max}).
+     * Exact only because {@link #checkAscii} runs first: for ASCII, UTF-16 code units
+     * and wire octets coincide.
      */
     static int maxLength(StringParameter p) {
         return p.getType() == StringType.C_OCTET_STRING ? p.getMax() - 1 : p.getMax();
