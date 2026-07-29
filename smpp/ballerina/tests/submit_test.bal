@@ -24,6 +24,7 @@ const int SUBMIT_CONCURRENT_TEST_PORT = 27820;
 const int SUBMIT_STALL_TEST_PORT = 27821;
 const int SUBMIT_LATE_RESP_PORT = 27822;
 const int SUBMIT_DUP_MT_PORT = 27823;
+const int SUBMIT_UDHI_TEST_PORT = 27824;
 
 // Cleanup state for the after: hooks (the house pattern - see data_sm_test.bal for why
 // @test:AfterEach is unusable). A listener leaked by a failed assertion would otherwise
@@ -371,6 +372,40 @@ function testSubmitHappyPathPinsWirePdu() returns error? {
     test:assertEquals(mockSmscSubmitServiceType(submit2), "CMT");
     test:assertEquals(r2.messageId, mockSmscSubmitMessageId(submit2));
     test:assertEquals(mockSmscPendingSubmitCount(mockId, conn), 0, "and no more submits");
+
+    check smsListener.gracefulStop();
+    mockSmscClose(mockId);
+}
+
+@test:Config {after: cleanupSubmitTest, groups: ["submit"]}
+function testUdhiBinarySubmitPinsEsmClassAtWire() returns error? {
+    var [mockId, conn, smsListener] = check startCapturingListener(
+            SUBMIT_UDHI_TEST_PORT, new CallerCapturingService());
+    Caller caller = <Caller>capturedCaller();
+
+    // A 6-octet concatenation UDH (05 00 03 ref total seq) + two payload octets,
+    // declared via BinarySms.udhi (D15). Without bit 6 the handset would render the
+    // header octets as visible garbage - the wire byte is the whole point here.
+    byte[] udhPayload = [0x05, 0x00, 0x03, 0x2A, 0x02, 0x01, 0x41, 0x42];
+    SubmitResult r = check caller->submit({
+        destAddr: "264811234567",
+        shortMessageBytes: udhPayload,
+        dataCoding: 0x00,
+        udhi: true
+    });
+    int submitUdh = check mockSmscAwaitNextSubmit(mockId, conn, 5000);
+    test:assertEquals(mockSmscSubmitEsmClass(submitUdh), 0x40,
+            "udhi must set exactly esm_class bit 6 at the wire (section 5.2.12)");
+    test:assertEquals(mockSmscSubmitShortMessageBytes(submitUdh), udhPayload,
+            "the UDH-bearing payload must pass verbatim");
+    test:assertEquals(mockSmscSubmitDataCoding(submitUdh), 0x00);
+    test:assertEquals(r.messageId, mockSmscSubmitMessageId(submitUdh));
+
+    // udhi is per-message, not sticky: a following default-path submit stays 0x00.
+    _ = check caller->submit({destAddr: "264811234567", shortMessage: "plain"});
+    int submitPlain = check mockSmscAwaitNextSubmit(mockId, conn, 5000);
+    test:assertEquals(mockSmscSubmitEsmClass(submitPlain), 0x00,
+            "default esm_class must remain 0x00 on the very next submit");
 
     check smsListener.gracefulStop();
     mockSmscClose(mockId);

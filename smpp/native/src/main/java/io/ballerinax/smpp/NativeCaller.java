@@ -89,10 +89,11 @@ public final class NativeCaller {
         String sourceAddr = "";
         String sourceTon = "TON_INTERNATIONAL";
         String sourceNpi = "NPI_ISDN";
-        String shortMessage;          // XOR shortMessageBytes
+        String shortMessage;          // XOR shortMessageBytes (TextSms vs BinarySms)
         String encoding = "LATIN1";   // ASCII | LATIN1 | UCS2
         byte[] shortMessageBytes;     // escape hatch; requires dataCoding
         Integer dataCoding;           // raw byte value, only with shortMessageBytes
+        boolean udhi;                 // esm_class bit 6; only with shortMessageBytes
         String registeredDelivery = "NONE";
         String serviceType = "";
         String validityPeriod;        // null = SMSC default
@@ -151,6 +152,9 @@ public final class NativeCaller {
         SubmitRequest req = new SubmitRequest();
 
         // --- body: exactly one of shortMessage / shortMessageBytes ---
+        // The TextSms|BinarySms union makes the wrong combinations unrepresentable from
+        // typed Ballerina code (R1 reshape); these checks are the native-side backstop,
+        // because the BMap crossing interop is untyped.
         boolean hasText = spec.shortMessage != null;
         boolean hasBytes = spec.shortMessageBytes != null;
         if (hasText == hasBytes) {
@@ -173,6 +177,11 @@ public final class NativeCaller {
                 throw new InvalidRequest("dataCoding is only for shortMessageBytes; with shortMessage "
                         + "the encoding field decides the data_coding");
             }
+            if (spec.udhi) {
+                throw new InvalidRequest("udhi requires shortMessageBytes (a BinarySms): the "
+                        + "connector encodes shortMessage itself and produces no UDH, so UDHI "
+                        + "would declare a header that does not exist");
+            }
             req.body = encode(spec.shortMessage, spec.encoding);
             req.dataCoding = switch (spec.encoding) {
                 case "ASCII" -> 0x01;
@@ -180,6 +189,14 @@ public final class NativeCaller {
                 case "UCS2" -> 0x08;
                 default -> throw new InvalidRequest("unknown encoding: " + spec.encoding);
             };
+        }
+        if (req.body.length == 0) {
+            // sm_length = 0 means "the payload is in the message_payload TLV" (section
+            // 5.2.21), which this connector never sets - a conforming SMSC answers
+            // ESME_RINVMSGLEN for what is really a local input error (L10). Mirrors
+            // required()'s stance on empty destAddr.
+            throw new InvalidRequest((hasBytes ? "shortMessageBytes" : "shortMessage")
+                    + " must not be empty");
         }
         int max = maxLength(StringParameter.SHORT_MESSAGE);
         if (req.body.length > max) {
@@ -234,9 +251,13 @@ public final class NativeCaller {
             case "ON_FAILURE_ONLY" -> 0x02;
             default -> throw new InvalidRequest("unknown registeredDelivery: " + spec.registeredDelivery);
         };
-        // Locked to plain point-to-point defaults. esm_class especially: a nonzero value
-        // is invisible in a happy-path test yet changes SMSC routing and billing.
-        req.esmClass = 0x00;
+        // Locked to plain point-to-point defaults, with ONE user-controlled exception:
+        // esm_class bit 6 (UDHI, 0x40) via BinarySms.udhi (D15) - section 5.2.12 requires
+        // it whenever the payload starts with a User Data Header, and without it the
+        // handset renders the header octets as visible garbage. Every other esm_class
+        // bit stays 0: the messaging-mode and message-type bits change SMSC routing and
+        // billing invisibly, and this connector has no machinery behind them.
+        req.esmClass = spec.udhi ? (byte) 0x40 : (byte) 0x00;
         req.protocolId = 0x00;
         req.priorityFlag = 0x00;
         req.scheduleDeliveryTime = null;
@@ -480,6 +501,8 @@ public final class NativeCaller {
             }
             spec.dataCoding = (int) dcLong;
         }
+        Object udhi = sms.get(StringUtils.fromString("udhi"));
+        spec.udhi = udhi instanceof Boolean b && b;
         spec.registeredDelivery = str(sms, "registeredDelivery", "NONE");
         spec.serviceType = str(sms, "serviceType", "");
         BString validity = sms.getStringValue(StringUtils.fromString("validityPeriod"));

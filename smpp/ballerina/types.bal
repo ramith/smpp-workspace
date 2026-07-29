@@ -258,8 +258,8 @@ public enum Npi {
 # Only the three schemes this connector also **decodes** precisely are offered. The GSM
 # 03.38 7-bit default alphabet (`data_coding 0x00`) is **not** available for sending: it
 # needs a packed-septet encoder, which jsmpp does not provide, and adding protocol logic
-# jsmpp lacks is outside this connector's remit. Use `OutboundSms.shortMessageBytes` with
-# an explicit `dataCoding` if you need to put such a payload on the wire yourself.
+# jsmpp lacks is outside this connector's remit. Use a `BinarySms` with an explicit
+# `dataCoding` if you need to put such a payload on the wire yourself.
 public enum Encoding {
     # IA5/ASCII — `data_coding 0x01`. 7-bit US-ASCII only; anything else is rejected.
     ASCII,
@@ -288,34 +288,21 @@ public enum DeliveryReceiptRequest {
     ON_FAILURE_ONLY
 }
 
-# A message to submit to the SMSC (`submit_sm`).
-#
-# Exactly one of `shortMessage` or `shortMessageBytes` must be set. They are mutually
-# exclusive rather than layered because SMPP has no way to carry both, and silently
-# preferring one would hide a caller's mistake.
-public type OutboundSms record {|
-    # Recipient. A plain `string` is shorthand for an international ISDN address.
+# Fields shared by every outbound message shape. Not used directly — submit takes an
+# `OutboundSms`, i.e. `TextSms` or `BinarySms`.
+public type OutboundBase record {|
+    # Recipient. A plain `string` is shorthand for an international ISDN address. ASCII
+    # only: SMPP address fields are octet-counted C-octet strings, and this connector
+    # rejects anything a platform charset could inflate on the wire.
     string|Address destAddr;
     # Sender. Omitted means `ConnectionConfig.sourceAddr`, which is the usual arrangement:
-    # the short code is a property of the binding, not of each message.
+    # the short code is a property of the binding, not of each message. ASCII only (see
+    # `destAddr`) — this includes `TON_ALPHANUMERIC` sender IDs.
     string|Address sourceAddr?;
-    # The message text, encoded per `encoding`. Mutually exclusive with
-    # `shortMessageBytes`.
-    string shortMessage?;
-    # How to encode `shortMessage`. Ignored when `shortMessageBytes` is used, since those
-    # octets are already encoded.
-    Encoding encoding = LATIN1;
-    # Pre-encoded payload, sent verbatim with `dataCoding`. The escape hatch for anything
-    # `Encoding` cannot express — packed GSM 7-bit above all. Requires `dataCoding`, and is
-    # mutually exclusive with `shortMessage`.
-    byte[] shortMessageBytes?;
-    # The raw `data_coding` byte accompanying `shortMessageBytes`. Required with it, and
-    # meaningless without it.
-    int dataCoding?;
     # Whether to ask the SMSC for a delivery receipt. A receipt arrives later at
     # `onDeliverSm` with `deliveryReceipt` set, not as part of the submit.
     DeliveryReceiptRequest registeredDelivery = NONE;
-    # SMPP `service_type`. Empty (the default) means the SMSC's default service.
+    # SMPP `service_type`. Empty (the default) means the SMSC's default service. ASCII only.
     string serviceType = "";
     # SMPP `validity_period`: how long the SMSC should keep trying. Omitted means the
     # SMSC's own default. When set, it must be EXACTLY 16 characters in the §7.1.1 time
@@ -324,6 +311,47 @@ public type OutboundSms record {|
     # locally before anything reaches the wire.
     string validityPeriod?;
 |};
+
+# A text message: the connector encodes `shortMessage` per `encoding` and stamps the
+# matching `data_coding` on the wire. This is the shape almost every service wants.
+public type TextSms record {|
+    *OutboundBase;
+    # The message text, encoded per `encoding`. Must not be empty: `sm_length = 0` means
+    # "payload is in the message_payload TLV" (§5.2.21), which this connector never sets,
+    # so an empty body is rejected locally instead of drawing `ESME_RINVMSGLEN`.
+    string shortMessage;
+    # How to encode `shortMessage`.
+    Encoding encoding = LATIN1;
+|};
+
+# A pre-encoded payload, sent verbatim: the escape hatch for anything `Encoding` cannot
+# express. The connector does not validate, split, or reassemble what you put in it.
+public type BinarySms record {|
+    *OutboundBase;
+    # The payload octets, sent verbatim. Must not be empty (see `TextSms.shortMessage`).
+    byte[] shortMessageBytes;
+    # The raw `data_coding` byte describing how `shortMessageBytes` is encoded (0-255).
+    # Required — the SMSC and handset can only interpret the payload through it.
+    int dataCoding;
+    # Sets the UDHI bit (`esm_class` bit 6, `0x40`): declares that `shortMessageBytes`
+    # STARTS with a User Data Header — required by §5.2.12 whenever a UDH is present
+    # (concatenation, WAP push, port addressing per 3GPP TS 23.040, where the first
+    # octet is the UDH length). The connector does not validate the UDH structure:
+    # setting `udhi` without a well-formed UDH at the front of the payload is a user
+    # error nothing here can detect, and leaving it `false` WITH a UDH makes the
+    # handset render the header octets as visible garbage text. Independent of
+    # `registeredDelivery` and of the receipt bits the SMSC sets on inbound messages.
+    boolean udhi = false;
+|};
+
+# A message to submit to the SMSC (`submit_sm`).
+#
+# A union rather than one record with optional fields: text and binary payloads have
+# different required fields (`encoding` belongs only to text, `dataCoding`/`udhi` only
+# to binary), and the union makes the wrong combinations unrepresentable at compile
+# time instead of runtime-rejected. In-line record literals pick their member by shape:
+# `{destAddr, shortMessage: "hi"}` is a `TextSms`.
+public type OutboundSms TextSms|BinarySms;
 
 # The outcome of a successful `submit`.
 #

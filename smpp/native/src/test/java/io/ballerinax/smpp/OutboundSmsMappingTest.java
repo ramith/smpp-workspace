@@ -42,9 +42,11 @@ class OutboundSmsMappingTest {
         assertArrayEquals("hello".getBytes(StandardCharsets.ISO_8859_1), req.body);
         assertEquals((byte) 0x00, req.registeredDelivery, "no receipt requested MUST be 0 - "
                 + "the negative is what catches an always-on bug");
-        // Point-to-point defaults, asserted on the composed byte.
-        assertEquals((byte) 0x00, req.esmClass, "esm_class must be 0x00: nonzero changes "
-                + "SMSC routing and billing invisibly");
+        // Point-to-point defaults, asserted on the composed byte. Since D15 this is a
+        // DEFAULT-PATH assertion, not an invariant: BinarySms.udhi legitimately sets
+        // bit 6 (see udhiSetsEsmClassBit6AndNothingElse). Every other bit stays locked.
+        assertEquals((byte) 0x00, req.esmClass, "default esm_class must be 0x00: nonzero "
+                + "changes SMSC routing and billing invisibly");
         assertEquals((byte) 0x00, req.protocolId);
         assertEquals((byte) 0x00, req.priorityFlag);
         assertEquals((byte) 0x00, req.replaceIfPresent);
@@ -98,6 +100,56 @@ class OutboundSmsMappingTest {
         NativeCaller.SubmitRequest req = NativeCaller.compose(spec);
         assertArrayEquals(new byte[] {0x01, 0x02, (byte) 0xFF}, req.body);
         assertEquals((byte) 0x00, req.dataCoding);
+    }
+
+    @Test
+    void udhiSetsEsmClassBit6AndNothingElse() throws Exception {
+        // D15: the one user-controlled esm_class bit. A 6-octet concatenation UDH
+        // (05 00 03 ref total seq) + one payload octet, declared via udhi.
+        NativeCaller.SubmitSpec spec = new NativeCaller.SubmitSpec();
+        spec.destAddr = "264811234567";
+        spec.shortMessageBytes = new byte[] {0x05, 0x00, 0x03, 0x2A, 0x02, 0x01, 0x41};
+        spec.dataCoding = 0x00;
+        spec.udhi = true;
+        NativeCaller.SubmitRequest req = NativeCaller.compose(spec);
+        assertEquals((byte) 0x40, req.esmClass, "udhi must set exactly bit 6");
+        // udhi does not leak into any sibling field.
+        assertEquals((byte) 0x00, req.registeredDelivery);
+        assertEquals((byte) 0x00, req.protocolId);
+        // Default stays 0x00 on the bytes path too.
+        spec.udhi = false;
+        assertEquals((byte) 0x00, NativeCaller.compose(spec).esmClass);
+    }
+
+    @Test
+    void udhiWithTextRejected() {
+        // Structurally impossible from typed Ballerina (TextSms has no udhi field);
+        // this pins the native backstop for the untyped interop BMap: the connector
+        // encodes shortMessage itself and produces no UDH, so UDHI would declare a
+        // header that does not exist - the same wrong-meaning class as M6, inverted.
+        NativeCaller.SubmitSpec spec = minimalText();
+        spec.udhi = true;
+        NativeCaller.InvalidRequest e =
+                assertThrows(NativeCaller.InvalidRequest.class, () -> NativeCaller.compose(spec));
+        assertTrue(e.getMessage().contains("udhi"), e.getMessage());
+    }
+
+    @Test
+    void emptyBodyRejectedOnBothArms() {
+        // L10: sm_length = 0 means "payload in message_payload" (section 5.2.21), which
+        // this connector never sets - reject locally instead of drawing ESME_RINVMSGLEN.
+        NativeCaller.SubmitSpec text = minimalText();
+        text.shortMessage = "";
+        NativeCaller.InvalidRequest e1 =
+                assertThrows(NativeCaller.InvalidRequest.class, () -> NativeCaller.compose(text));
+        assertTrue(e1.getMessage().contains("shortMessage"), e1.getMessage());
+        NativeCaller.SubmitSpec bytes = new NativeCaller.SubmitSpec();
+        bytes.destAddr = "264811234567";
+        bytes.shortMessageBytes = new byte[0];
+        bytes.dataCoding = 0x00;
+        NativeCaller.InvalidRequest e2 =
+                assertThrows(NativeCaller.InvalidRequest.class, () -> NativeCaller.compose(bytes));
+        assertTrue(e2.getMessage().contains("shortMessageBytes"), e2.getMessage());
     }
 
     @Test
