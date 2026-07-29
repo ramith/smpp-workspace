@@ -1,7 +1,7 @@
 # ramith/smpp examples
 
 Runnable examples for the [`ramith/smpp`](https://central.ballerina.io/ramith/smpp)
-listener connector. The connector is a **receive-only SMPP v3.4 trigger**: it binds
+listener connector, **pinned to `ramith/smpp:1.0.0`** (which was receive-only): it binds
 to an SMSC as an ESME (receiver/transceiver) and dispatches inbound PDUs — mobile-
 originated (MO) SMS and delivery receipts (DLRs) — to your service. There is no
 `submit_sm`/transmit API, so every example is about *receiving*.
@@ -49,6 +49,7 @@ The [mock SMSC](mock-smsc/) harness and its scenarios are documented in
 
 ## Note on `two-way-sms`
 
-Because the connector is receive-only, the two-way example can't send the reply
+Because these examples pin 1.0.0 (1.1.0's `Caller.submit` reaches them after the
+next Central publish, when this suite gets rewritten), the two-way example can't send the reply
 itself — it classifies each inbound message and logs the action a sending path
 (an HTTP call, a transmitter session, a queue) would take.

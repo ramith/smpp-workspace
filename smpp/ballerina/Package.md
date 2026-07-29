@@ -6,8 +6,11 @@ to the SMSC as an **ESME** in receiver or transceiver mode and dispatches each i
 message to your service, wrapping the Java library [`org.jsmpp:jsmpp`](https://jsmpp.org/)
 through Ballerina's Java interoperability.
 
-The connector speaks **SMPP v3.4** (it binds with `interface_version` `0x34`). It is
-receive-only by design: there is no `submit_sm`/transmit API.
+The connector speaks **SMPP v3.4** (it binds with `interface_version` `0x34`). As of
+1.1.0 it is **bidirectional**: a service may declare an `smpp:Caller` parameter and reply
+on the same session with `caller->submit(...)` (`submit_sm`), receiving the SMSC's
+`message_id` to correlate delivery receipts against (`Sms.receiptedMessageId`). Sending
+requires `bindType: TRANSCEIVER`; a `RECEIVER` bind stays receive-only.
 
 ## Quickstart
 
@@ -158,8 +161,10 @@ and `ESME_RTHROTTLED` (backpressure).
 
 Known limitations (raw fields are always surfaced so an application can handle these
 itself): concatenated/multipart messages are **not** reassembled — the `udhi` flag and
-`shortMessageBytes` are exposed instead; delivery-receipt bodies are delivered as-is
-(the receipt text is not parsed into typed fields); and packed GSM 7-bit is not decoded.
+`shortMessageBytes` are exposed instead; delivery receipts are parsed into
+`Sms.receipt` (typed, best-effort per Appendix B) with the raw body always preserved on
+`shortMessage`; and packed GSM 7-bit is neither decoded nor encoded — outbound text is
+ASCII/Latin-1/UCS-2, with `shortMessageBytes`+`dataCoding` as the raw escape hatch.
 
 The full design rationale, concurrency model, and lifecycle state machine are documented
 in `docs/architecture.md` in the source repository.

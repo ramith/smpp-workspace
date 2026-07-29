@@ -4,7 +4,9 @@ Inbound keyword handling for short-code / long-number campaigns: votes, competit
 ("text WIN to 12345"), HELP, and — most importantly — **STOP opt-outs**, which are
 legally mandated (TCPA in the US, GDPR/PECR in the EU).
 
-This connector is **receive-only**, so it cannot send the reply itself. The realistic
+This example pins `ramith/smpp:1.0.0`, which was **receive-only** — as of 1.1.0 the
+connector can reply via `smpp:Caller` (this example will be rewritten once 1.1.0 is on
+Central). At 1.0.0 the realistic
 pattern is to classify the inbound message here and hand the action to whatever sends
 (an HTTP call to your messaging API, a transmitter session, a queue). This example
 logs the routing decision that outbound path would act on, matching the first keyword

@@ -228,3 +228,208 @@ isolated function mockSmscOpenMutualTls(int port, string serverKeystorePath,
     'class: "io.ballerinax.smpp.test.MockSmscBridge",
     name: "openMockMutualTls"
 } external;
+
+// --- submit_sm capture (Sprint 8, item 10) -----------------------------------------
+//
+// Before Sprint 8 the mock set no ServerMessageReceiverListener at all, so jsmpp answered
+// every submit_sm with ESME_RX_R_APPN and no submit test could pass regardless of
+// connector correctness. Captures are FIFO *per connection*, so concurrent submits on
+// different links never interleave into one queue.
+
+# Blocks until the next `submit_sm` arrives on this connection, and returns a handle to
+# the captured PDU for the field accessors below. FIFO per connection.
+#
+# + mockId - the mock's handle
+# + connectionId - the connection handle from `mockSmscAwaitNextBind`
+# + timeoutMillis - how long to wait for a submit
+# + return - a handle to the captured `submit_sm`, or an `error` on timeout/unknown handle
+isolated function mockSmscAwaitNextSubmit(int mockId, int connectionId, int timeoutMillis)
+        returns int|error = @java:Method {
+    'class: "io.ballerinax.smpp.test.MockSmscBridge",
+    name: "awaitNextSubmit"
+} external;
+
+# How many captured submits are still unread on this connection — for asserting that a
+# handler sent exactly one message and no more. Returns `-1` (never 0) for an
+# unknown/severed handle so "no more submits" can never pass vacuously against a dead
+# connection.
+#
+# + mockId - the mock's handle
+# + connectionId - the connection handle
+# + return - the number of unread captured submits, or `-1` for an unknown handle
+isolated function mockSmscPendingSubmitCount(int mockId, int connectionId) returns int = @java:Method {
+    'class: "io.ballerinax.smpp.test.MockSmscBridge",
+    name: "pendingSubmitCount"
+} external;
+
+# The captured `short_message`, decoded with the charset matching the PDU's own
+# `data_coding`. Use `mockSmscSubmitShortMessageBytes` when the exact octets are the thing
+# under test — this decode is a convenience, not the assertion surface for encoding tests.
+#
+# + submitId - the handle from `mockSmscAwaitNextSubmit`
+# + return - the decoded message text
+isolated function mockSmscSubmitShortMessage(int submitId) returns string = @java:Method {
+    'class: "io.ballerinax.smpp.test.MockSmscBridge",
+    name: "submitShortMessage"
+} external;
+
+# The raw, undecoded `short_message` octets — the assertion surface for encoding tests.
+#
+# + submitId - the handle from `mockSmscAwaitNextSubmit`
+# + return - the octets exactly as they arrived on the wire
+isolated function mockSmscSubmitShortMessageBytes(int submitId) returns byte[] = @java:Method {
+    'class: "io.ballerinax.smpp.test.MockSmscBridge",
+    name: "submitShortMessageBytes"
+} external;
+
+# + submitId - the handle from `mockSmscAwaitNextSubmit`
+# + return - the PDU's `source_addr`
+isolated function mockSmscSubmitSourceAddr(int submitId) returns string = @java:Method {
+    'class: "io.ballerinax.smpp.test.MockSmscBridge",
+    name: "submitSourceAddr"
+} external;
+
+# + submitId - the handle from `mockSmscAwaitNextSubmit`
+# + return - the PDU's `destination_addr`
+isolated function mockSmscSubmitDestAddr(int submitId) returns string = @java:Method {
+    'class: "io.ballerinax.smpp.test.MockSmscBridge",
+    name: "submitDestAddr"
+} external;
+
+# + submitId - the handle from `mockSmscAwaitNextSubmit`
+# + return - the PDU's `service_type` (empty string when unset)
+isolated function mockSmscSubmitServiceType(int submitId) returns string = @java:Method {
+    'class: "io.ballerinax.smpp.test.MockSmscBridge",
+    name: "submitServiceType"
+} external;
+
+# + submitId - the handle from `mockSmscAwaitNextSubmit`
+# + return - the PDU's `validity_period` (empty string means "SMSC default")
+isolated function mockSmscSubmitValidityPeriod(int submitId) returns string = @java:Method {
+    'class: "io.ballerinax.smpp.test.MockSmscBridge",
+    name: "submitValidityPeriod"
+} external;
+
+# The PDU's `esm_class`, unsigned. A wrong value here is invisible in a happy-path test
+# yet changes SMSC routing and billing, so it is worth asserting explicitly.
+#
+# + submitId - the handle from `mockSmscAwaitNextSubmit`
+# + return - the `esm_class` byte as 0-255
+isolated function mockSmscSubmitEsmClass(int submitId) returns int = @java:Method {
+    'class: "io.ballerinax.smpp.test.MockSmscBridge",
+    name: "submitEsmClass"
+} external;
+
+# + submitId - the handle from `mockSmscAwaitNextSubmit`
+# + return - the `data_coding` byte as 0-255
+isolated function mockSmscSubmitDataCoding(int submitId) returns int = @java:Method {
+    'class: "io.ballerinax.smpp.test.MockSmscBridge",
+    name: "submitDataCoding"
+} external;
+
+# + submitId - the handle from `mockSmscAwaitNextSubmit`
+# + return - the `registered_delivery` byte as 0-255
+isolated function mockSmscSubmitRegisteredDelivery(int submitId) returns int = @java:Method {
+    'class: "io.ballerinax.smpp.test.MockSmscBridge",
+    name: "submitRegisteredDelivery"
+} external;
+
+# + submitId - the handle from `mockSmscAwaitNextSubmit`
+# + return - the `source_addr_ton` as 0-255
+isolated function mockSmscSubmitSourceAddrTon(int submitId) returns int = @java:Method {
+    'class: "io.ballerinax.smpp.test.MockSmscBridge",
+    name: "submitSourceAddrTon"
+} external;
+
+# + submitId - the handle from `mockSmscAwaitNextSubmit`
+# + return - the `source_addr_npi` as 0-255
+isolated function mockSmscSubmitSourceAddrNpi(int submitId) returns int = @java:Method {
+    'class: "io.ballerinax.smpp.test.MockSmscBridge",
+    name: "submitSourceAddrNpi"
+} external;
+
+# + submitId - the handle from `mockSmscAwaitNextSubmit`
+# + return - the `dest_addr_ton` as 0-255
+isolated function mockSmscSubmitDestAddrTon(int submitId) returns int = @java:Method {
+    'class: "io.ballerinax.smpp.test.MockSmscBridge",
+    name: "submitDestAddrTon"
+} external;
+
+# + submitId - the handle from `mockSmscAwaitNextSubmit`
+# + return - the `dest_addr_npi` as 0-255
+isolated function mockSmscSubmitDestAddrNpi(int submitId) returns int = @java:Method {
+    'class: "io.ballerinax.smpp.test.MockSmscBridge",
+    name: "submitDestAddrNpi"
+} external;
+
+# The `message_id` the mock returned in the `submit_sm_resp` for this exact PDU, or `""` if
+# it sent none (an injected failure, or a response not yet built).
+#
+# Use this instead of predicting the mock's monotonic counter: the counter is only
+# predictable for the first submit of a run, whereas this stays correct when a test submits
+# repeatedly or shares a mock. Capture happens before the response is composed, so read it
+# only after the connector's own `submit` has returned.
+#
+# + submitId - the handle from `mockSmscAwaitNextSubmit`
+# + return - the `message_id` sent to the client, or `""`
+isolated function mockSmscSubmitMessageId(int submitId) returns string = @java:Method {
+    'class: "io.ballerinax.smpp.test.MockSmscBridge",
+    name: "submitMessageId"
+} external;
+
+# The `sequence_number` jsmpp assigned to this submit — the only correlation handle a failed
+# submit has.
+#
+# + submitId - the handle from `mockSmscAwaitNextSubmit`
+# + return - the `sequence_number`
+isolated function mockSmscSubmitSequenceNumber(int submitId) returns int = @java:Method {
+    'class: "io.ballerinax.smpp.test.MockSmscBridge",
+    name: "submitSequenceNumber"
+} external;
+
+# Makes every subsequent `submit_sm` answer with this `command_status` instead of
+# succeeding; the client sees it as a negative response. Pass 0 to restore normal
+# behaviour.
+#
+# + mockId - the mock's handle
+# + commandStatus - the SMPP `command_status` to answer with, or 0 to disable
+isolated function mockSmscSetSubmitFailure(int mockId, int commandStatus) = @java:Method {
+    'class: "io.ballerinax.smpp.test.MockSmscBridge",
+    name: "setSubmitFailure"
+} external;
+
+# Delays every subsequent `submit_sm_resp`. Deliberately blocks the mock's PDU-processor
+# thread — that is what a slow SMSC does, and what `transactionTimeout` has to survive.
+#
+# + mockId - the mock's handle
+# + millis - delay in milliseconds, or 0 to disable
+isolated function mockSmscSetSubmitDelay(int mockId, int millis) = @java:Method {
+    'class: "io.ballerinax.smpp.test.MockSmscBridge",
+    name: "setSubmitDelay"
+} external;
+
+# When enabled, `submit_sm_resp` carries an empty `message_id` — spec-legal, and leaves
+# the client with nothing to correlate a later receipt against.
+#
+# + mockId - the mock's handle
+# + enabled - whether to answer with an empty message id
+isolated function mockSmscSetSubmitEmptyMessageId(int mockId, boolean enabled) = @java:Method {
+    'class: "io.ballerinax.smpp.test.MockSmscBridge",
+    name: "setSubmitEmptyMessageId"
+} external;
+
+# Sends a delivery receipt carrying a `receipted_message_id` TLV (0x001E) alongside the
+# Appendix-B body. The TLV is the spec's only *guaranteed* correlation key (§5.3.2.12) —
+# the body's `id:` is vendor specific — so a test can deliberately make the two disagree.
+# An empty `receiptedMessageId` sends no TLV, matching `mockSmscSendDeliveryReceipt`.
+#
+# + mockId - the mock's handle
+# + connectionId - the connection handle
+# + receiptText - the Appendix-B receipt body
+# + receiptedMessageId - the TLV value, or `""` for no TLV
+# + return - an `error` if the receipt cannot be sent
+isolated function mockSmscSendDeliveryReceiptWithTlv(int mockId, int connectionId,
+        string receiptText, string receiptedMessageId) returns error? = @java:Method {
+    'class: "io.ballerinax.smpp.test.MockSmscBridge",
+    name: "sendDeliveryReceiptWithTlv"
+} external;

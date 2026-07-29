@@ -5,10 +5,21 @@ mobile-originated (MO) SMS and delivery receipts (DLRs) — by binding to an SMS
 as an SMPP client. It wraps [`org.jsmpp:jsmpp`](https://jsmpp.org/) via
 Ballerina's Java interoperability.
 
-This connector is receive-only. It does not submit outbound messages
-(`submit_sm`); its only job is to bind to an SMSC and dispatch inbound PDUs to
-your service. Everything below describes what actually happens, end to end,
-when you use it.
+This connector binds to an SMSC, dispatches inbound PDUs to your service, and —
+since Sprint 8 — submits outbound messages (`submit_sm`) via the `smpp:Caller`
+delivered to remote methods that declare it (`bindType: TRANSCEIVER` required).
+Everything below describes what actually happens, end to end, when you use it.
+
+**Outbound in one paragraph:** one `Caller` exists per listener, valid across
+rebinds (every submit resolves the current session). Submits wait up to
+`transactionTimeout` for the `submit_sm_resp`; jsmpp housekeeping is bounded
+separately (~2s). Failures map to `FailureMode` (see `types.bal`). In `SYNC`
+mode an inline reply holds a dispatch slot AND relies on the PDU-processor
+reserve thread: **`submit_sm_resp` PDUs ride the same jsmpp pool as inbound
+dispatches**, so the reserve beyond `maxConcurrentDispatch` is a liveness
+requirement for the submit path itself, not just an enquire_link nicety — a
+handler blocked in `submit` completes only because a spare pool thread can
+deliver its response. Prefer `responseMode: ASYNC` for reply-style services.
 
 ## Connection lifecycle
 
@@ -68,6 +79,20 @@ call):
 
 This is distinct from a failed *initial* `'start()` call, which is always
 returned to you directly as an `error` and never retried by `rebindPolicy`.
+
+**How drops are detected (two independent signals).** The primary signal is jsmpp's own
+session-state listener firing `CLOSED` — normally 0–4ms after the socket dies. jsmpp 3.0.2
+also has a rare failure mode (roughly one sever in a few hundred under soak) where its
+reader thread dies mid-close and that notification **never** fires, leaving the session
+claiming to be bound forever. The connector therefore observes the transport itself: both
+connection factories wrap every socket stream, and an EOF or read error fires a second,
+independent drop signal. Whichever signal arrives first wins (exactly-once guarded); if
+the primary hasn't fired within a 1s grace, the connector declares the drop itself —
+`onError` message `"SMPP transport died and jsmpp's CLOSED notification did not arrive
+..."` instead of `"SMPP session closed unexpectedly ..."` — abandons the wedged session,
+and proceeds with the same rebind flow. Code that matches on `onError` message text should
+treat either wording as "the link dropped". See `ObservedConnection.java` and the Sprint 8
+Phase 3 incident record in [sprint-plan.md](sprint-plan.md) for the full forensics.
 
 ## Configuration reference
 
@@ -169,11 +194,11 @@ reason, `bindType` is typed as `ListenerBindType`
 transmitter bind here is a compile-time error, not something that connects
 successfully and then silently never calls your service.
 
-`RECEIVER` and `TRANSCEIVER` behave identically for this connector's
-purposes: both receive `deliver_sm`/`data_sm`. `TRANSCEIVER` additionally
-allows submitting messages over the same session, but since this connector
-has no API for that, choosing it only matters if you separately intend the
-same bind to double as a submission path outside this connector.
+`RECEIVER` and `TRANSCEIVER` both receive `deliver_sm`/`data_sm` identically.
+`TRANSCEIVER` additionally allows submitting on the same session — it is the
+bind type `Caller.submit` requires: a service that replies must bind
+`TRANSCEIVER`, and a `RECEIVER` bind's Caller fails fast with an error naming
+the fix.
 
 ### Dispatch concurrency and response mode
 

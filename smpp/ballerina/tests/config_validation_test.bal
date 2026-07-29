@@ -22,7 +22,12 @@ function testConfigValidationRejectsOutOfBoundsValues() {
         {config: {host: "h", systemId: "s", password: "p", enquireLinkInterval: 2}, expect: "enquireLinkInterval"},
         {config: {host: "h", systemId: "s", password: "p", enquireLinkInterval: 60000}, expect: "enquireLinkInterval"},
         {config: {host: "h", systemId: "s", password: "p", bindTimeout: 0.5}, expect: "bindTimeout"},
-        {config: {host: "h", systemId: "s", password: "p", bindTimeout: 60000}, expect: "bindTimeout"}
+        {config: {host: "h", systemId: "s", password: "p", bindTimeout: 60000}, expect: "bindTimeout"},
+        // Sprint 8 (item 5): same seconds-vs-millis guard family as its neighbours.
+        // sourceAddr deliberately has NO validation case: an absent/empty source address
+        // is spec-legal and D9 decided not to reject it locally.
+        {config: {host: "h", systemId: "s", password: "p", transactionTimeout: 0.5}, expect: "transactionTimeout"},
+        {config: {host: "h", systemId: "s", password: "p", transactionTimeout: 30000}, expect: "transactionTimeout"}
     ];
     foreach var {config, expect} in cases {
         Listener|error result = new (config);

@@ -50,8 +50,8 @@ function testSeverTriggersOnErrorAndRebind() returns error? {
 
     test:assertTrue(pollUntil(() => recordedErrorCount() >= 1, 5),
             "onError did not fire within 5s of severance");
-    test:assertTrue(recordedErrorsContaining("closed unexpectedly") >= 1,
-            "the drop notification must carry the pinned 'closed unexpectedly' wording");
+    test:assertTrue(recordedDropCount() >= 1,
+            "a drop notification (either detection path's wording) must have been recorded");
 
     // The rebind lands on the same mock's next accept.
     int conn2 = check mockSmscAwaitNextBind(mockId, 10000);
@@ -105,7 +105,7 @@ function testRebindExhaustionNotifiesPerAttemptAndGivesUp() returns error? {
             string `exhaustion completed in ${elapsed}s - backoff delays (0.3+0.6+1.2s) were not applied`);
 
     // Set-membership, not ordering (onError notifications ride separate virtual threads).
-    test:assertEquals(recordedErrorsContaining("closed unexpectedly"), 1);
+    test:assertEquals(recordedDropCount(), 1);
     test:assertEquals(recordedErrorsContaining("rebind attempt 1 failed"), 1);
     test:assertEquals(recordedErrorsContaining("rebind attempt 2 failed"), 1);
     test:assertEquals(recordedErrorsContaining("rebind attempt 3 failed"), 1);

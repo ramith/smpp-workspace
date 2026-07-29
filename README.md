@@ -1,7 +1,7 @@
 # smpp-workspace
 
 Workspace for the **[`ramith/smpp`](https://central.ballerina.io/ramith/smpp)** Ballerina
-connector — a **receive-only SMPP v3.4 listener/trigger** that binds to an SMSC as an ESME
+connector — an **SMPP v3.4 listener/trigger with reply support** that binds to an SMSC as an ESME
 (receiver/transceiver) and dispatches inbound PDUs (mobile-originated SMS and delivery
 receipts) to a Ballerina service. It wraps the Java library
 [`org.jsmpp:jsmpp`](https://jsmpp.org/) through Ballerina's Java interop.

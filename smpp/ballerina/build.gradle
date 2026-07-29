@@ -86,3 +86,32 @@ build.dependsOn ":${packageName}-native:testBridgeJar"
 
 test.dependsOn ":${packageName}-native:build"
 test.dependsOn ":${packageName}-native:testBridgeJar"
+// Without this, `./gradlew :smpp-ballerina:test` on a fresh checkout fails with
+// "could not locate dependency path './lib/jsmpp-...jar'" — only `build` pulled it in,
+// and the main tree masked that by having the jar left over from earlier builds.
+test.dependsOn copyToLib
+
+// `bal test` (2201.13.x, with coverage) exits 0 even when tests FAIL — a compile error
+// propagates a nonzero exit through the docker wrapper, but test failures do not. So the
+// plugin's test task, and therefore `./gradlew build`, reported BUILD SUCCESSFUL with a
+// red suite (observed: "39 passing / 1 failing" → exit 0). The sprint exit gates are
+// phrased as "passes under ./gradlew build", so gate on the report the test run writes.
+test {
+    // Staleness guard: a green report from a PREVIOUS run must not satisfy the gate if
+    // bal test dies before writing a fresh one (review finding M4).
+    doFirst {
+        delete file("${project.projectDir}/target/report/test_results.json")
+    }
+    doLast {
+        def resultsFile = file("${project.projectDir}/target/report/test_results.json")
+        if (!resultsFile.exists()) {
+            throw new GradleException("bal test produced no target/report/test_results.json — cannot verify the suite actually ran")
+        }
+        def results = new groovy.json.JsonSlurper().parse(resultsFile)
+        if ((results.failed ?: 0) > 0 || (results.skipped ?: 0) > 0 || (results.totalTests ?: 0) == 0) {
+            throw new GradleException("bal test: ${results.failed} failing / ${results.skipped} skipped / " +
+                    "${results.passed} passing of ${results.totalTests} — failing the build " +
+                    "(bal test itself exits 0 on test failures; skips can mask a BeforeSuite failure)")
+        }
+    }
+}

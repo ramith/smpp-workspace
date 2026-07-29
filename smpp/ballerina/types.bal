@@ -2,8 +2,9 @@
 import ballerina/crypto;
 
 # The SMPP bind mode. Reflects the full set of modes defined by the SMPP spec;
-# `ConnectionConfig.bindType` narrows this to `ListenerBindType` since this connector
-# is a receive-only trigger (see `ListenerBindType`).
+# `ConnectionConfig.bindType` narrows this to `ListenerBindType` (see there for why
+# TRANSMITTER is excluded). Sending is done from the listener's session via
+# `Caller.submit`, so a standalone transmitter bind has no role here.
 public enum BindType {
     # Receiver bind — the session only receives inbound PDUs (MO messages, delivery receipts).
     RECEIVER,
@@ -106,8 +107,12 @@ public type ConnectionConfig record {|
     # `data_coding` is always available on `Sms.properties` for services that must decode a
     # different scheme themselves.
     boolean decodeGsm7 = false;
-    # Maximum time `gracefulStop` waits for in-flight dispatches to the attached service to
-    # finish before unbinding, in seconds. `immediateStop` does not wait at all.
+    # Maximum time `gracefulStop` waits for in-flight work to finish before unbinding, in
+    # seconds. The drain covers dispatches to the attached service AND in-flight
+    # `Caller.submit` calls (including from non-handler code holding a `Caller`); submits
+    # stay legal for the whole drain window - a reply-style service's in-flight replies
+    # complete rather than being dropped on shutdown. `immediateStop` does not wait at
+    # all: a parked submit then surfaces `LINK_DOWN` when the socket closes under it.
     # Must not be negative (validated at `Listener` init).
     decimal gracefulStopTimeout = 30;
     # Controls automatic rebinding after an unexpected session drop. Defaults to retrying
@@ -124,13 +129,35 @@ public type ConnectionConfig record {|
     # disable dead-link detection.
     decimal enquireLinkInterval = 60;
     # Maximum time the connect-and-bind handshake may take, in seconds — applied to the
-    # initial `'start()` and to every automatic rebind attempt. It bounds the TCP connect
+    # initial ``'start()`` and to every automatic rebind attempt. It bounds the TCP connect
     # and the bind-response wait *separately*, so a fully stalled attempt (a black-holed
     # host that also never answers) can take up to ~2x this value. The rebind loop is
     # single-threaded, so this also caps how long one stalled attempt (e.g. a half-open
     # SMSC that accepts the TCP connection but never answers the bind) blocks the next
     # attempt. This field is in SECONDS. Must be 1-300 (validated at `Listener` init).
     decimal bindTimeout = 60;
+    # How long a `Caller.submit` waits for the SMSC's `submit_sm_resp`, in seconds.
+    #
+    # This bounds ONLY the requests this connector issues on your behalf (the
+    # submit-family operations). The session's internal housekeeping — the `unbind_resp`
+    # wait during `gracefulStop`/`immediateStop`, the `enquire_link_resp` wait that
+    # detects a silently dead link, and the reader thread's exit drain — is bounded
+    # separately at a short internal timer (~2s, jsmpp's own historical default for
+    # exactly those paths), so raising this value does NOT slow stops or dead-link
+    # detection. (jsmpp itself has one shared timer; the connector splits it — see
+    # `ConnectorSession` in the native layer.) Worst-case `gracefulStop` latency is
+    # therefore ≈ `gracefulStopTimeout` + 2s, and silent-peer detection stays ≈
+    # `enquireLinkInterval` + 2s, regardless of this setting.
+    #
+    # The default is 30s rather than jsmpp's own 2s. Two seconds is too short for a
+    # `submit_sm` under load, and a timed-out submit is the worst outcome the send path
+    # has: SMPP gives no way to tell "the SMSC never got it" from "the SMSC got it and the
+    # response was slow", so retrying may duplicate a message the subscriber already
+    # received (`FailureMode.TIMEOUT_DELIVERY_UNKNOWN`). Prefer waiting to guessing.
+    #
+    # This field is in SECONDS (jsmpp's underlying knob is milliseconds). Must be 1-300
+    # (validated at `Listener` init).
+    decimal transactionTimeout = 30;
     # Transport security. Absent (the default) means the SMSC connection is plaintext
     # TCP, exactly as before this field existed — pre-TLS configs are unaffected. A
     # `SecureSocket` yields a verified TLS connection; an `InsecureSocket` yields a TLS
@@ -139,6 +166,175 @@ public type ConnectionConfig record {|
     # topology where you control that boundary; this field is for the in-band case where
     # you don't.
     SecureSocket|InsecureSocket secureSocket?;
+    # Default source address for messages this ESME submits — the short code or sender ID
+    # the subscriber sees. `OutboundSms.sourceAddr` overrides it per message.
+    #
+    # Typed as a plain `Address`, deliberately **not** the `string|Address` union used on
+    # `OutboundSms`: this is the deployment-configured field, and on a union the compiler
+    # collapses three precise `Config.toml` diagnostics into one unhelpful "incompatible
+    # types" message.
+    #
+    # An empty `value` means "send no source address", which is spec-legal — the SMSC then
+    # supplies one — so it is **not** rejected at `Listener` init.
+    Address sourceAddr = {value: ""};
+|};
+
+# An SMPP address: the digits plus the two fields that say how to read them. SMPP carries
+# `ton`/`npi` alongside every address, and getting them wrong is a common cause of an SMSC
+# silently misrouting an otherwise correct MSISDN.
+#
+# Where a plain `string` is accepted instead of this record, it is shorthand for
+# `{value: <the string>}` — i.e. the defaults below.
+public type Address record {|
+    # The address itself. For `TON_INTERNATIONAL` this is E.164 **without** a leading `+`
+    # (the `ton` field is what carries that meaning on the wire). Empty means "absent",
+    # which is spec-legal for a source address — and when it is empty, the connector
+    # sends TON/NPI as Unknown/Unknown regardless of the fields below (§4.4.1: a NULL
+    # address and its TON/NPI move together).
+    string value;
+    # Type of number. Defaults to `TON_INTERNATIONAL`, the right answer for an ordinary
+    # MSISDN; short codes and alphanumeric sender IDs need an explicit value.
+    Ton ton = TON_INTERNATIONAL;
+    # Numbering plan. Defaults to `NPI_ISDN` (E.163/E.164), which pairs with the `ton`
+    # default above.
+    Npi npi = NPI_ISDN;
+|};
+
+# Type of number, per SMPP v3.4 §5.2.5.
+#
+# Member names are prefixed because Ballerina enum members are **module-scoped string
+# constants**: unprefixed, `UNKNOWN` would collide with the already-published
+# `DeliveryReceiptStatus.UNKNOWN` and `NATIONAL` would collide with `Npi`, producing build
+# warnings — one of them retroactively on a shipped doc comment.
+#
+# Each member's value equals its member name, so what a `Config.toml` author writes is
+# exactly what the docs show (owner decision, 2026-07-29 — this also keeps jsmpp's
+# identifier spelling out of the published contract). The native layer strips the
+# `TON_` prefix and resolves the remainder against `org.jsmpp.bean.TypeOfNumber`.
+public enum Ton {
+    # `TypeOfNumber.UNKNOWN` (0) — let the SMSC decide.
+    TON_UNKNOWN = "TON_UNKNOWN",
+    # `TypeOfNumber.INTERNATIONAL` (1) — E.164 without a leading `+`.
+    TON_INTERNATIONAL = "TON_INTERNATIONAL",
+    # `TypeOfNumber.NATIONAL` (2).
+    TON_NATIONAL = "TON_NATIONAL",
+    # `TypeOfNumber.NETWORK_SPECIFIC` (3).
+    TON_NETWORK_SPECIFIC = "TON_NETWORK_SPECIFIC",
+    # `TypeOfNumber.SUBSCRIBER_NUMBER` (4).
+    TON_SUBSCRIBER_NUMBER = "TON_SUBSCRIBER_NUMBER",
+    # `TypeOfNumber.ALPHANUMERIC` (5) — an alphanumeric sender ID rather than digits.
+    TON_ALPHANUMERIC = "TON_ALPHANUMERIC",
+    # `TypeOfNumber.ABBREVIATED` (6) — short codes.
+    TON_ABBREVIATED = "TON_ABBREVIATED"
+}
+
+# Numbering plan indicator, per SMPP v3.4 §5.2.6. Prefixed, value-equals-member-name,
+# and prefix-stripped natively — for the same reasons as `Ton`.
+public enum Npi {
+    # `NumberingPlanIndicator.UNKNOWN` (0).
+    NPI_UNKNOWN = "NPI_UNKNOWN",
+    # `NumberingPlanIndicator.ISDN` (1) — E.163/E.164, the usual choice for an MSISDN.
+    NPI_ISDN = "NPI_ISDN",
+    # `NumberingPlanIndicator.DATA` (3) — X.121.
+    NPI_DATA = "NPI_DATA",
+    # `NumberingPlanIndicator.TELEX` (4) — F.69.
+    NPI_TELEX = "NPI_TELEX",
+    # `NumberingPlanIndicator.LAND_MOBILE` (6) — E.212.
+    NPI_LAND_MOBILE = "NPI_LAND_MOBILE",
+    # `NumberingPlanIndicator.NATIONAL` (8).
+    NPI_NATIONAL = "NPI_NATIONAL",
+    # `NumberingPlanIndicator.PRIVATE` (9).
+    NPI_PRIVATE = "NPI_PRIVATE",
+    # `NumberingPlanIndicator.ERMES` (10).
+    NPI_ERMES = "NPI_ERMES",
+    # `NumberingPlanIndicator.INTERNET` (14) — IP.
+    NPI_INTERNET = "NPI_INTERNET",
+    # `NumberingPlanIndicator.WAP` (18) — WAP client id.
+    NPI_WAP = "NPI_WAP"
+}
+
+# How an outbound message's text is encoded, and hence the `data_coding` it is sent with.
+#
+# Only the three schemes this connector also **decodes** precisely are offered. The GSM
+# 03.38 7-bit default alphabet (`data_coding 0x00`) is **not** available for sending: it
+# needs a packed-septet encoder, which jsmpp does not provide, and adding protocol logic
+# jsmpp lacks is outside this connector's remit. Use `OutboundSms.shortMessageBytes` with
+# an explicit `dataCoding` if you need to put such a payload on the wire yourself.
+public enum Encoding {
+    # IA5/ASCII — `data_coding 0x01`. 7-bit US-ASCII only; anything else is rejected.
+    ASCII,
+    # Latin-1 — `data_coding 0x03`. The default: covers English, Afrikaans and most
+    # Western European text. Note some carriers/aggregators accept only `0x00`
+    # (their provisioned default) and `0x08`, and may reject or transcode `0x03`; for
+    # pure-ASCII text, `ASCII` produces byte-identical payloads under `data_coding
+    # 0x01` — a zero-cost switch if your SMSC dislikes `0x03`.
+    LATIN1,
+    # UCS-2 big-endian — `data_coding 0x08`. Any script, at half the characters per PDU.
+    UCS2
+}
+
+# Whether, and when, the SMSC should return a delivery receipt for a submitted message,
+# per SMPP v3.4 §5.2.17.
+#
+# Three members, not four: jsmpp also defines `SUCCESS` (`0x03`), but its own javadoc marks
+# that as introduced in SMPP 5.0, and `xxxxxx11` is *reserved* in the v3.4 table this
+# connector implements.
+public enum DeliveryReceiptRequest {
+    # `xxxxxx00` — no receipt. The SMPP default.
+    NONE,
+    # `xxxxxx01` — a receipt on final delivery or final failure.
+    ON_SUCCESS_OR_FAILURE,
+    # `xxxxxx10` — a receipt only if delivery ultimately fails.
+    ON_FAILURE_ONLY
+}
+
+# A message to submit to the SMSC (`submit_sm`).
+#
+# Exactly one of `shortMessage` or `shortMessageBytes` must be set. They are mutually
+# exclusive rather than layered because SMPP has no way to carry both, and silently
+# preferring one would hide a caller's mistake.
+public type OutboundSms record {|
+    # Recipient. A plain `string` is shorthand for an international ISDN address.
+    string|Address destAddr;
+    # Sender. Omitted means `ConnectionConfig.sourceAddr`, which is the usual arrangement:
+    # the short code is a property of the binding, not of each message.
+    string|Address sourceAddr?;
+    # The message text, encoded per `encoding`. Mutually exclusive with
+    # `shortMessageBytes`.
+    string shortMessage?;
+    # How to encode `shortMessage`. Ignored when `shortMessageBytes` is used, since those
+    # octets are already encoded.
+    Encoding encoding = LATIN1;
+    # Pre-encoded payload, sent verbatim with `dataCoding`. The escape hatch for anything
+    # `Encoding` cannot express — packed GSM 7-bit above all. Requires `dataCoding`, and is
+    # mutually exclusive with `shortMessage`.
+    byte[] shortMessageBytes?;
+    # The raw `data_coding` byte accompanying `shortMessageBytes`. Required with it, and
+    # meaningless without it.
+    int dataCoding?;
+    # Whether to ask the SMSC for a delivery receipt. A receipt arrives later at
+    # `onDeliverSm` with `deliveryReceipt` set, not as part of the submit.
+    DeliveryReceiptRequest registeredDelivery = NONE;
+    # SMPP `service_type`. Empty (the default) means the SMSC's default service.
+    string serviceType = "";
+    # SMPP `validity_period`: how long the SMSC should keep trying. Omitted means the
+    # SMSC's own default. When set, it must be EXACTLY 16 characters in the §7.1.1 time
+    # format `YYMMDDhhmmsstnnp` — absolute, e.g. `240115143000000+` (UTC+offset), or
+    # relative, e.g. `000000020000000R` (2 hours). Any other length or shape is rejected
+    # locally before anything reaches the wire.
+    string validityPeriod?;
+|};
+
+# The outcome of a successful `submit`.
+#
+# `messageId` is required rather than optional: an SMSC that accepts a `submit_sm` must
+# return one (§4.4.2), and typing it optional would push a nil check onto every caller for
+# a case a conforming SMSC cannot produce. A non-conforming SMSC returning an empty id
+# yields an empty string here — visible, rather than silently absent.
+public type SubmitResult record {|
+    # The SMSC's `message_id`. Correlate a later delivery receipt against this — see
+    # `Sms.receiptedMessageId` for the caveat about which field actually carries it back.
+    string messageId;
 |};
 
 # Transport-layer security (TLS) for the SMSC connection. Attach this to
@@ -212,6 +408,12 @@ public type Sms record {|
     byte[] shortMessageBytes = [];
     # `true` when this PDU is an SMSC delivery receipt (DLR) rather than a mobile-originated message.
     boolean deliveryReceipt = false;
+    # The `receipted_message_id` TLV (0x001E) when the SMSC attached one — the spec's only
+    # GUARANTEED correlation key (§5.3.2.12) between a delivery receipt and the
+    # `SubmitResult.messageId` your submit returned. The Appendix-B body's `id:` field
+    # (`receipt.id`) is vendor specific and can differ in radix; prefer this when present.
+    # `()` when the receipt carries no TLV (many SMSCs only populate the body).
+    string? receiptedMessageId = ();
     # Protocol metadata not promoted to a typed field above: `dataCoding` (`int`, raw
     # `data_coding` value), `sourceAddrTon`/`sourceAddrNpi`/`destAddrTon`/`destAddrNpi`
     # (`int`, address type-of-number/numbering-plan-indicator), `esmClass` (`int`, the raw
@@ -258,8 +460,10 @@ public enum DeliveryReceiptStatus {
 # "field absent" is a routine, meaningful outcome. The full raw receipt is always available on
 # `Sms.shortMessage`.
 public type DeliveryReceipt record {|
-    # The SMSC's message id for the original submission (Appendix-B `id:`) — the key you
-    # correlate against the `message_id` returned in your `submit_sm_resp`.
+    # The SMSC's message id for the original submission (Appendix-B `id:`). Appendix B is
+    # "SMSC vendor specific": some SMSCs emit this in a different radix (hex vs decimal)
+    # than the `message_id` they returned in the `submit_sm_resp`, so it is NOT a
+    # guaranteed correlation key — `Sms.receiptedMessageId` (the §5.3.2.12 TLV) is.
     string id?;
     # The `sub:` count — messages originally submitted (usually 1). Advisory: many SMSCs
     # omit or zero-fill it.
@@ -287,8 +491,58 @@ public type DeliveryReceipt record {|
     string text?;
 |};
 
+# How a `submit` failed, mapped from the jsmpp exception that surfaced it. The five
+# members deliberately partition by WHAT THE CALLER SHOULD DO, not by exception class:
+public enum FailureMode {
+    # The SMSC answered the submit with a negative `command_status` — it received the
+    # request and said no. `ErrorDetail.commandStatus` carries the exact status. The
+    # message was NOT accepted; whether a retry can succeed depends on the status
+    # (throttling: yes, after backing off; invalid destination: no).
+    REJECTED,
+    # No response arrived within `transactionTimeout`. The worst outcome the send path
+    # has: SMPP gives no way to tell "the SMSC never got it" from "the SMSC accepted it
+    # and the response was slow or lost" — so retrying MAY DELIVER A DUPLICATE to the
+    # subscriber. Decide per use case; for billing-relevant traffic, prefer reconciling
+    # via delivery receipts over blind retry.
+    TIMEOUT_DELIVERY_UNKNOWN,
+    # The link is the problem: it died while sending or waiting, OR it was already
+    # down/rebinding when the submit was attempted (one bucket for one operational
+    # condition — owner decision, 2026-07-29). For a mid-flight death the message may
+    # or may not have reached the SMSC (same duplicate caveat as
+    # `TIMEOUT_DELIVERY_UNKNOWN`); for an already-down link nothing was sent. If
+    # `rebindPolicy` is enabled, retry once rebound; if rebinding is disabled or
+    # exhausted, the link stays down until you restart the listener.
+    LINK_DOWN,
+    # This connector refused to send: the request failed local validation (oversize,
+    # unencodable character, bad field) or the lifecycle/config does not permit a
+    # submit (not started, stopped, RECEIVER bind). Nothing reached the wire; fix the
+    # request or the configuration. (A down/rebinding LINK is `LINK_DOWN`, not this.)
+    INVALID_REQUEST,
+    # jsmpp raised something outside the four categories above (a malformed response,
+    # an unexpected runtime failure inside the client). Not safely classifiable;
+    # treat like `TIMEOUT_DELIVERY_UNKNOWN` for retry purposes.
+    PROTOCOL_ERROR
+}
+
+# The detail record carried by `Error`. Deliberately **open** with all-optional fields:
+# closed would turn every `e.detail()["anything"]` a 1.0.x user wrote into a compile
+# error, and openness costs typed reads nothing (D3). Fields are populated on `submit`
+# failures; errors from other paths (config validation, start, drops) may carry none.
+public type ErrorDetail record {
+    # Which way the submit failed — the field to branch retry logic on.
+    FailureMode failureMode?;
+    # The SMPP `command_status` from the negative response, when `failureMode` is
+    # `REJECTED`. Compare against SMPP v3.4 §5.1.3 (e.g. 0x00000058 = ESME_RTHROTTLED).
+    int commandStatus?;
+};
+
 # The distinct error type raised by the SMPP connector. Returned from `Listener` init on
-# invalid configuration, from `'start()` on a failed connect/bind, and passed to a service's
-# `onError` method on an unexpected session drop. Match it with `err is smpp:Error` to
-# distinguish connector errors from other errors in your handler.
-public type Error distinct error;
+# invalid configuration, from `'start()` on a failed connect/bind, from `Caller.submit`
+# on a failed send (with `ErrorDetail` populated — see `FailureMode`), and passed to a
+# service's `onError` method on an unexpected session drop. Match it with
+# `err is smpp:Error` to distinguish connector errors from other errors in your handler.
+#
+# Known 1.0.x compile break, accepted and recorded (D3): once the detail type names any
+# field, `error smpp:Error("m", myOwnField = 42)` no longer compiles. `e.detail()["k"]`
+# reads keep compiling because `ErrorDetail` is open.
+public type Error distinct error<ErrorDetail>;
