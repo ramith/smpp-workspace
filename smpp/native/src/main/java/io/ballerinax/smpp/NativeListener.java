@@ -46,9 +46,26 @@ public final class NativeListener {
     private static final String NATIVE_SESSION_USABLE = "smpp.sessionUsable";
     private static final String NATIVE_SUBMITS_IN_FLIGHT = "smpp.submitsInFlight";
     private static final String NATIVE_REBIND_ABANDONED = "smpp.rebindAbandoned";
+    private static final String NATIVE_OBSERVED_CONN = "smpp.observedConn";
 
     private static final java.util.logging.Logger LOGGER =
             java.util.logging.Logger.getLogger(NativeListener.class.getName());
+
+    /**
+     * Wall-clock bound on jsmpp's close choreography during stop (D11). jsmpp's
+     * {@code unbindAndClose()} has THREE unbounded segments — the {@code synchronized(os)}
+     * monitor acquisition behind a stalled writer, the untimed socket write itself (Java
+     * has no send timeout), and {@code close()}'s untimed {@code enquireLinkSender.join()}
+     * — and only one bounded segment, the 2s {@code unbind_resp} wait. If the whole
+     * choreography exceeds this bound, the watchdog force-closes the raw socket, which
+     * unwedges all three (see {@code closeSession}). DERIVED, not tuned: it must
+     * STRICTLY exceed {@code unbind()}'s response wait ({@code HOUSEKEEPING_TIMER_MS},
+     * the field value), or a healthy-but-slow SMSC races its own {@code unbind_resp}
+     * against the force-close. Healthy-path worst case ≈ 2s (unbind wait) + ~0.5s
+     * (sender join), so 2x leaves ~1.5s of scheduling headroom — if the JUnit watchdog
+     * test ever flakes on loaded CI, prefer raising to 3x over weakening assertions.
+     */
+    static final long CLOSE_WATCHDOG_MS = 2 * ConnectorSession.HOUSEKEEPING_TIMER_MS;
 
     /**
      * Extra jsmpp PDU-processor threads kept beyond {@code maxConcurrentDispatch} in SYNC
@@ -156,6 +173,12 @@ public final class NativeListener {
         listener.addNativeData(NATIVE_STATE_LOCK, new Object());
         listener.addNativeData(NATIVE_SESSION, sessionRef);
         listener.addNativeData(NATIVE_REBIND_EXECUTOR, new AtomicReference<ScheduledExecutorService>());
+        // The INSTALLED session's observed connection, for the stop-path close watchdog
+        // (D11). Set inside bind()'s critical section alongside NATIVE_SESSION; the
+        // per-attempt transport-death task deliberately does NOT read this shared holder
+        // (it closure-captures its own attempt's connection at schedule time - a rebind
+        // may have installed a successor by fire time, design review FINDING-7).
+        listener.addNativeData(NATIVE_OBSERVED_CONN, new AtomicReference<ObservedConnection>());
         env.getRuntime().registerListener(listener);
         return null;
     }
@@ -233,8 +256,13 @@ public final class NativeListener {
         // before arming (i.e. during connectAndBind's connect phase) report nothing, and
         // connect/bind-phase failures are surfaced by connectAndBind itself.
         AtomicReference<Runnable> onTransportDeath = new AtomicReference<>();
+        // THIS attempt's observed connection, filled by the factory lambda during
+        // connectAndBind. Per-attempt on purpose: the transport-death task and the
+        // wedge-declaration force-close must act on the connection of the attempt that
+        // armed them, never on whatever a later rebind installed (FINDING-7).
+        AtomicReference<ObservedConnection> attemptConn = new AtomicReference<>();
         SMPPSession session = newSession(listener, bindTimeoutMillis, onTransportDeath,
-                (long) (decimalValue(config, "transactionTimeout") * 1000));
+                attemptConn, (long) (decimalValue(config, "transactionTimeout") * 1000));
         session.setMessageReceiverListener(dispatcher);
 
         String host = str(config, "host");
@@ -289,7 +317,8 @@ public final class NativeListener {
         // notification - the normal path, measured at 0-4ms after EOF when the close
         // choreography works - every reasonable chance to win; this path only acts when
         // that choreography wedges (the reader-death failure mode).
-        onTransportDeath.set(() -> scheduleTransportDeathCheck(listener, installed, dropReported));
+        onTransportDeath.set(() -> scheduleTransportDeathCheck(listener, installed, dropReported,
+                attemptConn, session));
         session.addSessionStateListener((newState, oldState, source) -> {
             if (newState != SessionState.CLOSED || !installed.get()) {
                 return;
@@ -328,6 +357,7 @@ public final class NativeListener {
             // stays STARTED across a drop; only sessions come and go).
             if (st == ListenerState.STARTING || st == ListenerState.STARTED) {
                 session(listener).set(session);
+                observedConn(listener).set(attemptConn.get());
                 sessionUsable(listener).set(true);
                 rebindAbandoned(listener).set(false);
                 installed.set(true);
@@ -437,18 +467,36 @@ public final class NativeListener {
      * listener unfired (the wedge documented on {@link ObservedConnection}) - does this
      * path report the drop and drive the rebind.
      *
-     * <p>The wedged jsmpp threads (an orphaned EnquireLinkSender, at worst) are
-     * deliberately abandoned, not joined: anything that waits on jsmpp's close
-     * choreography inherits the wedge. The next bind builds a fresh session; the orphan
-     * exits on its own if the state ever flips, and is otherwise a bounded, logged leak.
+     * <p>A declared wedge is no longer merely abandoned (Sprint 8.5, D11 actuator): the
+     * task force-closes the attempt's raw socket — which unwedges the writer-jam variant
+     * of the wedge entirely (the stalled writer throws, releases the {@code os} monitor,
+     * the pending interrupt drains the EnquireLinkSender, {@code close()}'s join returns,
+     * CLOSED fires onto an already-won CAS) — and then hands the session to a throwaway
+     * daemon closer thread that runs jsmpp's own {@code close()}, reclaiming the orphaned
+     * EnquireLinkSender (its 500ms wait IS interruptible) and driving the state to CLOSED
+     * so {@code SMPPSession.finalize()} becomes a permanent no-op (F1c retired). The
+     * closer runs on its own thread because {@code close()} can still park in the untimed
+     * {@code join()} at worst — a daemon thread the connector is willing to lose, never
+     * the rebind executor (which the next rebind needs) and never joined. What CANNOT be
+     * reclaimed connector-side: a reader thread that died before {@code pduExecutor
+     * .shutdown()} leaves that pool's idle core threads alive forever (the pool is
+     * private to jsmpp) — a bounded, now-logged leak of {@code maxConcurrentDispatch+1}
+     * idle threads per reader-death wedge, recorded in the known-limitations table.
      */
     private static void scheduleTransportDeathCheck(BObject listener, AtomicBoolean installed,
-            AtomicBoolean dropReported) {
+            AtomicBoolean dropReported, AtomicReference<ObservedConnection> attemptConn,
+            SMPPSession session) {
         synchronized (stateLock(listener)) {
             ListenerState st = state(listener).get();
             if (st != ListenerState.STARTING && st != ListenerState.STARTED) {
                 return; // stopping/stopped: user-initiated teardown closes sockets too
             }
+            // Captured NOW, not at fire time: by the time the task runs, a rebind may
+            // have installed a successor session/connection, and acting on the shared
+            // holder would force-close the WRONG (healthy) transport (FINDING-7). The
+            // per-attempt dropReported CAS already makes a stale task a no-op; this
+            // capture is the defense-in-depth that keeps even a misfire harmless.
+            ObservedConnection conn = attemptConn.get();
             try {
                 rebindExecutor(listener).schedule(() -> {
                     if (state(listener).get() != ListenerState.STARTED || !installed.get()) {
@@ -459,7 +507,25 @@ public final class NativeListener {
                     if (dropReported.compareAndSet(false, true)) {
                         onUnexpectedDrop(listener,
                                 "SMPP transport died and jsmpp's CLOSED notification did not arrive within "
-                                        + TRANSPORT_DEATH_GRACE_MS + "ms (reader-death wedge; abandoning the session)");
+                                        + TRANSPORT_DEATH_GRACE_MS + "ms (reader-death wedge; reclaiming the session)");
+                        // D11 actuator, site 3 - AFTER the CAS is won, so the CLOSED this
+                        // triggers lands on a no-op CAS. Order matters: force-close the
+                        // raw socket FIRST (unblocks any os-monitor holder; takes no lock,
+                        // runs fine on this rebind-executor thread, outside the monitor),
+                        // THEN close() on a throwaway daemon thread (can park in jsmpp's
+                        // untimed join at worst - a thread we are willing to lose).
+                        if (conn != null) {
+                            conn.forceClose();
+                        }
+                        Thread closer = new Thread(() -> {
+                            try {
+                                session.close();
+                            } catch (Throwable t) {
+                                LOGGER.warning("background close of abandoned SMPP session threw: " + t);
+                            }
+                        }, "smpp-abandoned-session-closer");
+                        closer.setDaemon(true);
+                        closer.start();
                     }
                 }, TRANSPORT_DEATH_GRACE_MS, TimeUnit.MILLISECONDS);
             } catch (java.util.concurrent.RejectedExecutionException e) {
@@ -572,21 +638,30 @@ public final class NativeListener {
             awaitDrain(listener);           // also covers in-flight onError notifications
         }
         // Point of no return for the send path: fail-fast any submit arriving after the
-        // drain, then unbind. (immediateStop skips the drain: in-flight submits surface
-        // as LINK_DOWN when the socket closes under them - documented, tested.)
+        // drain, then unbind. The flip stays OUTSIDE if(graceful) - both stop flavours
+        // depend on it, and the whole increment-before-check reservation argument on the
+        // submit side is ordered against it.
         sessionUsable(listener).set(false);
-        // Post-flip sweep (Phase 5 finding #2): a submit that incremented before the flip
-        // may still be in flight; with increment-before-check on the submit side, this
-        // bounded wait closes the reservation race - post-flip submits fail fast and
-        // decrement in microseconds, so the sweep only ever waits for real sends.
-        java.util.concurrent.atomic.AtomicInteger sweep = submitsInFlight(listener);
-        long sweepDeadline = System.currentTimeMillis() + 2000;
-        while (sweep.get() > 0 && System.currentTimeMillis() < sweepDeadline) {
-            try {
-                Thread.sleep(20);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                break;
+        if (graceful) {
+            // Post-flip sweep (Phase 5 finding #2): a submit that incremented before the
+            // flip may still be in flight; with increment-before-check on the submit
+            // side, this bounded wait closes the reservation race - post-flip submits
+            // fail fast and decrement in microseconds, so the sweep only ever waits for
+            // real sends. GRACEFUL ONLY (stage-2 F5): immediateStop's documented
+            // contract is to close the socket under an in-flight submit, and the sweep
+            // sitting outside this if() was exactly the unrecorded 2s wait that made
+            // three published latency claims false. Note this runs even at
+            // gracefulStopTimeout=0: the sweep is reservation-race CORRECTNESS, only
+            // the drain above is grace (design-review L11 verdict).
+            java.util.concurrent.atomic.AtomicInteger sweep = submitsInFlight(listener);
+            long sweepDeadline = System.currentTimeMillis() + 2000;
+            while (sweep.get() > 0 && System.currentTimeMillis() < sweepDeadline) {
+                try {
+                    Thread.sleep(20);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
             }
         }
         Object result = closeSession(listener);  // null-safe; outside the lock (network I/O)
@@ -621,16 +696,65 @@ public final class NativeListener {
         }
     }
 
+    /**
+     * Unbinds and closes the installed session, bounded by the D11 watchdog: jsmpp's
+     * {@code unbindAndClose()} has three unbounded segments (see {@code CLOSE_WATCHDOG_MS})
+     * and on a wedged session {@code isBound()} is still true, so the wedge path is
+     * precisely the path that DOES attempt an unbind on a dead socket. The watchdog is a
+     * dedicated daemon thread - never the rebind executor (single-threaded and possibly
+     * the very thread that is stalled), never a virtual thread (ASYNC+submit can pin the
+     * carrier pool, and a watchdog schedulable only on a resource the pathology exhausts
+     * is not a watchdog) - armed HERE, after the drain and sweep (a graceful drain longer
+     * than the bound must not be force-closed mid-drain), fire-and-forget, never joined
+     * (on TLS a close can itself block; the thread is disposable). It touches ONLY the
+     * raw transport: no connector lock, no jsmpp Session/SessionContext method. Calling
+     * session.close() from a drop path instead is the F2 deadlock (stateLock -> context
+     * monitor inversion against the reader) - do not "simplify" to that.
+     *
+     * <p>Why one raw {@code Socket.close()} suffices to unwedge all three segments:
+     * the stalled writer throws and RELEASES the {@code os} monitor; the
+     * EnquireLinkSender acquires it, fails its write (logged-and-continued for
+     * enquire_link), and its {@code waitDone} sees the interrupt {@code close()} already
+     * delivered before parking in {@code join()} - so the sender's run loop exits, the
+     * join returns, and {@code ctx.close()} fires CLOSED (suppressed: state is STOPPING).
+     * The watchdog never interrupts anything itself; jsmpp's own pending interrupt is
+     * what completes the choreography (design-review verification of the D11 chain).
+     */
     private static Object closeSession(BObject listener) {
         SMPPSession session = session(listener).get();
-        if (session != null) {
-            try {
-                session.unbindAndClose();
-            } catch (Exception e) {
-                return ModuleUtils.createError("failed to unbind SMSC session: " + e.getMessage());
+        if (session == null) {
+            return null;
+        }
+        ObservedConnection conn = observedConn(listener).get();
+        Thread watchdog = null;
+        if (conn != null) {
+            Thread w = new Thread(() -> {
+                try {
+                    Thread.sleep(CLOSE_WATCHDOG_MS);
+                } catch (InterruptedException e) {
+                    return; // unbindAndClose completed in time; nothing to break
+                }
+                conn.forceClose();
+            }, "smpp-close-watchdog");
+            w.setDaemon(true);
+            w.start();
+            watchdog = w;
+        }
+        try {
+            session.unbindAndClose();
+        } catch (Exception e) {
+            return ModuleUtils.createError("failed to unbind SMSC session: " + e.getMessage());
+        } finally {
+            if (watchdog != null) {
+                watchdog.interrupt();
             }
         }
         return null;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static AtomicReference<ObservedConnection> observedConn(BObject listener) {
+        return (AtomicReference<ObservedConnection>) listener.getNativeData(NATIVE_OBSERVED_CONN);
     }
 
     private static Dispatcher dispatcher(BObject listener) {
@@ -691,20 +815,27 @@ public final class NativeListener {
      */
     @SuppressWarnings("unchecked")
     private static SMPPSession newSession(BObject listener, int connectTimeoutMillis,
-            AtomicReference<Runnable> onTransportDeath, long submitTransactionTimerMs) throws Exception {
+            AtomicReference<Runnable> onTransportDeath,
+            AtomicReference<ObservedConnection> attemptConn, long submitTransactionTimerMs)
+            throws Exception {
         Object tls = listener.getNativeData(NATIVE_TLS);
-        org.jsmpp.session.connection.ConnectionFactory delegate = tls == null
+        RawConnectionFactory delegate = tls == null
                 ? new SmppPlainConnectionFactory(connectTimeoutMillis)
                 : buildSslFactory((BMap<BString, Object>) tls, connectTimeoutMillis);
         // Every connection this session ever opens is observed - the connector's own
         // transport-death signal, independent of jsmpp's CLOSED listener. See
-        // ObservedConnection for the reader-death wedge this guards against. The session
-        // itself is a ConnectorSession: submits wait the configured transactionTimeout,
-        // jsmpp's housekeeping (unbind, enquire-link probes, reader exit) is bounded at
+        // ObservedConnection for the reader-death wedge this guards against and for the
+        // raw-socket force-close primitive (D11). The session itself is a
+        // ConnectorSession: submits wait the configured transactionTimeout, jsmpp's
+        // housekeeping (unbind, enquire-link probes, reader exit) is bounded at
         // ConnectorSession.HOUSEKEEPING_TIMER_MS - see that class for the split.
-        return new ConnectorSession((host, port) ->
-                new ObservedConnection(delegate.createConnection(host, port), onTransportDeath),
-                submitTransactionTimerMs);
+        return new ConnectorSession((host, port) -> {
+            RawConnectionFactory.RawConnection raw = delegate.createRawConnection(host, port);
+            ObservedConnection observed =
+                    new ObservedConnection(raw.connection(), raw.rawSocket(), onTransportDeath);
+            attemptConn.set(observed);
+            return observed;
+        }, submitTransactionTimerMs);
     }
 
     /** Field names here mirror listener.bal's internal ResolvedTls record exactly. */

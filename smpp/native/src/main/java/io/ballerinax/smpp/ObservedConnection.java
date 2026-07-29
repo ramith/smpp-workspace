@@ -56,10 +56,40 @@ import java.util.concurrent.atomic.AtomicReference;
  * so whichever of the two signals arrives first — jsmpp's CLOSED listener or this one —
  * reports the drop exactly once, and the other is a no-op.
  *
- * <p>Deliberately NOT reported: {@link #close()}. A close is either this connector
- * stopping (user-initiated; never a drop) or jsmpp's own close choreography running — and
- * if that choreography runs to completion, the CLOSED listener fires normally. Reporting
- * close() would add nothing and would fire on every graceful stop.
+ * <p>{@link #close()} is the FOURTH signal (Sprint 8.5, stage-2 finding N2). It was
+ * originally not reported, on the reasoning that "if jsmpp's choreography runs to
+ * completion, the CLOSED listener fires normally" — but that reasoning fails exactly
+ * where it matters: {@code AbstractSession.close()} invoked <em>by the
+ * EnquireLinkSender on itself</em> (the ordinary enquire-link-timeout dead-link path,
+ * AbstractSession.java:543-552) structurally skips {@code ctx.close()} via the
+ * {@code Thread.currentThread() != enquireLinkSender} guard at :264 — CLOSED never
+ * fires from the closing thread. Normally the reader then observes the closed socket
+ * from {@code read()} and both remaining signals engage; but under inbound overflow the
+ * reader can be parked on {@code monitorenter(os)} (it sends NACKs through
+ * {@code SynchronizedPDUSender}, SMPPSession.java:705/:713) behind a stalled writer —
+ * it never reaches {@code read()}, and with the stream signal blind and CLOSED skipped,
+ * ZERO signals fire while submits keep being accepted onto a dead socket. Reporting
+ * {@code close()} — which the self-closing sender has just called first-hand — closes
+ * that hole, independent of the reader thread.
+ *
+ * <p>The conditionality lives in the SHARED guards, never here (design review,
+ * FINDING-1): {@code fireOnce()} always invokes the handler, and
+ * {@code scheduleTransportDeathCheck} suppresses at schedule time (state
+ * STOPPING/STOPPED = user teardown) and re-checks {@code installed} + the
+ * {@code dropReported} CAS at fire time (+1s). Classification of every
+ * {@code Connection.close()} reacher (design-review table): connector
+ * {@code closeSession}/{@code abortedByStop} — state already STOPPING, suppressed;
+ * connectAndBind failure closes — {@code installed} still false at fire time,
+ * suppressed; EnquireLinkSender self-close — REPORTS (the target); reader-loop and
+ * pduExecutor closes — report, deduped by the CAS against the stream signal and
+ * CLOSED; {@code SMPPSession.finalize()} on an abandoned session — suppressed only
+ * because every abandonment path latches that attempt's {@code dropReported} first
+ * (an invariant, not an accident — do not reorder).
+ *
+ * <p>{@link #forceClose()} is the bounded-close watchdog primitive (D11): it closes the
+ * PRE-TLS raw socket and nothing else. See {@link RawConnectionFactory} for why the
+ * raw socket is the only safe target, and note it deliberately does NOT fire the
+ * signal — the unblocked reader's own IOException does, and the guards classify it.
  *
  * <p>This is transport observation on a stream this connector already owns (both
  * connection factories are ours) — no jsmpp behaviour is altered, no reflection is used.
@@ -67,6 +97,7 @@ import java.util.concurrent.atomic.AtomicReference;
 final class ObservedConnection implements Connection {
 
     private final Connection delegate;
+    private final java.net.Socket rawSocket;
     private final AtomicReference<Runnable> onTransportDeath;
     private final AtomicBoolean fired = new AtomicBoolean(false);
     // jsmpp fetches the stream once per session, but idempotence is cheap: always hand
@@ -75,6 +106,8 @@ final class ObservedConnection implements Connection {
 
     /**
      * @param delegate the real connection from the plain/TLS factory
+     * @param rawSocket the pre-TLS raw socket beneath {@code delegate} — the
+     *     {@link #forceClose()} target; may be null in unit tests (forceClose no-ops)
      * @param onTransportDeath holder for the death callback; may still be empty when the
      *     connection is created (the callback is armed later in {@code bind()}, before
      *     {@code connectAndBind} — which is what creates this connection — returns). A
@@ -82,9 +115,32 @@ final class ObservedConnection implements Connection {
      *     happen only during the connect/bind phase, whose failures {@code connectAndBind}
      *     itself surfaces to the caller.
      */
-    ObservedConnection(Connection delegate, AtomicReference<Runnable> onTransportDeath) {
+    ObservedConnection(Connection delegate, java.net.Socket rawSocket,
+            AtomicReference<Runnable> onTransportDeath) {
         this.delegate = delegate;
+        this.rawSocket = rawSocket;
         this.onTransportDeath = onTransportDeath;
+    }
+
+    /**
+     * Force-closes the pre-TLS raw socket — the bounded-close watchdog primitive (D11).
+     * Deliberately NOT {@code delegate.close()}: on TLS that is {@code SSLSocket.close()},
+     * which attempts a close_notify write and can block behind the very stall this
+     * exists to break. A raw {@code Socket.close()} takes no jsmpp or JSSE lock and
+     * asynchronously unblocks threads parked in read/write on this socket (JDK
+     * asynchronous close — pinned by {@code forceCloseUnblocksAParkedWrite}). Idempotent;
+     * never throws. Does not fire the death signal itself: the unblocked reader's own
+     * IOException does, and the schedule/fire-time guards classify it (T2.4).
+     */
+    void forceClose() {
+        if (rawSocket == null) {
+            return;
+        }
+        try {
+            rawSocket.close();
+        } catch (IOException ignored) {
+            // best-effort: already closed or already broken - both count as closed here
+        }
     }
 
     private void fireOnce() {
@@ -176,7 +232,13 @@ final class ObservedConnection implements Connection {
 
     @Override
     public void close() throws IOException {
-        // Deliberately not a death signal - see the class doc.
+        // The FOURTH drop signal (stage-2 N2) - see the class doc. fireOnce() runs
+        // BEFORE the delegate close and unconditionally: the conditionality (stop vs
+        // bind-phase vs genuine drop) lives entirely in scheduleTransportDeathCheck's
+        // split-phase guards + the dropReported CAS, which already classify every
+        // caller correctly (design review, FINDING-1 - a close()-time guard here would
+        // re-open the install-sliver wedge).
+        fireOnce();
         delegate.close();
     }
 
