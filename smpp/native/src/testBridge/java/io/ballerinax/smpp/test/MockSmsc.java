@@ -82,6 +82,14 @@ final class MockSmsc {
     // Monotonic so a test can assert which submit produced which id, and so the value is
     // stable across runs (jsmpp's own generators are random).
     private final AtomicLong nextMessageId = new AtomicLong(1000);
+    // Identity-keyed record of which message_id this mock minted for which submit_sm, so a
+    // test can assert that the id the connector RETURNED is the id this mock actually sent -
+    // rather than inferring it from the monotonic counter, which stops being predictable the
+    // moment a test submits more than once or two tests share a mock. Identity, not equals:
+    // SubmitSm inherits Object identity, but two submits with the same body would collide
+    // under any value-based key.
+    private final Map<SubmitSm, String> submitMessageIds =
+            Collections.synchronizedMap(new IdentityHashMap<>());
     // Fault injection, both off by default. 0 = respond normally.
     private volatile int submitFailureStatus = 0;
     private volatile long submitDelayMillis = 0;
@@ -371,6 +379,9 @@ final class MockSmsc {
             String messageId = submitEmptyMessageId
                     ? ""
                     : Long.toString(nextMessageId.getAndIncrement());
+            // Recorded after the failure/delay branches above, so a submit that was rejected
+            // or that timed out has no entry - which is correct: no message_id was ever sent.
+            submitMessageIds.put(submitSm, messageId);
             try {
                 // The String ctors of SubmitSmResult are package-private; MessageId is the
                 // only public route. It declares PDUStringException but accepts both ""
@@ -456,6 +467,16 @@ final class MockSmsc {
                     + " within " + timeoutMillis + "ms");
         }
         return submitSm;
+    }
+
+    /**
+     * The {@code message_id} this mock returned in the {@code submit_sm_resp} for that exact
+     * PDU, or {@code null} if it never sent one (injected failure, or the response has not
+     * been built yet). A test awaits the submit, lets its own {@code submit} call return,
+     * then compares the two.
+     */
+    String messageIdFor(SubmitSm submitSm) {
+        return submitMessageIds.get(submitSm);
     }
 
     /** How many captured submits are still unread on this connection (0 if unknown). */

@@ -360,6 +360,31 @@ isolated function mockSmscSubmitDestAddrNpi(int submitId) returns int = @java:Me
     name: "submitDestAddrNpi"
 } external;
 
+# The `message_id` the mock returned in the `submit_sm_resp` for this exact PDU, or `""` if
+# it sent none (an injected failure, or a response not yet built).
+#
+# Use this instead of predicting the mock's monotonic counter: the counter is only
+# predictable for the first submit of a run, whereas this stays correct when a test submits
+# repeatedly or shares a mock. Capture happens before the response is composed, so read it
+# only after the connector's own `submit` has returned.
+#
+# + submitId - the handle from `mockSmscAwaitNextSubmit`
+# + return - the `message_id` sent to the client, or `""`
+isolated function mockSmscSubmitMessageId(int submitId) returns string = @java:Method {
+    'class: "io.ballerinax.smpp.test.MockSmscBridge",
+    name: "submitMessageId"
+} external;
+
+# The `sequence_number` jsmpp assigned to this submit — the only correlation handle a failed
+# submit has.
+#
+# + submitId - the handle from `mockSmscAwaitNextSubmit`
+# + return - the `sequence_number`
+isolated function mockSmscSubmitSequenceNumber(int submitId) returns int = @java:Method {
+    'class: "io.ballerinax.smpp.test.MockSmscBridge",
+    name: "submitSequenceNumber"
+} external;
+
 # Makes every subsequent `submit_sm` answer with this `command_status` instead of
 # succeeding; the client sees it as a negative response. Pass 0 to restore normal
 # behaviour.

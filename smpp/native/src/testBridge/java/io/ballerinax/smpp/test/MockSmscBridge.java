@@ -157,6 +157,11 @@ public final class MockSmscBridge {
 
     private static final AtomicLong NEXT_SUBMIT_ID = new AtomicLong(1);
     private static final ConcurrentHashMap<Long, SubmitSm> SUBMITS = new ConcurrentHashMap<>();
+    // Which mock minted each handle. The message_id lives on the mock, not on the SubmitSm
+    // bean (it is a field of the RESPONSE), so submitMessageId has to get back to the right
+    // instance. Kept parallel to SUBMITS rather than changing that map's value type, so the
+    // dozen existing accessors are untouched.
+    private static final ConcurrentHashMap<Long, Long> SUBMIT_MOCKS = new ConcurrentHashMap<>();
 
     /**
      * Blocks until the next submit_sm arrives on this connection; returns a handle to it.
@@ -167,7 +172,32 @@ public final class MockSmscBridge {
         SubmitSm submitSm = mock(mockId).awaitNextSubmit(connectionId, timeoutMillis);
         long handle = NEXT_SUBMIT_ID.getAndIncrement();
         SUBMITS.put(handle, submitSm);
+        SUBMIT_MOCKS.put(handle, mockId);
         return handle;
+    }
+
+    /**
+     * The {@code message_id} the mock returned for this submit, or {@code ""} if it sent none.
+     *
+     * <p>Capture happens before the response is built, so this is only populated once the
+     * connector's own {@code submit} has returned. That ordering is the point: a test awaits
+     * the PDU, lets its submit complete, then asserts the two ids are the same string. The
+     * alternative - predicting the monotonic counter - stops working the moment a test
+     * submits twice.
+     */
+    public static BString submitMessageId(long submitId) {
+        SubmitSm submitSm = submit(submitId);
+        Long mockId = SUBMIT_MOCKS.get(submitId);
+        String id = mockId == null ? null : mock(mockId).messageIdFor(submitSm);
+        return StringUtils.fromString(id == null ? "" : id);
+    }
+
+    /**
+     * The {@code sequence_number} jsmpp assigned to this submit — the only correlation handle
+     * a failed submit has, and what item 7 surfaces in the error detail.
+     */
+    public static int submitSequenceNumber(long submitId) {
+        return submit(submitId).getSequenceNumber();
     }
 
     /** Captured submits not yet read on this connection — for asserting "and no more". */
