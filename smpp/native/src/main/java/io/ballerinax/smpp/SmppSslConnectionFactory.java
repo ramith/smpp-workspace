@@ -49,7 +49,7 @@ import javax.net.ssl.X509TrustManager;
  * {@code trustAll} is a dev-only escape hatch that also forces hostname
  * verification off. No thrown message ever contains a password.
  */
-public final class SmppSslConnectionFactory implements ConnectionFactory {
+public final class SmppSslConnectionFactory implements ConnectionFactory, RawConnectionFactory {
 
     private final SSLSocketFactory socketFactory;
     private final String[] enabledProtocols;      // null => JVM defaults
@@ -113,10 +113,19 @@ public final class SmppSslConnectionFactory implements ConnectionFactory {
 
     @Override
     public Connection createConnection(String host, int port) throws IOException {
-        // Starts as the plain socket; after the TLS layer takes ownership (autoClose),
-        // `socket` is reassigned to the SSLSocket so the single catch below closes the
-        // right thing exactly once - no leaked file descriptor on a failed attempt.
-        Socket socket = new Socket();
+        return createRawConnection(host, port).connection();
+    }
+
+    @Override
+    public RawConnection createRawConnection(String host, int port) throws IOException {
+        // `raw` is the pre-TLS socket and stays valid for the connection's whole life -
+        // it is the force-close target for the bounded-close watchdog (D11), because
+        // SSLSocket.close() attempts a close_notify write and can block on the dead
+        // transport the watchdog assumes. `socket` is reassigned to the SSLSocket after
+        // the TLS layer takes ownership (autoClose), so the single catch below closes
+        // the right thing exactly once - no leaked file descriptor on a failed attempt.
+        Socket raw = new Socket();
+        Socket socket = raw;
         try {
             socket.connect(new InetSocketAddress(host, port), connectTimeoutMillis);
             SSLSocket sslSocket = (SSLSocket) socketFactory.createSocket(socket, host, port, true);
@@ -140,7 +149,7 @@ public final class SmppSslConnectionFactory implements ConnectionFactory {
             sslSocket.setSoTimeout(connectTimeoutMillis);
             sslSocket.startHandshake();
 
-            return new SocketConnection(sslSocket);
+            return new RawConnection(new SocketConnection(sslSocket), raw);
         } catch (IOException | RuntimeException e) {
             closeQuietly(socket);
             throw e;

@@ -42,9 +42,11 @@ class OutboundSmsMappingTest {
         assertArrayEquals("hello".getBytes(StandardCharsets.ISO_8859_1), req.body);
         assertEquals((byte) 0x00, req.registeredDelivery, "no receipt requested MUST be 0 - "
                 + "the negative is what catches an always-on bug");
-        // Point-to-point defaults, asserted on the composed byte.
-        assertEquals((byte) 0x00, req.esmClass, "esm_class must be 0x00: nonzero changes "
-                + "SMSC routing and billing invisibly");
+        // Point-to-point defaults, asserted on the composed byte. Since D15 this is a
+        // DEFAULT-PATH assertion, not an invariant: BinarySms.udhi legitimately sets
+        // bit 6 (see udhiSetsEsmClassBit6AndNothingElse). Every other bit stays locked.
+        assertEquals((byte) 0x00, req.esmClass, "default esm_class must be 0x00: nonzero "
+                + "changes SMSC routing and billing invisibly");
         assertEquals((byte) 0x00, req.protocolId);
         assertEquals((byte) 0x00, req.priorityFlag);
         assertEquals((byte) 0x00, req.replaceIfPresent);
@@ -98,6 +100,56 @@ class OutboundSmsMappingTest {
         NativeCaller.SubmitRequest req = NativeCaller.compose(spec);
         assertArrayEquals(new byte[] {0x01, 0x02, (byte) 0xFF}, req.body);
         assertEquals((byte) 0x00, req.dataCoding);
+    }
+
+    @Test
+    void udhiSetsEsmClassBit6AndNothingElse() throws Exception {
+        // D15: the one user-controlled esm_class bit. A 6-octet concatenation UDH
+        // (05 00 03 ref total seq) + one payload octet, declared via udhi.
+        NativeCaller.SubmitSpec spec = new NativeCaller.SubmitSpec();
+        spec.destAddr = "264811234567";
+        spec.shortMessageBytes = new byte[] {0x05, 0x00, 0x03, 0x2A, 0x02, 0x01, 0x41};
+        spec.dataCoding = 0x00;
+        spec.udhi = true;
+        NativeCaller.SubmitRequest req = NativeCaller.compose(spec);
+        assertEquals((byte) 0x40, req.esmClass, "udhi must set exactly bit 6");
+        // udhi does not leak into any sibling field.
+        assertEquals((byte) 0x00, req.registeredDelivery);
+        assertEquals((byte) 0x00, req.protocolId);
+        // Default stays 0x00 on the bytes path too.
+        spec.udhi = false;
+        assertEquals((byte) 0x00, NativeCaller.compose(spec).esmClass);
+    }
+
+    @Test
+    void udhiWithTextRejected() {
+        // Structurally impossible from typed Ballerina (TextSms has no udhi field);
+        // this pins the native backstop for the untyped interop BMap: the connector
+        // encodes shortMessage itself and produces no UDH, so UDHI would declare a
+        // header that does not exist - the same wrong-meaning class as M6, inverted.
+        NativeCaller.SubmitSpec spec = minimalText();
+        spec.udhi = true;
+        NativeCaller.InvalidRequest e =
+                assertThrows(NativeCaller.InvalidRequest.class, () -> NativeCaller.compose(spec));
+        assertTrue(e.getMessage().contains("udhi"), e.getMessage());
+    }
+
+    @Test
+    void emptyBodyRejectedOnBothArms() {
+        // L10: sm_length = 0 means "payload in message_payload" (section 5.2.21), which
+        // this connector never sets - reject locally instead of drawing ESME_RINVMSGLEN.
+        NativeCaller.SubmitSpec text = minimalText();
+        text.shortMessage = "";
+        NativeCaller.InvalidRequest e1 =
+                assertThrows(NativeCaller.InvalidRequest.class, () -> NativeCaller.compose(text));
+        assertTrue(e1.getMessage().contains("shortMessage"), e1.getMessage());
+        NativeCaller.SubmitSpec bytes = new NativeCaller.SubmitSpec();
+        bytes.destAddr = "264811234567";
+        bytes.shortMessageBytes = new byte[0];
+        bytes.dataCoding = 0x00;
+        NativeCaller.InvalidRequest e2 =
+                assertThrows(NativeCaller.InvalidRequest.class, () -> NativeCaller.compose(bytes));
+        assertTrue(e2.getMessage().contains("shortMessageBytes"), e2.getMessage());
     }
 
     @Test
@@ -218,6 +270,29 @@ class OutboundSmsMappingTest {
         NativeCaller.SubmitSpec bad = minimalText();
         bad.destTon = "TON_BOGUS";
         assertThrows(NativeCaller.InvalidRequest.class, () -> NativeCaller.compose(bad));
+
+        // The NUMERIC values, pinned separately (stage-2 §E): inbound TON/NPI reach the
+        // user as raw ints on Sms.properties (Dispatcher.toProperties), so the outbound
+        // enum and the inbound integers are only reconcilable if these values hold. A
+        // jsmpp renumbering would leave every outbound name resolving fine while
+        // silently changing what an inbound 5 means - invisible to the table above.
+        assertEquals(0, TypeOfNumber.UNKNOWN.value());
+        assertEquals(1, TypeOfNumber.INTERNATIONAL.value());
+        assertEquals(2, TypeOfNumber.NATIONAL.value());
+        assertEquals(3, TypeOfNumber.NETWORK_SPECIFIC.value());
+        assertEquals(4, TypeOfNumber.SUBSCRIBER_NUMBER.value());
+        assertEquals(5, TypeOfNumber.ALPHANUMERIC.value());
+        assertEquals(6, TypeOfNumber.ABBREVIATED.value());
+        assertEquals(0, NumberingPlanIndicator.UNKNOWN.value());
+        assertEquals(1, NumberingPlanIndicator.ISDN.value());
+        assertEquals(3, NumberingPlanIndicator.DATA.value());
+        assertEquals(4, NumberingPlanIndicator.TELEX.value());
+        assertEquals(6, NumberingPlanIndicator.LAND_MOBILE.value());
+        assertEquals(8, NumberingPlanIndicator.NATIONAL.value());
+        assertEquals(9, NumberingPlanIndicator.PRIVATE.value());
+        assertEquals(10, NumberingPlanIndicator.ERMES.value());
+        assertEquals(14, NumberingPlanIndicator.INTERNET.value());
+        assertEquals(18, NumberingPlanIndicator.WAP.value());
     }
 
     @Test
@@ -241,6 +316,44 @@ class OutboundSmsMappingTest {
                     () -> NativeCaller.compose(spec));
             assertTrue(!e.getMessage().contains(bad), "must not echo the value: " + e.getMessage());
         }
+    }
+
+    @Test
+    void nonAsciiAddressFieldsRejectedNamingIndexNotValue() {
+        // jsmpp counts address/C-octet fields in UTF-16 code units (StringValidator uses
+        // value.length()) but WRITES them with String.getBytes() in the platform default
+        // charset (PDUByteBuffer.append(String)) - so a non-ASCII sender ID passes both
+        // validators and overflows the field on the wire, with bytes that vary by
+        // -Dfile.encoding (stage-2 finding H2). ASCII-only makes the length checks exact.
+        NativeCaller.SubmitSpec dest = minimalText();
+        dest.destAddr = "2648É1234";
+        NativeCaller.InvalidRequest e1 =
+                assertThrows(NativeCaller.InvalidRequest.class, () -> NativeCaller.compose(dest));
+        assertTrue(e1.getMessage().contains("destAddr"), e1.getMessage());
+        assertTrue(e1.getMessage().contains("index 4"), e1.getMessage());
+        assertTrue(!e1.getMessage().contains("É"), "must not echo the value");
+
+        // The exposure the docs actively recommend: an alphanumeric sender ID.
+        NativeCaller.SubmitSpec src = minimalText();
+        src.sourceAddr = "Café";
+        src.sourceTon = "TON_ALPHANUMERIC";
+        NativeCaller.InvalidRequest e2 =
+                assertThrows(NativeCaller.InvalidRequest.class, () -> NativeCaller.compose(src));
+        assertTrue(e2.getMessage().contains("sourceAddr"), e2.getMessage());
+        assertTrue(e2.getMessage().contains("index 3"), e2.getMessage());
+
+        // Cyrillic Т in serviceType - visually identical to ASCII T, wire-different.
+        NativeCaller.SubmitSpec svc = minimalText();
+        svc.serviceType = "CMТ";
+        NativeCaller.InvalidRequest e3 =
+                assertThrows(NativeCaller.InvalidRequest.class, () -> NativeCaller.compose(svc));
+        assertTrue(e3.getMessage().contains("serviceType"), e3.getMessage());
+
+        // ASCII alphanumeric sender IDs stay legal - the restriction is charset, not shape.
+        NativeCaller.SubmitSpec ok = minimalText();
+        ok.sourceAddr = "INFO";
+        ok.sourceTon = "TON_ALPHANUMERIC";
+        assertEquals("INFO", assertDoesNotThrowCompose(ok).srcAddr);
     }
 
     @Test

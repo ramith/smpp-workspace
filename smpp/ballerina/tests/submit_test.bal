@@ -24,6 +24,12 @@ const int SUBMIT_CONCURRENT_TEST_PORT = 27820;
 const int SUBMIT_STALL_TEST_PORT = 27821;
 const int SUBMIT_LATE_RESP_PORT = 27822;
 const int SUBMIT_DUP_MT_PORT = 27823;
+const int SUBMIT_UDHI_TEST_PORT = 27824;
+const int SUBMIT_ABANDONED_TEST_PORT = 27825;
+const int SUBMIT_FLAP_TEST_PORT = 27827;
+const int SUBMIT_SHAPES_PORT_4 = 27830;
+const int SUBMIT_SHAPES_PORT_5 = 27831;
+const int SUBMIT_ANYDATA_TEST_PORT = 27832;
 
 // Cleanup state for the after: hooks (the house pattern - see data_sm_test.bal for why
 // @test:AfterEach is unusable). A listener leaked by a failed assertion would otherwise
@@ -136,6 +142,62 @@ isolated service class PlainSmsService {
     *Service;
 
     remote isolated function onDeliverSm(Sms sms) returns error? {
+        lock {
+            submitTestDispatches += 1;
+        }
+    }
+}
+
+// `readonly & Sms` - compile-valid, idiomatic, and legal in 1.0.1 (where the parameter
+// was matched by name alone). Stage-2 H5: getReferredType unwraps type-reference chains
+// but NOT intersections, so this shape made the whole attach fail with "unsupported
+// type" - a hard startup failure on a signature users write, in the very release whose
+// headline feature is signature flexibility.
+isolated service class ReadonlySmsService {
+    *Service;
+
+    remote isolated function onDeliverSm(readonly & Sms sms) returns error? {
+        lock {
+            submitTestDispatches += 1;
+        }
+    }
+}
+
+type ReadonlySms readonly & Sms;
+
+isolated string anydataOutcome = "";
+
+isolated function anydataResult() returns string {
+    lock {
+        return anydataOutcome;
+    }
+}
+
+// Every observability integration does this, and nothing in the suite did before
+// Sprint 8.5 - which is how M9 survived: Sms.properties was built with the argless
+// createMapValue(), i.e. runtime type map<any>, into a field DECLARED map<anydata>.
+// RecordValueImpl.put does not type-check, so it went unnoticed until an anydata
+// operation inspected the member's runtime type.
+isolated service class AnydataProbingService {
+    *Service;
+
+    remote isolated function onDeliverSm(Sms sms) returns error? {
+        json j = check sms.toJson();
+        Sms copy = sms.clone();
+        readonly & Sms frozen = sms.cloneReadOnly();
+        lock {
+            anydataOutcome = j is map<json> && copy.shortMessage == sms.shortMessage
+                    && frozen.shortMessage == sms.shortMessage ? "ok" : "unexpected shape";
+        }
+    }
+}
+
+// The same shape behind an alias: getReferredType unwraps the reference and stops at the
+// intersection, so this failed for the same reason by a different route.
+isolated service class ReadonlyAliasSmsService {
+    *Service;
+
+    remote isolated function onDeliverSm(ReadonlySms sms) returns error? {
         lock {
             submitTestDispatches += 1;
         }
@@ -377,6 +439,73 @@ function testSubmitHappyPathPinsWirePdu() returns error? {
 }
 
 @test:Config {after: cleanupSubmitTest, groups: ["submit"]}
+function testSmsIsGenuinelyAnydata() returns error? {
+    // M9: toJson/clone/cloneReadOnly all inspect the RUNTIME type of every member. A
+    // map<any> properties map is not a subtype of anydata, so each of these would fail
+    // on a record that type-checks statically. Pins the typed createMapValue.
+    lock {
+        anydataOutcome = "";
+    }
+    int mockId = check mockSmscOpen(SUBMIT_ANYDATA_TEST_PORT);
+    submitTestMockId = mockId;
+    Listener smsListener = check new ({
+        host: "localhost",
+        port: SUBMIT_ANYDATA_TEST_PORT,
+        systemId: "test",
+        password: "test",
+        bindType: TRANSCEIVER
+    });
+    submitTestListener = smsListener;
+    check smsListener.attach(new AnydataProbingService());
+    check smsListener.'start();
+    int conn = check mockSmscAwaitNextBind(mockId, 5000);
+    check mockSmscSendDeliverSm(mockId, conn, "anydata probe", "", 0);
+
+    test:assertTrue(pollUntil(isolated function() returns boolean {
+        return anydataResult() != "";
+    }, 5), "the handler never completed - an anydata operation on Sms panicked or failed");
+    test:assertEquals(anydataResult(), "ok",
+            "Sms must survive toJson/clone/cloneReadOnly - properties must be map<anydata>");
+
+    check smsListener.gracefulStop();
+    mockSmscClose(mockId);
+}
+
+@test:Config {after: cleanupSubmitTest, groups: ["submit"]}
+function testUdhiBinarySubmitPinsEsmClassAtWire() returns error? {
+    var [mockId, conn, smsListener] = check startCapturingListener(
+            SUBMIT_UDHI_TEST_PORT, new CallerCapturingService());
+    Caller caller = <Caller>capturedCaller();
+
+    // A 6-octet concatenation UDH (05 00 03 ref total seq) + two payload octets,
+    // declared via BinarySms.udhi (D15). Without bit 6 the handset would render the
+    // header octets as visible garbage - the wire byte is the whole point here.
+    byte[] udhPayload = [0x05, 0x00, 0x03, 0x2A, 0x02, 0x01, 0x41, 0x42];
+    SubmitResult r = check caller->submit({
+        destAddr: "264811234567",
+        shortMessageBytes: udhPayload,
+        dataCoding: 0x00,
+        udhi: true
+    });
+    int submitUdh = check mockSmscAwaitNextSubmit(mockId, conn, 5000);
+    test:assertEquals(mockSmscSubmitEsmClass(submitUdh), 0x40,
+            "udhi must set exactly esm_class bit 6 at the wire (section 5.2.12)");
+    test:assertEquals(mockSmscSubmitShortMessageBytes(submitUdh), udhPayload,
+            "the UDH-bearing payload must pass verbatim");
+    test:assertEquals(mockSmscSubmitDataCoding(submitUdh), 0x00);
+    test:assertEquals(r.messageId, mockSmscSubmitMessageId(submitUdh));
+
+    // udhi is per-message, not sticky: a following default-path submit stays 0x00.
+    _ = check caller->submit({destAddr: "264811234567", shortMessage: "plain"});
+    int submitPlain = check mockSmscAwaitNextSubmit(mockId, conn, 5000);
+    test:assertEquals(mockSmscSubmitEsmClass(submitPlain), 0x00,
+            "default esm_class must remain 0x00 on the very next submit");
+
+    check smsListener.gracefulStop();
+    mockSmscClose(mockId);
+}
+
+@test:Config {after: cleanupSubmitTest, groups: ["submit"]}
 function testSubmitOnReceiverBindIsRejected() returns error? {
     clearCapturedCaller();
     int mockId = check mockSmscOpen(SUBMIT_RECEIVER_TEST_PORT);
@@ -408,6 +537,113 @@ function testSubmitOnReceiverBindIsRejected() returns error? {
             "jsmpp state names must not leak - that is the guard-absent signature");
     test:assertEquals(e.detail().failureMode, INVALID_REQUEST);
 
+    check smsListener.gracefulStop();
+    mockSmscClose(mockId);
+}
+
+@test:Config {after: cleanupSubmitTest, groups: ["submit"]}
+function testExhaustedRebindYieldsLinkAbandoned() returns error? {
+    clearCapturedCaller();
+    int mockId = check mockSmscOpen(SUBMIT_ABANDONED_TEST_PORT);
+    submitTestMockId = mockId;
+    Listener smsListener = check new ({
+        host: "localhost",
+        port: SUBMIT_ABANDONED_TEST_PORT,
+        systemId: "test",
+        password: "test",
+        bindType: TRANSCEIVER,
+        rebindPolicy: {maxRebindAttempts: 0}
+    });
+    submitTestListener = smsListener;
+    check smsListener.attach(new CallerCapturingService());
+    check smsListener.'start();
+    int conn = check mockSmscAwaitNextBind(mockId, 5000);
+    check mockSmscSendDeliverSm(mockId, conn, "capture", "", 0);
+    test:assertTrue(pollUntil(isolated function() returns boolean {
+        return capturedCaller() !is ();
+    }, 5), "the dispatch never delivered a Caller");
+    Caller caller = <Caller>capturedCaller();
+
+    check mockSmscSever(mockId, conn);
+
+    // Poll until the drop is detected AND the terminal verdict latched: a submit in
+    // the sliver between sessionUsable=false and the latch may correctly see
+    // LINK_DOWN once - the two flags flip microseconds apart, in that order.
+    Error? abandoned = ();
+    int attempts = 0;
+    while abandoned is () {
+        SubmitResult|Error r = caller->submit({destAddr: "264811234567", shortMessage: "x"});
+        if r is Error && r.detail().failureMode == LINK_ABANDONED {
+            abandoned = r;
+        } else {
+            attempts += 1;
+            test:assertTrue(attempts < 50,
+                    "LINK_ABANDONED never surfaced with maxRebindAttempts: 0 after a sever");
+            runtime:sleep(0.1);
+        }
+    }
+    Error e = <Error>abandoned;
+    test:assertTrue(e.message().includes("new Listener"),
+            string `the remedy must be named in the message: ${e.message()}`);
+    test:assertEquals(e.detail().possiblySubmitted, false,
+            "an abandoned-link refusal provably never wrote - resubmit on a new Listener is safe");
+
+    check smsListener.gracefulStop();
+    mockSmscClose(mockId);
+}
+
+// D13's reason to exist: before Sprint 8.5, onUnexpectedDrop hardcoded attempt=1, so a
+// link that binds successfully and then drops (accept-then-kick: quota enforcement, an
+// L4 balancer resetting bound sessions) reset the counter on every cycle -
+// maxRebindAttempts never exhausted, backOffMultiplier never compounded, and "gave up"
+// was unreachable (stage-2 H1). This pins the fix: consecutive short-lived binds COUNT,
+// the flap terminates at the cap, and the terminal state is program-visible.
+@test:Config {after: cleanupSubmitTest, groups: ["submit"]}
+function testBindThenDropFlapExhaustsRebindAttempts() returns error? {
+    clearCapturedCaller();
+    clearRecordedErrors();
+    int mockId = check mockSmscOpen(SUBMIT_FLAP_TEST_PORT);
+    submitTestMockId = mockId;
+    Listener smsListener = check new ({
+        host: "localhost",
+        port: SUBMIT_FLAP_TEST_PORT,
+        systemId: "test",
+        password: "test",
+        bindType: TRANSCEIVER,
+        rebindPolicy: {initialRebindDelay: 0.1, maxRebindDelay: 0.5, backOffMultiplier: 2.0,
+                maxRebindAttempts: 2}
+    });
+    submitTestListener = smsListener;
+    check smsListener.attach(new CallerCapturingService());
+    // First bind is a normal one (enabling the flap before 'start() would race
+    // connectAndBind itself); capture the Caller while the link is healthy.
+    check smsListener.'start();
+    int conn = check mockSmscAwaitNextBind(mockId, 5000);
+    check mockSmscSendDeliverSm(mockId, conn, "capture", "", 0);
+    test:assertTrue(pollUntil(isolated function() returns boolean {
+        return capturedCaller() !is ();
+    }, 5), "the dispatch never delivered a Caller");
+    Caller caller = <Caller>capturedCaller();
+
+    // Every rebind from here on is accepted (bind_resp OK - the client-side install
+    // genuinely happens) and then instantly dropped: the flap.
+    mockSmscSetCloseAfterAccept(mockId, true);
+    check mockSmscSever(mockId, conn);
+
+    // Drop 1 (uptime of the healthy bind is seconds, far below the ~60s stability
+    // window, so the counter is NOT reset) -> attempts 2, 3 > maxRebindAttempts=2 ->
+    // give up. Before D13 this loop never terminated.
+    test:assertTrue(pollUntil(isolated function() returns boolean {
+        return recordedErrorsContaining("gave up") > 0;
+    }, 20), "the flap never exhausted maxRebindAttempts - the pre-D13 infinite-flap bug");
+
+    // The terminal verdict is program-visible, not just logged.
+    SubmitResult|Error r = caller->submit({destAddr: "264811234567", shortMessage: "x"});
+    test:assertTrue(r is Error, "submit after give-up must fail");
+    test:assertEquals((<Error>r).detail().failureMode, LINK_ABANDONED,
+            "an exhausted flap must latch LINK_ABANDONED");
+
+    mockSmscSetCloseAfterAccept(mockId, false);
     check smsListener.gracefulStop();
     mockSmscClose(mockId);
 }
@@ -526,9 +762,15 @@ function testCallerParamShapes() returns error? {
     Service[] accepted = [
         new PlainSmsService(),
         new CallerCapturingService(),
-        new CallerFirstService()
+        new CallerFirstService(),
+        // The two intersection shapes H5 restored: direct and behind an alias. They
+        // must ATTACH (the pre-8.5 failure) and DISPATCH (the freeze the plan performs
+        // for a readonly parameter must produce a value the runtime accepts).
+        new ReadonlySmsService(),
+        new ReadonlyAliasSmsService()
     ];
-    int[] shapePorts = [SUBMIT_SHAPES_TEST_PORT, SUBMIT_SHAPES_PORT_2, SUBMIT_SHAPES_PORT_3];
+    int[] shapePorts = [SUBMIT_SHAPES_TEST_PORT, SUBMIT_SHAPES_PORT_2, SUBMIT_SHAPES_PORT_3,
+            SUBMIT_SHAPES_PORT_4, SUBMIT_SHAPES_PORT_5];
     int portIndex = 0;
     foreach Service svc in accepted {
         int port = shapePorts[portIndex];

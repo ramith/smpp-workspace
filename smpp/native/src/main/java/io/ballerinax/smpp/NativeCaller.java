@@ -74,6 +74,8 @@ public final class NativeCaller {
     static final String CONFIG = "smpp.caller.config";
     static final String SESSION_USABLE = "smpp.caller.sessionUsable";
     static final String SUBMITS_IN_FLIGHT = "smpp.caller.submitsInFlight";
+    static final String REBIND_ABANDONED = "smpp.caller.rebindAbandoned";
+    static final String SELF_CLOSED = "smpp.caller.selfClosed";
 
     private NativeCaller() {}
 
@@ -89,10 +91,11 @@ public final class NativeCaller {
         String sourceAddr = "";
         String sourceTon = "TON_INTERNATIONAL";
         String sourceNpi = "NPI_ISDN";
-        String shortMessage;          // XOR shortMessageBytes
+        String shortMessage;          // XOR shortMessageBytes (TextSms vs BinarySms)
         String encoding = "LATIN1";   // ASCII | LATIN1 | UCS2
         byte[] shortMessageBytes;     // escape hatch; requires dataCoding
         Integer dataCoding;           // raw byte value, only with shortMessageBytes
+        boolean udhi;                 // esm_class bit 6; only with shortMessageBytes
         String registeredDelivery = "NONE";
         String serviceType = "";
         String validityPeriod;        // null = SMSC default
@@ -131,11 +134,20 @@ public final class NativeCaller {
         final String message;
         final String failureMode;
         final Integer commandStatus;
+        /**
+         * Whether the message may already have reached the SMSC (D-record F7). The
+         * semantics are "can a retry duplicate?", NOT "did it reach the wire": a
+         * REJECTED submit WAS written, but the SMSC definitively refused it, so a
+         * retry cannot duplicate — false.
+         */
+        final boolean possiblySubmitted;
 
-        MappedFailure(String message, String failureMode, Integer commandStatus) {
+        MappedFailure(String message, String failureMode, Integer commandStatus,
+                boolean possiblySubmitted) {
             this.message = message;
             this.failureMode = failureMode;
             this.commandStatus = commandStatus;
+            this.possiblySubmitted = possiblySubmitted;
         }
     }
 
@@ -151,6 +163,9 @@ public final class NativeCaller {
         SubmitRequest req = new SubmitRequest();
 
         // --- body: exactly one of shortMessage / shortMessageBytes ---
+        // The TextSms|BinarySms union makes the wrong combinations unrepresentable from
+        // typed Ballerina code (R1 reshape); these checks are the native-side backstop,
+        // because the BMap crossing interop is untyped.
         boolean hasText = spec.shortMessage != null;
         boolean hasBytes = spec.shortMessageBytes != null;
         if (hasText == hasBytes) {
@@ -173,6 +188,11 @@ public final class NativeCaller {
                 throw new InvalidRequest("dataCoding is only for shortMessageBytes; with shortMessage "
                         + "the encoding field decides the data_coding");
             }
+            if (spec.udhi) {
+                throw new InvalidRequest("udhi requires shortMessageBytes (a BinarySms): the "
+                        + "connector encodes shortMessage itself and produces no UDH, so UDHI "
+                        + "would declare a header that does not exist");
+            }
             req.body = encode(spec.shortMessage, spec.encoding);
             req.dataCoding = switch (spec.encoding) {
                 case "ASCII" -> 0x01;
@@ -180,6 +200,14 @@ public final class NativeCaller {
                 case "UCS2" -> 0x08;
                 default -> throw new InvalidRequest("unknown encoding: " + spec.encoding);
             };
+        }
+        if (req.body.length == 0) {
+            // sm_length = 0 means "the payload is in the message_payload TLV" (section
+            // 5.2.21), which this connector never sets - a conforming SMSC answers
+            // ESME_RINVMSGLEN for what is really a local input error (L10). Mirrors
+            // required()'s stance on empty destAddr.
+            throw new InvalidRequest((hasBytes ? "shortMessageBytes" : "shortMessage")
+                    + " must not be empty");
         }
         int max = maxLength(StringParameter.SHORT_MESSAGE);
         if (req.body.length > max) {
@@ -189,10 +217,12 @@ public final class NativeCaller {
 
         // --- addresses ---
         req.dstAddr = required(spec.destAddr, "destAddr");
+        checkAscii("destAddr", req.dstAddr);
         checkLength("destAddr", req.dstAddr, StringParameter.DESTINATION_ADDR);
         req.dstTon = ton(spec.destTon, "destAddr.ton");
         req.dstNpi = npi(spec.destNpi, "destAddr.npi");
         req.srcAddr = spec.sourceAddr == null ? "" : spec.sourceAddr;
+        checkAscii("sourceAddr", req.srcAddr);
         checkLength("sourceAddr", req.srcAddr, StringParameter.SOURCE_ADDR);
         if (req.srcAddr.isEmpty()) {
             // SMPP v3.4 section 4.4.1: a NULL source address and its TON/NPI move
@@ -208,6 +238,7 @@ public final class NativeCaller {
 
         // --- the rest ---
         req.serviceType = spec.serviceType == null ? "" : spec.serviceType;
+        checkAscii("serviceType", req.serviceType);
         checkLength("serviceType", req.serviceType, StringParameter.SERVICE_TYPE);
         req.validityPeriod = spec.validityPeriod;
         if (req.validityPeriod != null) {
@@ -231,9 +262,13 @@ public final class NativeCaller {
             case "ON_FAILURE_ONLY" -> 0x02;
             default -> throw new InvalidRequest("unknown registeredDelivery: " + spec.registeredDelivery);
         };
-        // Locked to plain point-to-point defaults. esm_class especially: a nonzero value
-        // is invisible in a happy-path test yet changes SMSC routing and billing.
-        req.esmClass = 0x00;
+        // Locked to plain point-to-point defaults, with ONE user-controlled exception:
+        // esm_class bit 6 (UDHI, 0x40) via BinarySms.udhi (D15) - section 5.2.12 requires
+        // it whenever the payload starts with a User Data Header, and without it the
+        // handset renders the header octets as visible garbage. Every other esm_class
+        // bit stays 0: the messaging-mode and message-type bits change SMSC routing and
+        // billing invisibly, and this connector has no machinery behind them.
+        req.esmClass = spec.udhi ? (byte) 0x40 : (byte) 0x00;
         req.protocolId = 0x00;
         req.priorityFlag = 0x00;
         req.scheduleDeliveryTime = null;
@@ -290,38 +325,82 @@ public final class NativeCaller {
      * checked branch of their own (D3).
      */
     static MappedFailure mapSubmitFailure(Throwable t) {
+        return mapSubmitFailure(t, false);
+    }
+
+    /**
+     * @param selfClosed whether THIS CONNECTOR closed the session (a stop, or the
+     *     reclaim of an abandoned dead link) — consulted ONLY in the response-timeout
+     *     branch. jsmpp has no fail-pending-on-close: a submit already parked awaiting
+     *     its {@code submit_sm_resp} is not woken when the socket closes under it, runs
+     *     its full {@code transactionTimeout}, and would otherwise masquerade as an SMSC
+     *     timeout — whose docs point the operator at delivery receipts that can never
+     *     arrive on a stopped listener (H4). Keyed off an explicit connector-set marker,
+     *     NEVER off {@code sessionUsable}: that flag also flips on genuine drops, where
+     *     TIMEOUT_DELIVERY_UNKNOWN is the truthful verdict.
+     */
+    static MappedFailure mapSubmitFailure(Throwable t, boolean selfClosed) {
         String msg = t.getMessage() != null ? t.getMessage() : t.getClass().getSimpleName();
         if (t instanceof InvalidRequest) {
-            return new MappedFailure(msg, "INVALID_REQUEST", null);
+            // Local refusal: provably never wrote.
+            return new MappedFailure(msg, "INVALID_REQUEST", null, false);
         }
         if (t instanceof NegativeResponseException e) {
-            return new MappedFailure("SMSC rejected the submit: " + msg, "REJECTED", e.getCommandStatus());
+            // Written AND definitively refused - a retry cannot duplicate.
+            return new MappedFailure("SMSC rejected the submit: " + msg, "REJECTED",
+                    e.getCommandStatus(), false);
         }
         if (t instanceof GenericNackResponseException e) {
             // Before InvalidResponseException: it is a subclass, and unlike its parent it
             // carries the SMSC's actual command_status - a generic_nack IS a rejection.
-            return new MappedFailure("SMSC answered generic_nack: " + msg, "REJECTED", e.getCommandStatus());
+            return new MappedFailure("SMSC answered generic_nack: " + msg, "REJECTED",
+                    e.getCommandStatus(), false);
         }
         if (t instanceof ResponseTimeoutException) {
+            if (selfClosed) {
+                // Names the connector's own close, not a network fault or SMSC
+                // slowness - and not "stop" alone, because the abandoned-dead-link
+                // reclaim sets the same marker (design-review FD3 change 1).
+                return new MappedFailure("this connector closed the session (a stop, or the "
+                        + "reclaim of a dead link) while the submit was awaiting its response: "
+                        + msg + " (the SMSC may have accepted the message before the close - "
+                        + "retrying may duplicate it)", "LINK_DOWN", null, true);
+            }
             return new MappedFailure("no submit_sm_resp within transactionTimeout: " + msg
                     + " (the SMSC may still have accepted the message - retrying may duplicate it)",
-                    "TIMEOUT_DELIVERY_UNKNOWN", null);
+                    "TIMEOUT_DELIVERY_UNKNOWN", null, true);
         }
         if (t instanceof InvalidResponseException) {
-            return new MappedFailure("invalid submit_sm_resp: " + msg, "PROTOCOL_ERROR", null);
+            // Sent; the response was unusable - acceptance unknown.
+            return new MappedFailure("invalid submit_sm_resp: " + msg, "PROTOCOL_ERROR", null, true);
         }
         if (t instanceof PDUException) {
             // Includes PDUStringException - jsmpp's own validator, which compose()'s
-            // pre-checks make a never-fires backstop.
-            return new MappedFailure("jsmpp rejected the request PDU: " + msg, "INVALID_REQUEST", null);
+            // pre-checks make a never-fires backstop. Thrown while COMPOSING, pre-write.
+            return new MappedFailure("jsmpp rejected the request PDU: " + msg, "INVALID_REQUEST",
+                    null, false);
         }
         if (t instanceof IOException) {
+            // jsmpp's ensureTransmittable throws a bare IOException naming the session id
+            // and its INTERNAL state ("Cannot submit_sm while session <id> in state
+            // CLOSED"). The lifecycle pre-checks exist precisely to answer before that
+            // happens - but they cannot close the sliver between the liveness check and
+            // the send, so the same leak reaches the user by the racy path. Substitute
+            // the connector's own wording there: jsmpp state names are not part of this
+            // connector's published vocabulary, and nothing actionable is lost (the
+            // caller already gets LINK_DOWN + possiblySubmitted).
+            if (msg.contains(" in state ")) {
+                return new MappedFailure("the SMSC session went down while submitting"
+                        + " (delivery unknown; the listener is rebinding if the link dropped)",
+                        "LINK_DOWN", null, true);
+            }
+            // Mid-flight death: octets may have been flushed before the failure.
             return new MappedFailure("connection failed mid-submit: " + msg
                     + " (delivery unknown; the listener is rebinding if the link dropped)",
-                    "LINK_DOWN", null);
+                    "LINK_DOWN", null, true);
         }
         return new MappedFailure("unexpected failure in the submit path: "
-                + t.getClass().getSimpleName() + ": " + msg, "PROTOCOL_ERROR", null);
+                + t.getClass().getSimpleName() + ": " + msg, "PROTOCOL_ERROR", null, true);
     }
 
     // ------------------------------------------------------------------
@@ -351,10 +430,11 @@ public final class NativeCaller {
         NativeListener.ListenerState st = stateRef.get();
         if (st == NativeListener.ListenerState.INIT || st == NativeListener.ListenerState.STARTING) {
             return detailError("cannot submit: the listener has not started yet - call 'start() first",
-                    "INVALID_REQUEST", null);
+                    "INVALID_REQUEST", null, false);
         }
         if (st == NativeListener.ListenerState.STOPPED) {
-            return detailError("cannot submit: the listener has been stopped", "INVALID_REQUEST", null);
+            return detailError("cannot submit: the listener has been stopped", "INVALID_REQUEST",
+                    null, false);
         }
 
         // Pre-check 2: bind type. Deliberately names the config field and the fix, and
@@ -363,7 +443,7 @@ public final class NativeCaller {
         String bindType = config.getStringValue(StringUtils.fromString("bindType")).getValue();
         if (!"TRANSCEIVER".equals(bindType)) {
             return detailError("cannot submit on a RECEIVER bind: submitting requires "
-                    + "bindType: TRANSCEIVER in the ConnectionConfig", "INVALID_REQUEST", null);
+                    + "bindType: TRANSCEIVER in the ConnectionConfig", "INVALID_REQUEST", null, false);
         }
 
         // Pre-check 3: session liveness. Two signals, both required:
@@ -394,8 +474,19 @@ public final class NativeCaller {
             SMPPSession session = sessionRef.get();
             if (session == null || !usable.get()
                     || session.getSessionState() != SessionState.BOUND_TRX) {
+                // LINK_ABANDONED vs LINK_DOWN (D-record F7): same down link, opposite
+                // advice. The abandoned flag is latched by scheduleRebind's give-up
+                // points and cleared only by a successful install, so this branch is
+                // the one place "retrying is futile" becomes program-visible.
+                java.util.concurrent.atomic.AtomicBoolean abandoned =
+                        (java.util.concurrent.atomic.AtomicBoolean) caller.getNativeData(REBIND_ABANDONED);
+                if (abandoned.get()) {
+                    return detailError("cannot submit: the SMSC link is down and rebinding was "
+                            + "disabled or exhausted - this listener will not recover; create a "
+                            + "new Listener", "LINK_ABANDONED", null, false);
+                }
                 return detailError("cannot submit: the SMSC session is down"
-                        + " (rebinding runs per rebindPolicy, if enabled)", "LINK_DOWN", null);
+                        + " (rebinding runs per rebindPolicy, if enabled)", "LINK_DOWN", null, false);
             }
             SubmitSpec spec = specFrom(sms, config);
             SubmitRequest req = compose(spec);
@@ -424,8 +515,12 @@ public final class NativeCaller {
             // Exception, not Throwable: every failure D3 named is an Exception, and a
             // VirtualMachineError must panic, not become a returned smpp:Error. specFrom
             // is inside this net too, so a malformed BMap cannot panic across interop.
-            MappedFailure f = mapSubmitFailure(e);
-            return detailError(f.message, f.failureMode, f.commandStatus);
+            // The selfClosed marker is read AT FAILURE TIME, deliberately: a stop that
+            // raced in while this submit was parked is exactly what it must observe.
+            java.util.concurrent.atomic.AtomicBoolean selfClosed =
+                    (java.util.concurrent.atomic.AtomicBoolean) caller.getNativeData(SELF_CLOSED);
+            MappedFailure f = mapSubmitFailure(e, selfClosed.get());
+            return detailError(f.message, f.failureMode, f.commandStatus, f.possiblySubmitted);
         } finally {
             // The one decrement, on every path incl. throws - a leaked count would make
             // every later gracefulStop burn its full timeout (Phase 5 finding #7).
@@ -437,12 +532,14 @@ public final class NativeCaller {
     // Ballerina-value plumbing
     // ------------------------------------------------------------------
 
-    private static BError detailError(String message, String failureMode, Integer commandStatus) {
+    private static BError detailError(String message, String failureMode, Integer commandStatus,
+            boolean possiblySubmitted) {
         Map<String, Object> detail = new HashMap<>();
         detail.put("failureMode", failureMode);
         if (commandStatus != null) {
             detail.put("commandStatus", (long) (int) commandStatus);
         }
+        detail.put("possiblySubmitted", possiblySubmitted);
         return ModuleUtils.createError(message, detail);
     }
 
@@ -477,6 +574,8 @@ public final class NativeCaller {
             }
             spec.dataCoding = (int) dcLong;
         }
+        Object udhi = sms.get(StringUtils.fromString("udhi"));
+        spec.udhi = udhi instanceof Boolean b && b;
         spec.registeredDelivery = str(sms, "registeredDelivery", "NONE");
         spec.serviceType = str(sms, "serviceType", "");
         BString validity = sms.getStringValue(StringUtils.fromString("validityPeriod"));
@@ -551,9 +650,33 @@ public final class NativeCaller {
     }
 
     /**
+     * Rejects any character above 0x7F in an address/C-octet field. jsmpp validates
+     * these fields in UTF-16 code units ({@code StringValidator} counts
+     * {@code value.length()}) but WRITES them with {@code String.getBytes()} in the JVM
+     * default charset ({@code PDUByteBuffer.append(String)}) — so a non-ASCII character
+     * ships more octets than either validator counted, silently overflowing the field
+     * on the wire, and the emitted bytes change with {@code -Dfile.encoding}
+     * (stage-2 code review, H2). Restricting these fields to ASCII makes code-unit
+     * count == octet count true by construction on every ASCII-transparent platform
+     * charset, which is what makes {@link #checkLength} exact rather than accidental.
+     * Runs BEFORE the length check so the diagnostic names the real problem. Names the
+     * field and the index, never the value (MSISDNs/sender IDs).
+     */
+    static void checkAscii(String field, String value) throws InvalidRequest {
+        for (int i = 0; i < value.length(); i++) {
+            if (value.charAt(i) > 0x7F) {
+                throw new InvalidRequest(field + " contains a non-ASCII character at index " + i
+                        + "; SMPP address and C-octet fields must be ASCII");
+            }
+        }
+    }
+
+    /**
      * jsmpp's limit for the parameter, adjusted for the C-octet asymmetry: a C-octet
      * string's max INCLUDES the terminating NUL (its validator rejects
      * {@code length >= max}), an octet string's does not (rejects {@code > max}).
+     * Exact only because {@link #checkAscii} runs first: for ASCII, UTF-16 code units
+     * and wire octets coincide.
      */
     static int maxLength(StringParameter p) {
         return p.getType() == StringType.C_OCTET_STRING ? p.getMax() - 1 : p.getMax();

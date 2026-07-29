@@ -12,6 +12,7 @@ import org.junit.jupiter.api.Test;
 import java.io.IOException;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -80,12 +81,77 @@ class SubmitErrorMappingTest {
     }
 
     @Test
+    void jsmppSessionStateNamesNeverLeak() {
+        // jsmpp's ensureTransmittable throws a bare IOException naming its internal
+        // session id and state. The lifecycle pre-checks answer before that on the
+        // ordinary path, but cannot close the sliver between the liveness check and the
+        // send - so this branch has to sanitize, or the leak the RECEIVER-bind guard
+        // exists to prevent reappears by the racy route (caught by
+        // testSubmitDuringRebindFailsFastAndAfterStopIsRejected).
+        NativeCaller.MappedFailure f = NativeCaller.mapSubmitFailure(new IOException(
+                "Cannot submit_sm while session 12bcad39 in state CLOSED"));
+        assertEquals("LINK_DOWN", f.failureMode);
+        assertTrue(f.possiblySubmitted);
+        assertFalse(f.message.contains("CLOSED"), f.message);
+        assertFalse(f.message.contains("12bcad39"), f.message);
+        assertTrue(f.message.contains("delivery unknown"), f.message);
+    }
+
+    @Test
     void localValidationIsInvalidRequestVerbatim() {
         NativeCaller.MappedFailure f = NativeCaller.mapSubmitFailure(
                 new NativeCaller.InvalidRequest("destAddr is required"));
         assertEquals("INVALID_REQUEST", f.failureMode);
         assertEquals("destAddr is required", f.message,
                 "local validation messages pass through verbatim - they are already safe");
+    }
+
+    @Test
+    void selfClosedRemapsResponseTimeoutToLinkDownOnly() {
+        // H4/FD3: a submit parked in waitDone() is not woken by a connector-initiated
+        // close (jsmpp has no fail-pending-on-close); it runs the full transactionTimeout
+        // and, without the marker, would masquerade as an SMSC timeout whose docs point
+        // at delivery receipts that can never arrive on a stopped listener.
+        NativeCaller.MappedFailure f = NativeCaller.mapSubmitFailure(
+                new ResponseTimeoutException("no resp in 2000ms"), true);
+        assertEquals("LINK_DOWN", f.failureMode);
+        assertTrue(f.possiblySubmitted, "it WAS written; a retry may duplicate");
+        assertTrue(f.message.contains("closed the session"), f.message);
+        assertTrue(f.message.contains("retrying may duplicate"), f.message);
+        // Without the marker, the honest SMSC-timeout verdict is unchanged.
+        assertEquals("TIMEOUT_DELIVERY_UNKNOWN", NativeCaller.mapSubmitFailure(
+                new ResponseTimeoutException("t"), false).failureMode);
+        // The marker must not leak into ANY other branch: a rejection observed during a
+        // stop is still a rejection, an IO failure is LINK_DOWN either way.
+        assertEquals("REJECTED", NativeCaller.mapSubmitFailure(
+                new NegativeResponseException(0x58), true).failureMode);
+        assertEquals("LINK_DOWN", NativeCaller.mapSubmitFailure(
+                new IOException("pipe"), true).failureMode);
+        assertEquals("INVALID_REQUEST", NativeCaller.mapSubmitFailure(
+                new NativeCaller.InvalidRequest("x"), true).failureMode);
+    }
+
+    @Test
+    void possiblySubmittedPartitionsByDuplicateRisk() {
+        // The semantics are "can a retry duplicate?", NOT "did it reach the wire"
+        // (design-review FINDING-6). REJECTED is the subtle row: the PDU WAS written,
+        // but the SMSC received and definitively refused it - a retry cannot duplicate.
+        assertFalse(NativeCaller.mapSubmitFailure(
+                new NativeCaller.InvalidRequest("x")).possiblySubmitted, "local refusal");
+        assertFalse(NativeCaller.mapSubmitFailure(
+                new NegativeResponseException(0x58)).possiblySubmitted, "REJECTED: refused");
+        assertFalse(NativeCaller.mapSubmitFailure(
+                new GenericNackResponseException("nack", 0x03)).possiblySubmitted, "nack: refused");
+        assertFalse(NativeCaller.mapSubmitFailure(
+                new PDUException("bad pdu")).possiblySubmitted, "composer throws pre-write");
+        assertTrue(NativeCaller.mapSubmitFailure(
+                new ResponseTimeoutException("t")).possiblySubmitted, "response lost");
+        assertTrue(NativeCaller.mapSubmitFailure(
+                new InvalidResponseException("seq")).possiblySubmitted, "response unusable");
+        assertTrue(NativeCaller.mapSubmitFailure(
+                new IOException("pipe")).possiblySubmitted, "mid-flight death");
+        assertTrue(NativeCaller.mapSubmitFailure(
+                new NullPointerException()).possiblySubmitted, "unknown: assume the worst");
     }
 
     @Test

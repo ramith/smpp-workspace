@@ -24,7 +24,7 @@ import java.net.Socket;
  * <p>Immutable and therefore safe to reuse, though the connector builds a fresh instance per
  * bind attempt (like the TLS factory).
  */
-public final class SmppPlainConnectionFactory implements ConnectionFactory {
+public final class SmppPlainConnectionFactory implements ConnectionFactory, RawConnectionFactory {
 
     private final int connectTimeoutMillis;
 
@@ -34,10 +34,16 @@ public final class SmppPlainConnectionFactory implements ConnectionFactory {
 
     @Override
     public Connection createConnection(String host, int port) throws IOException {
+        return createRawConnection(host, port).connection();
+    }
+
+    @Override
+    public RawConnection createRawConnection(String host, int port) throws IOException {
         Socket socket = new Socket();
         try {
             socket.connect(new InetSocketAddress(host, port), connectTimeoutMillis);
-            return new SocketConnection(socket);
+            // Plaintext: the raw socket IS the connection's socket.
+            return new RawConnection(new SocketConnection(socket), socket);
         } catch (IOException e) {
             // Close the half-open socket so a failed attempt leaks no file descriptor, then
             // rethrow so connectAndBind surfaces the failure to start()/the rebind loop.

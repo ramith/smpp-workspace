@@ -28,10 +28,16 @@ import org.jsmpp.session.connection.ConnectionFactory;
  *       jsmpp's own housekeeping threads — gets the SHORT bound.</li>
  * </ul>
  *
- * <p>Net effect with defaults: submits wait up to 30s for their response; a graceful stop
- * on a half-dead link waits ≤~2s for {@code unbind_resp} (worst-case stop ≈
- * {@code gracefulStopTimeout} + 2s instead of + 30s); a dead-link enquire probe burns 2s
- * instead of 30s; silent-peer detection stays ≈ {@code enquireLinkInterval} + 2s.
+ * <p>Net effect with defaults: submits wait up to 30s for their response; a dead-link
+ * enquire probe burns 2s instead of 30s; silent-peer detection stays ≈
+ * {@code enquireLinkInterval} + 2s. NOTE the timer split alone does NOT bound a stop:
+ * jsmpp's {@code unbindAndClose()} still has three untimed segments (monitor
+ * acquisition behind a stalled writer, the socket write itself, and {@code close()}'s
+ * {@code enquireLinkSender.join()}) — the wall-clock stop bound comes from
+ * {@code NativeListener.CLOSE_WATCHDOG_MS}'s raw-socket force-close (D11), giving
+ * worst-case {@code gracefulStop} ≈ {@code gracefulStopTimeout} + ≤2s sweep + ≤4s
+ * bounded close, and {@code immediateStop} ≈ ≤4s. (The earlier "+2s" claim here
+ * pre-dated D11 and was not a bound at all — stage-2 finding H3.)
  *
  * <p><b>Version coupling, stated plainly:</b> the getter-vs-field split is a jsmpp 3.0.2
  * bytecode fact (unbind() reads the field; the submit family, sendEnquireLink and the

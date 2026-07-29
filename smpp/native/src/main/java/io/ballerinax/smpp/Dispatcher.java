@@ -4,8 +4,10 @@ package io.ballerinax.smpp;
 import io.ballerina.runtime.api.Module;
 import io.ballerina.runtime.api.Runtime;
 import io.ballerina.runtime.api.concurrent.StrandMetadata;
+import io.ballerina.runtime.api.creators.TypeCreator;
 import io.ballerina.runtime.api.creators.ValueCreator;
 import io.ballerina.runtime.api.types.MethodType;
+import io.ballerina.runtime.api.types.PredefinedTypes;
 import io.ballerina.runtime.api.types.NetworkObjectType;
 import io.ballerina.runtime.api.types.ObjectType;
 import io.ballerina.runtime.api.types.Parameter;
@@ -88,7 +90,8 @@ public class Dispatcher implements MessageReceiverListener {
      * goes ({@code -1} = the method did not declare one). Resolved once, at attach, by
      * TYPE — never re-derived per PDU.
      */
-    record MethodPlan(int smsIndex, int callerIndex, int arity, boolean isolated) { }
+    record MethodPlan(int smsIndex, int callerIndex, int arity, boolean isolated,
+            boolean smsReadonly) { }
 
     /**
      * Immutable (service, remote-method-set, per-method plans) triple published through a
@@ -227,6 +230,81 @@ public class Dispatcher implements MessageReceiverListener {
                 StringUtils.fromString(context), err);
     }
 
+    /**
+     * PDU types already reported as unhandled. Bounded to the number of dispatchable
+     * methods (2), so this is a two-slot latch, not a growing set.
+     */
+    private final java.util.Set<String> missingHandlerLogged =
+            java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    private final java.util.concurrent.atomic.AtomicLong throttledCount =
+            new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong nextThrottleLogAt =
+            new java.util.concurrent.atomic.AtomicLong(1);
+
+    /**
+     * Makes {@code ESME_RTHROTTLED} visible (stage-2 F10.5). The connector had no counter
+     * and no log for it, yet for a reply-style service at shipped defaults throttling is
+     * the EXPECTED steady state, not an anomaly — so users met it on day one with
+     * nothing to look at. Logged on a geometric schedule (1st, 2nd, 4th, 8th …) so a
+     * sustained overload costs O(log n) lines instead of one per rejected PDU, while the
+     * first occurrence is still immediate. Never blocks the reject path: the log runs on
+     * a virtual thread, same reason as {@link #warnOnceMissingHandler}.
+     */
+    private void countThrottle() {
+        long n = throttledCount.incrementAndGet();
+        long threshold = nextThrottleLogAt.get();
+        if (n < threshold || !nextThrottleLogAt.compareAndSet(threshold, threshold * 2)) {
+            return;
+        }
+        BError err = ModuleUtils.createError("inbound dispatch throttled " + n + " time(s)");
+        try {
+            Thread.startVirtualThread(() -> logError(
+                    "inbound PDU rejected with ESME_RTHROTTLED because maxConcurrentDispatch "
+                            + "is fully occupied (" + n + " so far). The SMSC retains and "
+                            + "redelivers these. Sustained throttling means handlers are slower "
+                            + "than the inbound rate - raise maxConcurrentDispatch, or use "
+                            + "responseMode: ASYNC if handlers block on outbound calls.", err));
+        } catch (Throwable ignored) {
+            // A failed log must never turn into a failed NACK.
+        }
+    }
+
+    /**
+     * Logs, ONCE per PDU type per listener, that inbound traffic is being NACKed because
+     * the attached service implements no handler for it (D14). Without this the only
+     * evidence of a misconfigured service is on the SMSC's side: the connector would send
+     * a negative command_status and keep no record of it. Once-per-type on purpose — the
+     * condition is permanent, so per-message logging would be pure noise at the SMSC's
+     * full redelivery rate.
+     */
+    private void warnOnceMissingHandler(String method) {
+        if (!missingHandlerLogged.add(method)) {
+            return;
+        }
+        BError err = ModuleUtils.createError("no " + method + " handler on the attached service");
+        // On a VIRTUAL THREAD, never inline - same reason dispatchError does it (see
+        // there): logError crosses into the Ballerina runtime, and this runs on a jsmpp
+        // PDU-processor thread that owes the SMSC a deliver_sm_resp. Doing it inline
+        // delayed the NACK past the peer's transaction timer and turned an asserted
+        // ESME_RX_P_APPN into a response timeout - caught by
+        // testUnhandledPduTypeIsNackedPermanently on the first run of this code. The
+        // reject path must stay at microseconds (that is also why both no-handler
+        // checks precede toSms and tryAcquire). Not tracked as in-flight: it is a log
+        // write with no service callback, and a stop need not drain it.
+        try {
+            Thread.startVirtualThread(() -> logError(
+                    "inbound " + method + " PDUs are being rejected with ESME_RX_P_APPN: the "
+                            + "attached service implements no " + method + " remote method. "
+                            + "Implement it (returning successfully is enough to consume the "
+                            + "traffic) or expect the SMSC to record permanent delivery failures.",
+                    err));
+        } catch (Throwable t) {
+            // A failed log must never turn into a failed NACK.
+            missingHandlerLogged.remove(method);
+        }
+    }
+
     void setAsync(boolean async) {
         this.async = async;
     }
@@ -251,7 +329,11 @@ public class Dispatcher implements MessageReceiverListener {
         // methods, and a name-only check against it could validate a method that dispatch
         // (which resolves remote methods by name) would never invoke. ServiceType always
         // implements NetworkObjectType; anything else structurally cannot be a service.
-        ObjectType objType = (ObjectType) TypeUtils.getReferredType(TypeUtils.getType(service));
+        // getImpliedType for uniformity with the parameter-type checks below (H5 audit).
+        // getType(value) already yields the concrete ObjectType here, so this is a
+        // no-op in practice - kept identical so no future reader has to work out why one
+        // site unwraps differently from the rest.
+        ObjectType objType = (ObjectType) TypeUtils.getImpliedType(TypeUtils.getType(service));
         if (!(objType instanceof NetworkObjectType networkType)) {
             return new AttachOutcome(AttachResult.NO_REMOTE_METHODS, null);
         }
@@ -327,7 +409,9 @@ public class Dispatcher implements MessageReceiverListener {
                 }
                 if (!p.isDefault) {
                     required++;
-                    Type referred = TypeUtils.getReferredType(p.type);
+                    // getImpliedType: a distinct error subtype behind an alias, or a
+                    // `readonly &` intersection, must still resolve to its ErrorType.
+                    Type referred = TypeUtils.getImpliedType(p.type);
                     if (!(referred instanceof io.ballerina.runtime.api.types.ErrorType)) {
                         // Unchecked, dispatchError's callMethod would panic per drop and
                         // LOSE the notification (Phase 5 finding #8).
@@ -343,6 +427,7 @@ public class Dispatcher implements MessageReceiverListener {
         }
         int smsIndex = -1;
         int callerIndex = -1;
+        boolean smsReadonly = false;
         for (int i = 0; i < params.length; i++) {
             Parameter param = params[i];
             if (isCallerType(param.type)) {
@@ -359,6 +444,11 @@ public class Dispatcher implements MessageReceiverListener {
                     return name + " declares more than one smpp:Sms parameter";
                 }
                 smsIndex = i;
+                // `readonly & smpp:Sms` (accepted since H5) needs the record FROZEN
+                // before dispatch: toSms builds a mutable one, and handing a mutable
+                // value to a readonly-typed parameter fails the runtime's argument
+                // check. Resolved once here, never per PDU.
+                smsReadonly = TypeUtils.getImpliedType(param.type).isReadOnly();
             } else if (involvesCallerType(param.type)) {
                 // D1's first trap, checked BEFORE the isDefault skip below: a union like
                 // `smpp:Caller? c = ()` is defaultable, and skipping it would silently
@@ -384,7 +474,7 @@ public class Dispatcher implements MessageReceiverListener {
         // Arity = the bound prefix only (Ballerina forces defaulted params to trail, so
         // everything past the last bound param is defaultable and runtime-padded).
         int arity = Math.max(smsIndex, callerIndex) + 1;
-        plans.put(name, new MethodPlan(smsIndex, callerIndex, arity, methodIsolated));
+        plans.put(name, new MethodPlan(smsIndex, callerIndex, arity, methodIsolated, smsReadonly));
         return null;
     }
 
@@ -394,13 +484,16 @@ public class Dispatcher implements MessageReceiverListener {
 
     /** True if the type IS Caller or is a union with Caller as a member (e.g. Caller?). */
     private static boolean involvesCallerType(Type type) {
-        Type referred = TypeUtils.getReferredType(type);
+        Type referred = TypeUtils.getImpliedType(type);
         if (isCallerType(referred)) {
             return true;
         }
         if (referred instanceof io.ballerina.runtime.api.types.UnionType union) {
             for (Type member : union.getMemberTypes()) {
-                if (isCallerType(member)) {
+                // Per MEMBER, not just the union: `type MaybeCaller readonly & Caller?`
+                // reaches here with intersection members that a name comparison alone
+                // would miss, silently re-opening D1's first trap.
+                if (isCallerType(TypeUtils.getImpliedType(member))) {
                     return true;
                 }
             }
@@ -412,13 +505,44 @@ public class Dispatcher implements MessageReceiverListener {
         return isModuleType(type, "Sms");
     }
 
-    /** Exact-type match against this module's declaration - unions/optionals do not match. */
+    /**
+     * Exact-type match against this module's declaration - unions/optionals do not match.
+     *
+     * <p>{@code getImpliedType}, not {@code getReferredType} (stage-2 H5): the latter
+     * unwraps type-reference chains only, so a {@code readonly & smpp:Sms} parameter -
+     * compile-valid, idiomatic, and legal in 1.0.1 where matching was name-only -
+     * arrived here as an {@code IntersectionType} whose name is not "Sms" and made the
+     * whole attach fail with "unsupported type". {@code getImpliedType} unwraps
+     * intersections as well as references (it is the non-deprecated successor), so both
+     * shapes resolve. Widening only: nothing previously accepted can now be rejected.
+     */
     private static boolean isModuleType(Type type, String name) {
         Type referred = TypeUtils.getReferredType(type);
-        if (!name.equals(referred.getName())) {
+        if (nameMatches(referred, name)) {
+            return true;
+        }
+        // `readonly & smpp:Sms` arrives as an IntersectionType. Neither getReferredType
+        // nor getImpliedType yields something still NAMED "Sms" (the implied form is the
+        // synthesized readonly shape), so the match is made against the CONSTITUENTS -
+        // where the user's `smpp:Sms` is still itself. Narrow by construction: a
+        // constituent that is a union (`readonly & smpp:Caller?`) does not name-match
+        // here, so D1's optional-Caller trap keeps failing exactly as before.
+        if (referred instanceof io.ballerina.runtime.api.types.IntersectionType intersection) {
+            for (Type constituent : intersection.getConstituentTypes()) {
+                if (nameMatches(TypeUtils.getReferredType(constituent), name)) {
+                    return true;
+                }
+            }
+        }
+        return nameMatches(TypeUtils.getImpliedType(type), name);
+    }
+
+    /** Name + declaring-module match against this module's own declaration. */
+    private static boolean nameMatches(Type type, String name) {
+        if (!name.equals(type.getName())) {
             return false;
         }
-        io.ballerina.runtime.api.Module m = referred.getPackage();
+        io.ballerina.runtime.api.Module m = type.getPackage();
         io.ballerina.runtime.api.Module ours = ModuleUtils.getModule();
         return m != null && ours != null
                 && java.util.Objects.equals(m.getOrg(), ours.getOrg())
@@ -450,7 +574,9 @@ public class Dispatcher implements MessageReceiverListener {
 
     @Override
     public void onAcceptAlertNotification(AlertNotification alertNotification) {
-        // No corresponding service method exposed yet; ignored.
+        // No corresponding service method exposed yet; ignored. Deliberately NOT part of
+        // the D14 NACK split: alert_notification is the one inbound PDU with no response
+        // PDU defined in SMPP v3.4, so there is nothing to acknowledge either way.
     }
 
     /**
@@ -754,7 +880,15 @@ public class Dispatcher implements MessageReceiverListener {
      * @return a {@code map<anydata>} suitable for {@code Sms.properties}
      */
     private BMap<BString, Object> toProperties(AbstractSmCommand pdu) {
-        BMap<BString, Object> properties = ValueCreator.createMapValue();
+        // Typed map<anydata>, NOT the no-arg createMapValue() (stage-2 M9): the argless
+        // form produces a map<any>, whose runtime type is not a subtype of anydata even
+        // though Sms.properties is declared map<anydata>. RecordValueImpl.put does not
+        // type-check, so it landed unnoticed - and then sms.toJson()/clone()/
+        // cloneReadOnly(), i.e. every observability integration and every readonly
+        // parameter, inspects the RUNTIME type of that member and fails. Every sibling
+        // value is built correctly typed, which is what made this one stand out.
+        BMap<BString, Object> properties = ValueCreator.createMapValue(
+                TypeCreator.createMapType(PredefinedTypes.TYPE_ANYDATA));
         properties.put(StringUtils.fromString("dataCoding"), (long) (pdu.getDataCoding() & 0xFF));
         properties.put(StringUtils.fromString("sourceAddrTon"), (long) (pdu.getSourceAddrTon() & 0xFF));
         properties.put(StringUtils.fromString("sourceAddrNpi"), (long) (pdu.getSourceAddrNpi() & 0xFF));
@@ -784,12 +918,44 @@ public class Dispatcher implements MessageReceiverListener {
     private void dispatch(String method, AbstractSmCommand pdu, byte[] fallback, boolean deliveryReceipt)
             throws ProcessRequestException {
         ServiceBinding binding = this.binding;
-        if (binding == null || !binding.remoteMethods().contains(method)) {
-            return; // no handler for this PDU type; nothing to gate or acknowledge negatively
+        if (binding == null) {
+            // No service attached AT ALL: a PDU arriving between 'start() and attach, or
+            // after detach. Transient by nature - the same service may be attached a
+            // millisecond later - so ESME_RX_T_APPN (0x64, "Receiver Temporary App
+            // Error"), inviting the SMSC to retain and redeliver. Distinct from the
+            // no-such-handler case below, which can never resolve itself (D14).
+            throw new ProcessRequestException(
+                    "no service is attached to this listener", SMPPConstant.STAT_ESME_RX_T_APPN);
         }
+        if (!binding.remoteMethods().contains(method)) {
+            // A service IS attached but does not implement this PDU type's handler. This
+            // used to `return`, which made jsmpp answer ESME_ROK - a POSITIVE ack for a
+            // message that was then dropped on the floor, silently discharging the SMSC's
+            // at-least-once guarantee against nothing (stage-2 M8). It contradicted this
+            // connector's own published posture ("a NACK is not a drop").
+            //
+            // ESME_RX_P_APPN (0x65, "Receiver Permanent App Error"), NOT the temporary
+            // 0x64 used above and for handler errors: a missing remote method is a
+            // permanent property of the deployed code - it cannot appear at runtime, so
+            // redelivery could never succeed and 0x64 here would be a guaranteed poison
+            // loop for the life of the deployment. Nor RX_R_APPN (0x66, "Reject"), which
+            // is a per-MESSAGE verdict for what is really a per-CAPABILITY condition;
+            // a permanent application error is what SMSC-side error accounting and DLQ
+            // policy are built to consume. Do NOT "harmonise" this with :867 below.
+            warnOnceMissingHandler(method);
+            throw new ProcessRequestException(
+                    "the attached service does not implement " + method,
+                    SMPPConstant.STAT_ESME_RX_P_APPN);
+        }
+        // NOTE (load-bearing order, D14): both checks above run BEFORE tryAcquire. An
+        // unhandled PDU type must never consume a dispatch permit - otherwise a service
+        // with only onDataSm, under deliver_sm load, would throttle its own onDataSm
+        // traffic, and the unhandled PDU could be answered RTHROTTLED: a TRANSIENT
+        // status for a PERMANENT condition, i.e. the poison loop again by another route.
         if (!permits.tryAcquire()) {
             // At the maxConcurrentDispatch limit. Reject cheaply (before toSms) with the
             // SMPP throttle status so the SMSC backs off and retains the message.
+            countThrottle();
             throw new ProcessRequestException(
                     "dispatch throttled: maxConcurrentDispatch reached", SMPPConstant.STAT_ESME_RTHROTTLED);
         }
@@ -812,11 +978,29 @@ public class Dispatcher implements MessageReceiverListener {
             MethodPlan plan = binding.plans().get(method);
             if (plan == null) {
                 // Unreachable today (dispatch is only called with onDeliverSm/onDataSm,
-                // both of which always have plans when present in remoteMethods) - but an
-                // NPE here would escape PDUProcessTask.run() (IOException-only catch) and
-                // silently drop the PDU with no resp. Fail loud and answerable instead.
+                // both of which always have plans when present in remoteMethods). Kept as
+                // an INTERNAL-INCONSISTENCY guard - "we advertised this method but have no
+                // plan for it" - which is what RSYSERR says and why it is distinct from
+                // the RX_P_APPN "the service does not implement this" case above.
+                //
+                // The earlier rationale here was wrong (stage-2 L12): an NPE would NOT
+                // escape silently - SMPPSession.ResponseHandlerImpl.processDeliverSm
+                // catches Exception and converts it to ProcessRequestException(RX_T_APPN),
+                // so the PDU would still get a (misleading, transient) resp. What genuinely
+                // escapes all three catches is a java.lang.Error, one level up - it dies in
+                // the pool worker with no resp sent, though permits.release() and the
+                // inFlight decrement still run from their finally blocks.
                 throw new ProcessRequestException(
                         "no dispatch plan for " + method, SMPPConstant.STAT_ESME_RSYSERR);
+            }
+            if (plan.smsReadonly()) {
+                // The handler declared `readonly & smpp:Sms`. toSms built a mutable
+                // record; freeze it in place before it crosses into the handler. Safe
+                // to freeze rather than clone: this record was allocated for this one
+                // dispatch and is referenced by nothing else. Depends on the M9 typed
+                // properties map above - freezing a map<any> member is where that
+                // mismatch would surface first.
+                sms.freezeDirect();
             }
             StrandMetadata meta = new StrandMetadata(plan.isolated(), null);
             Object[] args = new Object[plan.arity()];

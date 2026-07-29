@@ -51,10 +51,20 @@ public isolated client class Caller {
     # `responseMode: ASYNC` for reply-style services**, and carry your own idempotency
     # key (e.g. dedupe on the inbound source+text+timestamp) where duplicates are costly.
     #
-    # + sms - the message to send
+    # Two limits worth knowing before sizing anything against this: the connector applies
+    # no rate limiting of its own (carrier throttling policy is yours to respect), and a
+    # submit already awaiting its response is **not** woken if the link dies or the
+    # listener stops — the underlying library has no fail-pending-on-close, so it
+    # completes only at `transactionTimeout`, holding its dispatch slot in `SYNC` mode
+    # for that whole time.
+    #
+    # + sms - the message to send: a `TextSms` (the connector encodes it) or a
+    #   `BinarySms` (pre-encoded octets, with `udhi` for UDH-bearing payloads)
     # + return - the SMSC's `message_id` for the accepted message (correlate delivery
     #   receipts against it — see `Sms.receiptedMessageId`), or an `Error` whose detail
-    #   carries `failureMode`/`commandStatus` (see `FailureMode` for retry guidance)
+    #   carries `failureMode`, `commandStatus`, and `possiblySubmitted` — the last being
+    #   the field to branch retry logic on, since `false` means a retry cannot duplicate
+    #   the message (see `FailureMode` for the rest of the retry guidance)
     remote isolated function submit(OutboundSms sms) returns SubmitResult|Error {
         return self.externSubmit(sms);
     }

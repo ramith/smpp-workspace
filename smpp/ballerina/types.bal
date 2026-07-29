@@ -58,12 +58,24 @@ public type RebindPolicy record {|
     # Maximum delay between rebind attempts, in seconds — caps the exponential backoff.
     # Must be >= `initialRebindDelay` (validated at `Listener` init).
     decimal maxRebindDelay = 60;
-    # Multiplier applied to the delay after each failed attempt (exponential backoff).
-    # Must be >= 1 (validated at `Listener` init) — values below 1 would shrink, not
-    # back off.
+    # Multiplier applied to the delay after each consecutive failure (exponential
+    # backoff). The exponent grows across a *flapping* link too — a bind that succeeds
+    # and then quickly drops counts as a failure, so the delay keeps compounding instead
+    # of snapping back to `initialRebindDelay` on every short-lived bind. Must be >= 1
+    # (validated at `Listener` init) — values below 1 would shrink, not back off.
     decimal backOffMultiplier = 2.0;
-    # Maximum number of rebind attempts before giving up. `0` disables automatic rebinding
-    # entirely (a drop still notifies `onError` once, but nothing is retried). `-1` retries
+    # Maximum number of CONSECUTIVE failures before giving up, where a failure is either
+    # a failed bind attempt or a bind that did not stay up for the stability window
+    # (~60s continuously bound). The counter resets only after a stable window, at the
+    # next drop — never on a successful bind alone, so this cap is reachable against
+    # exactly the flapping link it exists for. (Behavior change in 8.5: earlier releases
+    # reset the counter on every successful bind, making this cap and the backoff growth
+    # silently inert under a flap — a link that previously retried forever now
+    # terminates after this many consecutive short-lived cycles.) On give-up the
+    # listener latches dead: `onError` is notified once more, a WARN is logged, and
+    # every subsequent `submit` fails with `LINK_ABANDONED` — only a new `Listener`
+    # recovers. `0` disables automatic rebinding entirely (a drop still notifies
+    # `onError` once, latching `LINK_ABANDONED` immediately). `-1` (the default) retries
     # indefinitely. Other negative values are rejected at `Listener` init.
     int maxRebindAttempts = -1;
 |};
@@ -88,11 +100,20 @@ public type ConnectionConfig record {|
     # `ASYNC` mode. When the SMSC sends PDUs faster than this limit drains, the excess is
     # answered immediately with `ESME_RTHROTTLED` so the SMSC backs off and retains the
     # message (SMPP is at-least-once — a NACK is not a drop). Inbound throughput is bounded
-    # by design, not best-effort. The connector guarantees the SMSC's `enquire_link`
-    # keepalive is always answered promptly even while every dispatch slot is busy — so a
-    # slow service can no longer provoke the SMSC into dropping the link (in `SYNC` mode via
-    # a reserved worker thread beyond this limit; in `ASYNC` mode handlers run on virtual
-    # threads, so pool threads never block — see `docs/architecture.md`). Must be 1-1024
+    # by design, not best-effort.
+    #
+    # A busy service does not provoke the SMSC into dropping the link: the connector keeps
+    # a PDU-processor thread in reserve beyond this limit (in `SYNC` mode, where handlers
+    # occupy those threads; in `ASYNC` mode handlers run on virtual threads and never
+    # occupy them at all), so `enquire_link` is answered while every dispatch slot is busy.
+    # Stated precisely rather than as a guarantee: that reserve also carries every
+    # `submit_sm_resp`, so on a reply-heavy service keepalive latency and submit completion
+    # compete for the same thread. It is sized for that (`maxConcurrentDispatch + 1`), and
+    # a stuck outbound WRITE would stall both regardless — no reserve can protect against
+    # that. See `docs/architecture.md`.
+    #
+    # This ceiling is **per listener, not per process**: N listeners at 1024 in `SYNC` mode
+    # is a legal configuration that would attempt ~N×1024 platform threads. Must be 1-1024
     # (validated at `Listener` init).
     int maxConcurrentDispatch = 3;
     # Controls when the `deliver_sm_resp`/`data_sm_resp` is sent back to the SMSC
@@ -111,9 +132,17 @@ public type ConnectionConfig record {|
     # seconds. The drain covers dispatches to the attached service AND in-flight
     # `Caller.submit` calls (including from non-handler code holding a `Caller`); submits
     # stay legal for the whole drain window - a reply-style service's in-flight replies
-    # complete rather than being dropped on shutdown. `immediateStop` does not wait at
-    # all: a parked submit then surfaces `LINK_DOWN` when the socket closes under it.
-    # Must not be negative (validated at `Listener` init).
+    # complete rather than being dropped on shutdown. After the drain, `gracefulStop`
+    # also runs a ≤2s reservation sweep (correctness, not grace: it closes the race with
+    # a submit that reserved its slot just before the cutoff) - so `0` here means "no
+    # drain wait", with the sweep still applying. `immediateStop` skips both. Either
+    # stop's unbind/close is itself bounded (~4s worst case) by a force-close watchdog,
+    # even against an unresponsive peer. One caveat for both flavours: a submit already
+    # awaiting its `submit_sm_resp` when the close lands is NOT woken (the underlying
+    # library has no fail-pending-on-close) - mid-write it fails immediately with
+    # `LINK_DOWN`, but once parked it completes only at `transactionTimeout`, with
+    # `LINK_DOWN` and `possiblySubmitted: true`, so a submitting strand can outlive the
+    # stop by up to that long. Must not be negative (validated at `Listener` init).
     decimal gracefulStopTimeout = 30;
     # Controls automatic rebinding after an unexpected session drop. Defaults to retrying
     # indefinitely with exponential backoff; set `maxRebindAttempts: 0` to disable.
@@ -145,9 +174,14 @@ public type ConnectionConfig record {|
     # separately at a short internal timer (~2s, jsmpp's own historical default for
     # exactly those paths), so raising this value does NOT slow stops or dead-link
     # detection. (jsmpp itself has one shared timer; the connector splits it — see
-    # `ConnectorSession` in the native layer.) Worst-case `gracefulStop` latency is
-    # therefore ≈ `gracefulStopTimeout` + 2s, and silent-peer detection stays ≈
-    # `enquireLinkInterval` + 2s, regardless of this setting.
+    # `ConnectorSession` in the native layer — and additionally bounds the whole close
+    # choreography with a ~4s force-close watchdog, because the unbind write itself is
+    # untimed against a pathological peer.) Worst-case `gracefulStop` ≈
+    # `gracefulStopTimeout` + ~2s (sweep) + ~4s (bounded close); `immediateStop` ≈ ~4s;
+    # silent-peer detection stays ≈ `enquireLinkInterval` + 2s, regardless of this
+    # setting. The one exception: a submit already awaiting its response when a stop
+    # closes the session completes only at THIS timeout (with `LINK_DOWN`,
+    # `possiblySubmitted: true`) — the single place this value can stretch past a stop.
     #
     # The default is 30s rather than jsmpp's own 2s. Two seconds is too short for a
     # `submit_sm` under load, and a timed-out submit is the worst outcome the send path
@@ -256,10 +290,17 @@ public enum Npi {
 # How an outbound message's text is encoded, and hence the `data_coding` it is sent with.
 #
 # Only the three schemes this connector also **decodes** precisely are offered. The GSM
-# 03.38 7-bit default alphabet (`data_coding 0x00`) is **not** available for sending: it
-# needs a packed-septet encoder, which jsmpp does not provide, and adding protocol logic
-# jsmpp lacks is outside this connector's remit. Use `OutboundSms.shortMessageBytes` with
-# an explicit `dataCoding` if you need to put such a payload on the wire yourself.
+# 03.38 7-bit default alphabet (`data_coding 0x00`) is **not** available for sending:
+# packing text into septets is protocol logic the underlying library does not provide and
+# this connector deliberately does not add.
+#
+# If your SMSC requires `data_coding 0x00`, send a `BinarySms` with `dataCoding: 0` and
+# the bytes you want. Note the common case needs no encoder at all: for text that is
+# **pure ASCII**, the GSM 03.38 default alphabet agrees with ASCII on every character
+# except `@` (0x00 in GSM-7) and a handful of currency/accented symbols, and most SMSCs
+# accept unpacked one-byte-per-character `0x00` payloads — so `shortMessageBytes` holding
+# the plain ASCII bytes is usually exactly what is wanted. For anything beyond ASCII under
+# `0x00`, you need a real GSM-7 encoder of your own.
 public enum Encoding {
     # IA5/ASCII — `data_coding 0x01`. 7-bit US-ASCII only; anything else is rejected.
     ASCII,
@@ -288,34 +329,21 @@ public enum DeliveryReceiptRequest {
     ON_FAILURE_ONLY
 }
 
-# A message to submit to the SMSC (`submit_sm`).
-#
-# Exactly one of `shortMessage` or `shortMessageBytes` must be set. They are mutually
-# exclusive rather than layered because SMPP has no way to carry both, and silently
-# preferring one would hide a caller's mistake.
-public type OutboundSms record {|
-    # Recipient. A plain `string` is shorthand for an international ISDN address.
+# Fields shared by every outbound message shape. Not used directly — submit takes an
+# `OutboundSms`, i.e. `TextSms` or `BinarySms`.
+public type OutboundBase record {|
+    # Recipient. A plain `string` is shorthand for an international ISDN address. ASCII
+    # only: SMPP address fields are octet-counted C-octet strings, and this connector
+    # rejects anything a platform charset could inflate on the wire.
     string|Address destAddr;
     # Sender. Omitted means `ConnectionConfig.sourceAddr`, which is the usual arrangement:
-    # the short code is a property of the binding, not of each message.
+    # the short code is a property of the binding, not of each message. ASCII only (see
+    # `destAddr`) — this includes `TON_ALPHANUMERIC` sender IDs.
     string|Address sourceAddr?;
-    # The message text, encoded per `encoding`. Mutually exclusive with
-    # `shortMessageBytes`.
-    string shortMessage?;
-    # How to encode `shortMessage`. Ignored when `shortMessageBytes` is used, since those
-    # octets are already encoded.
-    Encoding encoding = LATIN1;
-    # Pre-encoded payload, sent verbatim with `dataCoding`. The escape hatch for anything
-    # `Encoding` cannot express — packed GSM 7-bit above all. Requires `dataCoding`, and is
-    # mutually exclusive with `shortMessage`.
-    byte[] shortMessageBytes?;
-    # The raw `data_coding` byte accompanying `shortMessageBytes`. Required with it, and
-    # meaningless without it.
-    int dataCoding?;
     # Whether to ask the SMSC for a delivery receipt. A receipt arrives later at
     # `onDeliverSm` with `deliveryReceipt` set, not as part of the submit.
     DeliveryReceiptRequest registeredDelivery = NONE;
-    # SMPP `service_type`. Empty (the default) means the SMSC's default service.
+    # SMPP `service_type`. Empty (the default) means the SMSC's default service. ASCII only.
     string serviceType = "";
     # SMPP `validity_period`: how long the SMSC should keep trying. Omitted means the
     # SMSC's own default. When set, it must be EXACTLY 16 characters in the §7.1.1 time
@@ -324,6 +352,47 @@ public type OutboundSms record {|
     # locally before anything reaches the wire.
     string validityPeriod?;
 |};
+
+# A text message: the connector encodes `shortMessage` per `encoding` and stamps the
+# matching `data_coding` on the wire. This is the shape almost every service wants.
+public type TextSms record {|
+    *OutboundBase;
+    # The message text, encoded per `encoding`. Must not be empty: `sm_length = 0` means
+    # "payload is in the message_payload TLV" (§5.2.21), which this connector never sets,
+    # so an empty body is rejected locally instead of drawing `ESME_RINVMSGLEN`.
+    string shortMessage;
+    # How to encode `shortMessage`.
+    Encoding encoding = LATIN1;
+|};
+
+# A pre-encoded payload, sent verbatim: the escape hatch for anything `Encoding` cannot
+# express. The connector does not validate, split, or reassemble what you put in it.
+public type BinarySms record {|
+    *OutboundBase;
+    # The payload octets, sent verbatim. Must not be empty (see `TextSms.shortMessage`).
+    byte[] shortMessageBytes;
+    # The raw `data_coding` byte describing how `shortMessageBytes` is encoded (0-255).
+    # Required — the SMSC and handset can only interpret the payload through it.
+    int dataCoding;
+    # Sets the UDHI bit (`esm_class` bit 6, `0x40`): declares that `shortMessageBytes`
+    # STARTS with a User Data Header — required by §5.2.12 whenever a UDH is present
+    # (concatenation, WAP push, port addressing per 3GPP TS 23.040, where the first
+    # octet is the UDH length). The connector does not validate the UDH structure:
+    # setting `udhi` without a well-formed UDH at the front of the payload is a user
+    # error nothing here can detect, and leaving it `false` WITH a UDH makes the
+    # handset render the header octets as visible garbage text. Independent of
+    # `registeredDelivery` and of the receipt bits the SMSC sets on inbound messages.
+    boolean udhi = false;
+|};
+
+# A message to submit to the SMSC (`submit_sm`).
+#
+# A union rather than one record with optional fields: text and binary payloads have
+# different required fields (`encoding` belongs only to text, `dataCoding`/`udhi` only
+# to binary), and the union makes the wrong combinations unrepresentable at compile
+# time instead of runtime-rejected. In-line record literals pick their member by shape:
+# `{destAddr, shortMessage: "hi"}` is a `TextSms`.
+public type OutboundSms TextSms|BinarySms;
 
 # The outcome of a successful `submit`.
 #
@@ -491,7 +560,7 @@ public type DeliveryReceipt record {|
     string text?;
 |};
 
-# How a `submit` failed, mapped from the jsmpp exception that surfaced it. The five
+# How a `submit` failed, mapped from the jsmpp exception that surfaced it. The six
 # members deliberately partition by WHAT THE CALLER SHOULD DO, not by exception class:
 public enum FailureMode {
     # The SMSC answered the submit with a negative `command_status` — it received the
@@ -508,11 +577,17 @@ public enum FailureMode {
     # The link is the problem: it died while sending or waiting, OR it was already
     # down/rebinding when the submit was attempted (one bucket for one operational
     # condition — owner decision, 2026-07-29). For a mid-flight death the message may
-    # or may not have reached the SMSC (same duplicate caveat as
-    # `TIMEOUT_DELIVERY_UNKNOWN`); for an already-down link nothing was sent. If
-    # `rebindPolicy` is enabled, retry once rebound; if rebinding is disabled or
-    # exhausted, the link stays down until you restart the listener.
+    # or may not have reached the SMSC (`ErrorDetail.possiblySubmitted` tells you
+    # which); for an already-down link nothing was sent. If `rebindPolicy` is enabled,
+    # retry once rebound; when rebinding is disabled or exhausted the submit fails with
+    # `LINK_ABANDONED` instead, so this member always means "worth retrying later".
     LINK_DOWN,
+    # The link is down and this connector will NOT try to restore it: `rebindPolicy`
+    # was disabled (`maxRebindAttempts: 0`) at the time of the drop, or its attempts
+    # are exhausted. Unlike `LINK_DOWN`, retrying against this `Listener` is futile for
+    # the rest of its life — the only remedy is a new `Listener`. Nothing was sent.
+    # (Names the decision THIS connector made; the SMSC itself may be healthy.)
+    LINK_ABANDONED,
     # This connector refused to send: the request failed local validation (oversize,
     # unencodable character, bad field) or the lifecycle/config does not permit a
     # submit (not started, stopped, RECEIVER bind). Nothing reached the wire; fix the
@@ -534,6 +609,13 @@ public type ErrorDetail record {
     # The SMPP `command_status` from the negative response, when `failureMode` is
     # `REJECTED`. Compare against SMPP v3.4 §5.1.3 (e.g. 0x00000058 = ESME_RTHROTTLED).
     int commandStatus?;
+    # Whether the message may already have reached the SMSC — the single most useful
+    # bit for retry logic. `false`: retrying CANNOT duplicate the message (it either
+    # provably never left this connector, or the SMSC received it and definitively
+    # refused it). `true`: the SMSC may have accepted it (response lost or unusable,
+    # or the link died mid-flight), so a retry MAY DELIVER A DUPLICATE to the
+    # subscriber. Populated on every `submit` failure.
+    boolean possiblySubmitted?;
 };
 
 # The distinct error type raised by the SMPP connector. Returned from `Listener` init on
