@@ -1572,7 +1572,41 @@ subproject falls back to compiling against the local `bal home` distribution's j
 docker fixture tests still exercising the exact pinned 2201.13.0 distribution, so a
 local patch-version skew cannot silently ship an API drift.
 
-**Exit gate: PASSED** — `./gradlew build` green: 79 JUnit + 63 bal + 10 plugin
+**Phase 5 (adversarial review of the sprint diff, two independent SMEs): one HIGH,
+found empirically and fixed at the ROOT.** The java review probed the contested shapes
+through the real runtime type machinery and the real plugin code, and found the plugin
+and runtime DISAGREED on the intersection-flavored Caller unions: `(readonly &
+smpp:Caller)? c = ()` attached fine at runtime (its `getImpliedType` wrapper on union
+members erases the very name the check needs — the implied form of `Caller & readonly`
+is a synthesized type not named "Caller") while the plugin rejected it — the
+compile-break-on-attachable-program failure class, the exact thing the parity
+requirement exists to prevent. And `readonly & smpp:Caller?` evaded BOTH sides: D1's
+first trap, still alive in those shapes while the Sprint 8.5 comment claimed otherwise.
+Per the reviewer's recommendation the RUNTIME was fixed (pass union members to the
+Caller check raw — `isModuleType` already resolves references and intersection
+constituents), the plugin's `involvesCaller` gained matching intersection descent, the
+overclaiming comment was rewritten to record the empirical trap, and both shapes are
+pinned at attach (`IntersectionOptionalCallerService`, `WrappedMaybeCallerService`) and
+in the `caller_shapes_bad` fixture.
+
+Also dispositioned: a recognition-pin fixture for the inline-`new` listener form (the
+one fail-open path no diagnostic-asserting fixture could catch — and it proved the
+union branch WORKS rather than assuming it); a byte-for-byte template-compile fixture
+(the templates previously had zero coverage — and the caller template was teaching
+`shortMessage: ""`, which the fix wave's own L10 rejects at runtime); the
+stale-plugin-jar guard and a minimum-fixture-count assert in the harness; a
+version-skew guard on the `bal home` fallback plus a clear no-credentials error; the
+isolation warning extended to `onError` (the runtime serializes it identically);
+Package.md's honest "stricter than the runtime" paragraph (SMPP_102/105 reject shapes
+the runtime tolerates — deliberate, ecosystem-standard, now documented); and the
+valid-shape/coverage extensions (defaulted Sms, legal onError-with-defaulted-extra,
+alias-of-union Caller). Accepted with comments: transitive `*smpp:Service` inclusion
+fails open (runtime still validates; same limitation as mqtt), hardcoded `smpp:` prefix
+in templates (shared with mqtt/ftp), object-level isolation not checked (would risk
+false positives on unverifiable inference surfacing; method-level only — misses, never
+false alarms).
+
+**Exit gate: PASSED** — `./gradlew build` green: 79 JUnit + 63 bal + 12 plugin
 fixtures, 0 failures, 0 skipped.
 
 ---

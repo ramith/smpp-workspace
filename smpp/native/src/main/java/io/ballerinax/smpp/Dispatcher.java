@@ -498,10 +498,16 @@ public class Dispatcher implements MessageReceiverListener {
         }
         if (referred instanceof io.ballerina.runtime.api.types.UnionType union) {
             for (Type member : union.getMemberTypes()) {
-                // Per MEMBER, not just the union: `type MaybeCaller readonly & Caller?`
-                // reaches here with intersection members that a name comparison alone
-                // would miss, silently re-opening D1's first trap.
-                if (isCallerType(TypeUtils.getImpliedType(member))) {
+                // The member goes to isCallerType RAW - never through getImpliedType
+                // first (Sprint 9 Phase-5 H1, verified empirically): the implied form
+                // of `(Caller & readonly)` is a SYNTHESIZED type whose name is not
+                // "Caller", so wrapping the member erased exactly the name the check
+                // needs, and `(readonly & Caller)? c = ()` slid through the defaulted
+                // skip with c permanently nil - D1's first trap, alive in the
+                // intersection-flavored shapes while this comment claimed otherwise.
+                // isModuleType already unwraps reference chains AND scans intersection
+                // constituents, which is the resolution that keeps the name visible.
+                if (isCallerType(member)) {
                     return true;
                 }
             }

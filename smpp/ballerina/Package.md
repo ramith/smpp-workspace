@@ -94,8 +94,16 @@ missing the `remote` qualifier, a `resource` method, or a return type other than
 Diagnostics carry `SMPP_1xx` codes; an empty service offers code actions that insert
 handler templates (with or without the reply `caller`). One warning worth heeding:
 `SMPP_112` flags a non-isolated handler, which forces every dispatch through the
-runtime's process-wide lock — legal, but it quietly turns `maxConcurrentDispatch` into
-a no-op.
+runtime's process-wide lock — legal, but it quietly stops `maxConcurrentDispatch`
+being a parallelism knob.
+
+The plugin is deliberately **stricter than the runtime** in two places, standard for
+Ballerina listener plugins: an extra remote method with an unrecognized name is a
+compile error (`SMPP_102` — the runtime merely ignores it, which is how a typo'd
+handler silently receives nothing), and a non-`error?` return is a compile error
+(`SMPP_105` — the runtime dispatches it fine but discards the return, so a handler
+failure could never reach the SMSC). A 1.0.x program relying on either tolerated shape
+compiles again after deleting the stray method or fixing the return type.
 
 > **Breaking change (vs 1.0.x):** the listener now discovers handlers via remote-method
 > lookup, so a handler declared **without** `remote` — which 1.0.x dispatched — is

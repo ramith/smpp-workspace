@@ -338,6 +338,29 @@ isolated service class TwoSmsService {
     }
 }
 
+// Sprint 9 Phase-5 H1/M1: the two intersection-flavored Caller-union shapes that used
+// to evade involvesCallerType. `getImpliedType` on a union MEMBER erases the name the
+// check needs (the implied form of `Caller & readonly` is a synthesized type not named
+// "Caller"), so both attached with c permanently () - D1's first trap, alive in exactly
+// the shapes the code's own comment claimed it caught.
+type ReadonlyCaller readonly & Caller;
+
+type WrappedMaybeCaller readonly & Caller?;
+
+isolated service class IntersectionOptionalCallerService {
+    *Service;
+
+    remote isolated function onDeliverSm(Sms sms, ReadonlyCaller? c = ()) returns error? {
+    }
+}
+
+isolated service class WrappedMaybeCallerService {
+    *Service;
+
+    remote isolated function onDeliverSm(Sms sms, WrappedMaybeCaller c = ()) returns error? {
+    }
+}
+
 // Sprint 9 N2: the onError twin of OptionalCallerService - used to attach silently.
 isolated service class OnErrorOptionalCallerService {
     *Service;
@@ -862,6 +885,13 @@ function testCallerParamShapes() returns error? {
     test:assertTrue(optional is error, "optional Caller must be rejected at attach (D1 trap 1)");
     test:assertTrue((<error>optional).message().includes("Caller"),
             (<error>optional).message());
+    // Sprint 9 Phase-5 H1/M1: the intersection-flavored variants of the same trap.
+    error? roCaller = rejecting.attach(new IntersectionOptionalCallerService());
+    test:assertTrue(roCaller is error && (<error>roCaller).message().includes("Caller"),
+            "(readonly & Caller)? must be rejected at attach, like Caller? (H1)");
+    error? wrapped = rejecting.attach(new WrappedMaybeCallerService());
+    test:assertTrue(wrapped is error && (<error>wrapped).message().includes("Caller"),
+            "readonly & Caller? must be rejected at attach, like Caller? (M1)");
     error? rest = rejecting.attach(new RestParamService());
     test:assertTrue(rest is error, "rest parameter must be rejected at attach (D1 trap 2)");
     test:assertTrue((<error>rest).message().includes("rest"), (<error>rest).message());
@@ -884,6 +914,8 @@ function testCallerParamShapes() returns error? {
     error? nonRemote = rejecting.attach(new NonRemoteHandlerService());
     test:assertTrue(nonRemote is error,
             "a service whose only handler is non-remote must fail attach (N1)");
+    test:assertTrue((<error>nonRemote).message().includes("does not implement any"),
+            (<error>nonRemote).message());
     // The 1.0.1 compatibility shape (D5's required case): a trailing defaulted extra
     // parameter is a legal, WORKING 1.0.1 program and must keep attaching - this is the
     // test whose absence let the compat break ship the first time (review major #1).

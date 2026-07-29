@@ -121,6 +121,18 @@ public final class PluginUtils {
                 }
             }
         }
+        if (unwrapped.typeKind() == TypeDescKind.INTERSECTION) {
+            // `readonly & smpp:Caller?`: the intersection WRAPS the union, so the
+            // union hunt above never sees it (Sprint 9 Phase-5 M1 - this shape evaded
+            // both the plugin and, before its H1 fix, the runtime). Descend the
+            // constituents; isSmppType alone cannot serve here because it deliberately
+            // never matches unions.
+            for (TypeSymbol constituent : ((IntersectionTypeSymbol) unwrapped).memberTypeDescriptors()) {
+                if (involvesCaller(constituent, depth + 1)) {
+                    return true;
+                }
+            }
+        }
         return false;
     }
 

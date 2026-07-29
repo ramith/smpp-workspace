@@ -97,7 +97,12 @@ public class SmppServiceValidator implements AnalysisTask<SyntaxNodeAnalysisCont
             return;
         }
         // Only classes that opt in via `*smpp:Service` — anything else is not ours to
-        // judge, however smpp-ish its method names look.
+        // judge, however smpp-ish its method names look. Known fail-open limitation
+        // (Phase-5 L4, shared with mqtt): a TRANSITIVE inclusion (`service class B {
+        // *A; }` where A includes *smpp:Service) is not resolved through the included
+        // object's own inclusions, so B gets no compile-time validation - the runtime
+        // still validates it at attach, so the failure direction is a missing early
+        // diagnostic, never a false acceptance.
         boolean includesSmppService = false;
         for (TypeSymbol inclusion : classSymbol.typeInclusions()) {
             if (isSmppType(inclusion, PluginConstants.SERVICE_TYPE)) {
@@ -194,6 +199,16 @@ public class SmppServiceValidator implements AnalysisTask<SyntaxNodeAnalysisCont
             context.reportDiagnostic(diagnostic(SmppDiagnostic.SMPP_106, function.location(), name));
         }
 
+        // Isolation (S7) applies to ALL THREE methods - the runtime derives onError's
+        // strand isolation the same way (Dispatcher.onErrorIsolated), so a
+        // non-isolated onError serializes on the same process-wide lock (Phase-5
+        // finding L1: this check originally sat after the onError early-return).
+        // Note qualifiers() reflects isolated INFERENCE, so this only fires when the
+        // body genuinely defeats it - i.e. when the trap is real.
+        if (!method.qualifiers().contains(Qualifier.ISOLATED)) {
+            context.reportDiagnostic(diagnostic(SmppDiagnostic.SMPP_112, function.location(), name));
+        }
+
         List<ParameterSymbol> params = fnType.params().orElse(List.of());
         if (ON_ERROR.equals(name)) {
             validateOnError(context, function, params);
@@ -236,7 +251,7 @@ public class SmppServiceValidator implements AnalysisTask<SyntaxNodeAnalysisCont
                 // A7 (D5 compat): trailing defaulted params of any other type are
                 // SKIPPED, not rejected - `(Sms, string extra = "x")` is a legal,
                 // working 1.0.1 program. A "too many parameters" rule here would be a
-                // breaking regression (pinned by fixture valid_defaulted_extra).
+                // breaking regression (pinned by fixture valid_shapes_class).
                 continue;
             } else {
                 context.reportDiagnostic(diagnostic(SmppDiagnostic.SMPP_107,
@@ -245,12 +260,6 @@ public class SmppServiceValidator implements AnalysisTask<SyntaxNodeAnalysisCont
         }
         if (!sawSms) {
             context.reportDiagnostic(diagnostic(SmppDiagnostic.SMPP_110, function.location(), name));
-        }
-
-        // Isolation (S7): legal either way, but a non-isolated handler serializes ALL
-        // dispatch on the runtime's process-wide lock - only the compiler can see this.
-        if (!method.qualifiers().contains(Qualifier.ISOLATED)) {
-            context.reportDiagnostic(diagnostic(SmppDiagnostic.SMPP_112, function.location(), name));
         }
     }
 

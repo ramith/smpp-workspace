@@ -44,10 +44,28 @@ def balHomeLibs = {
 dependencies {
     def libDir = System.getenv('packagePAT') != null ? null : balHomeLibs()
     if (libDir != null) {
+        // Version-skew guard (Phase-5 M3): the dist dir is named ballerina-<version>.
+        // A different update line (2201.12.x, 2201.14.x) compiles against a different
+        // compiler API with zero warning otherwise; the docker fixture tests would
+        // catch it only later, as an opaque load failure.
+        // libDir is <distribution>/bre/lib - two hops up to the version-named dist dir.
+        def distVersion = libDir.parentFile.parentFile.name.replace('ballerina-', '')
+        def wantLine = "${ballerinaLangVersion}".tokenize('.')[0..1].join('.')
+        if (!distVersion.startsWith(wantLine)) {
+            throw new GradleException("local Ballerina distribution is ${distVersion} but this " +
+                    "package pins ${ballerinaLangVersion} (${wantLine}.x): install a matching " +
+                    "distribution (bal dist pull) or set packageUser/packagePAT to resolve the " +
+                    "pinned compiler jars from GitHub Packages")
+        }
         logger.lifecycle("smpp-compiler-plugin: no packagePAT set; compiling against the " +
-                "local Ballerina distribution at ${libDir}")
+                "local Ballerina distribution at ${libDir} (${distVersion}; pinned line ${wantLine}.x)")
         compileOnly fileTree(dir: libDir,
                 includes: ['ballerina-lang-*.jar', 'ballerina-tools-api-*.jar', 'ballerina-parser-*.jar'])
+    } else if (System.getenv('packagePAT') == null) {
+        // Neither credentials nor a local bal: fail with the remedy, not a 401 later.
+        throw new GradleException("smpp-compiler-plugin needs either packageUser/packagePAT " +
+                "(a GitHub PAT with read:packages, per README) or a local Ballerina " +
+                "installation ('bal home' must work) to supply the compiler API jars")
     } else {
         compileOnly group: 'org.ballerinalang', name: 'ballerina-lang', version: "${ballerinaLangVersion}"
         compileOnly group: 'org.ballerinalang', name: 'ballerina-tools-api', version: "${ballerinaLangVersion}"

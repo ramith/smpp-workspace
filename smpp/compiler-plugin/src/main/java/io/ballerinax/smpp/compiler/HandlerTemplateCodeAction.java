@@ -116,11 +116,16 @@ public class HandlerTemplateCodeAction implements CodeAction {
                     + LS + "\t}" + LS;
         }
         if (withCaller) {
+            // The reply text is a non-empty placeholder ON PURPOSE: empty bodies are
+            // rejected at submit (sm_length 0 means "payload in message_payload", which
+            // this connector never sets - L10), so an "" here would teach a pattern
+            // that compiles and then fails at runtime. `_ =` avoids handing the user an
+            // unused-variable warning along with their new handler.
             return LS + "\tremote function " + method
                     + "(smpp:Sms sms, smpp:Caller caller) returns error? {" + LS
-                    + "\t\tsmpp:SubmitResult result = check caller->submit({" + LS
+                    + "\t\tsmpp:SubmitResult _ = check caller->submit({" + LS
                     + "\t\t\tdestAddr: sms.sourceAddr," + LS
-                    + "\t\t\tshortMessage: \"\"" + LS
+                    + "\t\t\tshortMessage: \"TODO: reply\"" + LS
                     + "\t\t});" + LS
                     + "\t}" + LS;
         }

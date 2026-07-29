@@ -4,6 +4,21 @@ set -uo pipefail
 
 SMPP=/home/ballerina/smpp
 VERSION=$(grep '^version' "$SMPP/ballerina/Ballerina.toml" | head -1 | sed 's/.*"\(.*\)"/\1/')
+
+# Stale-plugin-jar guard (Phase-5 M2): CompilerPlugin.toml pins the jar by literal
+# version (restamped only by updateTomlFiles). On a dirty tree after a version bump,
+# build/libs can still hold the OLD jar - bal pack would embed it silently and every
+# fixture would then validate the PREVIOUS sprint's plugin. Fail loud instead.
+if ! grep -q "smpp-compiler-plugin-${VERSION}.jar" "$SMPP/ballerina/CompilerPlugin.toml"; then
+    echo "CompilerPlugin.toml does not reference smpp-compiler-plugin-${VERSION}.jar - run updateTomlFiles"
+    exit 72
+fi
+jarCount=$(ls "$SMPP"/compiler-plugin/build/libs/smpp-compiler-plugin-*.jar 2>/dev/null | wc -l)
+if [ "$jarCount" -ne 1 ]; then
+    echo "expected exactly one smpp-compiler-plugin jar in build/libs, found ${jarCount} - clean stale versions"
+    exit 73
+fi
+
 echo "=== packing ramith/smpp:${VERSION} (with the compiler plugin) ==="
 cd "$SMPP/ballerina"
 # target/ may hold root-owned docker build output with a stale bala; pack somewhere else
@@ -72,9 +87,16 @@ run_fixture() {
     fi
 }
 
+count=0
 for d in "$SMPP"/compiler-plugin/tests/fixtures/*/; do
     run_fixture "$(basename "$d")"
+    count=$((count + 1))
 done
 
+# A glob that matched nothing must not report success (Phase-5 L5).
+if [ "$count" -lt 10 ]; then
+    echo "only ${count} fixtures found - the suite is 10+; a path/glob regression is eating fixtures"
+    exit 74
+fi
 if [ $fail -ne 0 ]; then exit 1; fi
-echo "=== all fixtures passed ==="
+echo "=== all ${count} fixtures passed ==="
