@@ -17,6 +17,9 @@ const int SUBMIT_SHAPES_MIXED_PORT = 27813;
 const int SUBMIT_SHAPES_REJECT_PORT = 27814;
 const int SUBMIT_ERRORS_MAPPING_PORT = 27815;
 const int SUBMIT_DLR_TEST_PORT = 27816;
+const int SUBMIT_ONERROR_TEST_PORT = 27817;
+const int SUBMIT_THROTTLE_TEST_PORT = 27818;
+const int SUBMIT_REBIND_TIMER_PORT = 27819;
 
 // Cleanup state for the after: hooks (the house pattern - see data_sm_test.bal for why
 // @test:AfterEach is unusable). A listener leaked by a failed assertion would otherwise
@@ -165,6 +168,52 @@ isolated service class RestParamService {
     *Service;
 
     remote isolated function onDeliverSm(Sms... sms) returns error? {
+    }
+}
+
+// Submits from onError (via a stashed Caller) - Sprint 5 recorded that runtime work on
+// this exact path once derailed scheduleRebind; the gate demands it not happen again.
+isolated service class OnErrorSubmittingService {
+    *Service;
+
+    remote isolated function onDeliverSm(Sms sms, Caller caller) returns error? {
+        lock {
+            submitTestCaller = caller;
+        }
+        lock {
+            submitTestDispatches += 1;
+        }
+    }
+
+    remote isolated function onError(Error err) returns error? {
+        Caller? c = ();
+        lock {
+            c = submitTestCaller;
+        }
+        if c is Caller {
+            // Expected to fail (the link just dropped) - the point is that this runtime
+            // work must not derail the rebind that is being scheduled around it.
+            SubmitResult|Error r = c->submit({destAddr: "264811234567", shortMessage: "from onError"});
+            if r is Error {
+                lock {
+                    submitTestDispatches += 0; // outcome irrelevant; must simply not panic
+                }
+            }
+        }
+    }
+}
+
+// Replies inline from the handler (SYNC): while the submit waits, the handler holds its
+// dispatch permit - the seam the throttle test pins.
+isolated service class InlineReplyService {
+    *Service;
+
+    remote isolated function onDeliverSm(Sms sms, Caller caller) returns error? {
+        lock {
+            submitTestDispatches += 1;
+        }
+        SubmitResult|Error r = caller->submit({destAddr: sms.sourceAddr, shortMessage: "reply"});
+        _ = r is Error;
     }
 }
 
@@ -532,6 +581,96 @@ function testSubmitWaitsBeyondHousekeepingTimer() returns error? {
     _ = check mockSmscAwaitNextSubmit(mockId, conn, 5000);
     check smsListener.gracefulStop();
     mockSmscClose(mockId);
+}
+
+@test:Config {after: cleanupSubmitTest, groups: ["submit"]}
+function testSubmitFromOnErrorDoesNotDerailRebind() returns error? {
+    var [mockId, conn, smsListener] = check startCapturingListener(
+            SUBMIT_ONERROR_TEST_PORT, new OnErrorSubmittingService());
+    check mockSmscSever(mockId, conn);
+    // The gate's two clauses: the onError-issued submit errors (asserted inside the
+    // service - it must not panic), AND the rebind still lands.
+    int conn2 = check mockSmscAwaitNextBind(mockId, 10000);
+    check mockSmscSendDeliverSm(mockId, conn2, "post-rebind", "", 0);
+    test:assertTrue(pollUntil(isolated function() returns boolean {
+        return dispatchCount() >= 2;
+    }, 5), "the rebound session must dispatch - onError's submit must not derail the rebind");
+    check smsListener.gracefulStop();
+    mockSmscClose(mockId);
+    submitTestListener = ();
+    submitTestMockId = -1;
+}
+
+@test:Config {after: cleanupSubmitTest, groups: ["submit"]}
+function testSubmitStarvesInboundDispatchWithThrottle() returns error? {
+    // Pins the DOCUMENTED consequence caller.bal names: in SYNC mode a handler blocked in
+    // submit holds its dispatch permit; with all maxConcurrentDispatch permits held, the
+    // next inbound deliver_sm answers ESME_RTHROTTLED (the bridge surfaces that as an
+    // error whose message names ThrottledException).
+    clearCapturedCaller();
+    int mockId = check mockSmscOpen(SUBMIT_THROTTLE_TEST_PORT);
+    submitTestMockId = mockId;
+    Listener smsListener = check new ({
+        host: "localhost",
+        port: SUBMIT_THROTTLE_TEST_PORT,
+        systemId: "test",
+        password: "test",
+        bindType: TRANSCEIVER,
+        maxConcurrentDispatch: 1
+    });
+    submitTestListener = smsListener;
+    check smsListener.attach(new InlineReplyService());
+    check smsListener.'start();
+    int conn = check mockSmscAwaitNextBind(mockId, 5000);
+    // The handler acks the deliver_sm only after its ~3s inline reply completes - the
+    // mock's own 2s transaction timer must outwait that (the graceful_stop_test pattern).
+    check mockSmscSetTransactionTimer(mockId, conn, 15000);
+    mockSmscSetSubmitDelay(mockId, 3000);
+    // First deliver_sm occupies the ONLY permit (its handler blocks ~3s in submit)...
+    future<error?> first = start mockSmscSendDeliverSm(mockId, conn, "occupy", "", 0);
+    runtime:sleep(0.5);
+    // ...so the second must come back throttled, not queued behind the handler.
+    error? second = mockSmscSendDeliverSm(mockId, conn, "starved", "", 0);
+    test:assertTrue(second is error && (<error>second).message().includes("Throttled"),
+            second is error ? (<error>second).message() : "second deliver_sm must be RTHROTTLED");
+    error? firstOutcome = wait first;
+    test:assertTrue(firstOutcome is (), "the occupying dispatch itself must complete");
+    mockSmscSetSubmitDelay(mockId, 0);
+    check smsListener.gracefulStop();
+    mockSmscClose(mockId);
+    submitTestListener = ();
+    submitTestMockId = -1;
+}
+
+@test:Config {after: cleanupSubmitTest, groups: ["submit"]}
+function testSubmitTimerReappliedOnRebind() returns error? {
+    // Item 5's justification for living in bind() is that the submit bound survives
+    // rebinds; without this test, dropping it from the rebind path would silently turn
+    // every post-rebind slow response into TIMEOUT_DELIVERY_UNKNOWN (review risk #3).
+    var [mockId, conn, smsListener] = check startCapturingListener(
+            SUBMIT_REBIND_TIMER_PORT, new CallerCapturingService());
+    Caller caller = <Caller>capturedCaller();
+    check mockSmscSever(mockId, conn);
+    int conn2 = check mockSmscAwaitNextBind(mockId, 10000);
+    // Post-rebind: a 3s-delayed resp must still succeed (2s housekeeping bound would fail).
+    mockSmscSetSubmitDelay(mockId, 3000);
+    SubmitResult? postRebind = ();
+    foreach int i in 1 ... 50 {
+        SubmitResult|Error r = caller->submit({destAddr: "264811234567", shortMessage: "patient"});
+        if r is SubmitResult {
+            postRebind = r;
+            break;
+        }
+        runtime:sleep(0.1);
+    }
+    test:assertTrue(postRebind !is (),
+            "a 3s-delayed submit must succeed on the REBOUND session - the configured "
+            + "transactionTimeout must be re-applied, not jsmpp's or the housekeeping default");
+    mockSmscSetSubmitDelay(mockId, 0);
+    check smsListener.gracefulStop();
+    mockSmscClose(mockId);
+    submitTestListener = ();
+    submitTestMockId = -1;
 }
 
 @test:Config {after: cleanupSubmitTest, groups: ["submit"]}
