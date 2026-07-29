@@ -178,7 +178,18 @@ final class MockSmsc {
             connections.put(id, session);
             connectionIds.put(session, id);
             submitCaptures.put(id, new LinkedBlockingQueue<>());
-            request.accept("mock-smsc");
+            try {
+                request.accept("mock-smsc");
+            } catch (Exception e) {
+                // The registration above is speculative (it must precede accept() so an
+                // instant submit_sm is attributable - D9); if accept() itself throws
+                // (e.g. the peer vanished between bind and bind_resp) the session is
+                // already BOUND jsmpp-side, and leaving it registered would make close()
+                // unbindAndClose() a dead session - up to a transactionTimer stall each,
+                // serially, in test teardown. Undo and rethrow (review finding, 016f450).
+                forget(id, session);
+                throw e;
+            }
             if (closeAfterAccept) {
                 // Accepted-then-instantly-dropped: the bound-race soak's cycle driver
                 // (docs/sprint-plan.md Sprint 2, "closes the connection immediately
@@ -338,6 +349,14 @@ final class MockSmsc {
      *
      * <p>One instance is shared by every session this mock accepts, so it holds no
      * per-connection state: attribution is by session identity via {@code connectionIds}.
+     *
+     * <p><b>Invariant - nothing in this listener may block the enquire_link path.</b>
+     * On the server side jsmpp runs {@code onAcceptEnquireLink} BEFORE sending
+     * {@code enquire_link_resp} (AbstractGenericSMPPSessionBound), and this class
+     * deliberately does not override that default no-op. An override that blocks (a
+     * delay knob, a capture) would delay the keepalive answer and can make the
+     * connector's session time out - destabilizing every soak test in ways that look
+     * like connector bugs. If you need enquire_link observability, count and return.
      */
     private final class CapturingReceiverListener implements ServerMessageReceiverListener {
 
@@ -479,10 +498,17 @@ final class MockSmsc {
         return submitMessageIds.get(submitSm);
     }
 
-    /** How many captured submits are still unread on this connection (0 if unknown). */
+    /**
+     * How many captured submits are still unread on this connection. Throws on an
+     * unknown/severed handle rather than returning 0: "and no more submits arrived" must
+     * never pass vacuously against a dead handle (review minor).
+     */
     int pendingSubmitCount(long connectionId) {
         BlockingQueue<SubmitSm> queue = submitCaptures.get(connectionId);
-        return queue == null ? 0 : queue.size();
+        if (queue == null) {
+            throw new IllegalArgumentException("no such connection handle: " + connectionId);
+        }
+        return queue.size();
     }
 
     /**
@@ -597,6 +623,12 @@ final class MockSmsc {
         running = false;
         connections.values().forEach(SMPPServerSession::unbindAndClose);
         connections.clear();
+        // Clear the sibling registries too: bounded by the mock's lifetime, but a close()
+        // that leaves connectionIds/submitCaptures populated is misleadingly named and
+        // would bite if mocks were ever pooled (review minor).
+        connectionIds.clear();
+        submitCaptures.clear();
+        submitMessageIds.clear();
         try {
             listener.close();
         } catch (Exception ignored) {

@@ -250,12 +250,13 @@ isolated function mockSmscAwaitNextSubmit(int mockId, int connectionId, int time
 } external;
 
 # How many captured submits are still unread on this connection — for asserting that a
-# handler sent exactly one message and no more.
+# handler sent exactly one message and no more. Errors on an unknown/severed handle so
+# "no more submits" can never pass vacuously against a dead connection.
 #
 # + mockId - the mock's handle
 # + connectionId - the connection handle
-# + return - the number of unread captured submits (0 if the connection is unknown)
-isolated function mockSmscPendingSubmitCount(int mockId, int connectionId) returns int = @java:Method {
+# + return - the number of unread captured submits, or an `error` on an unknown handle
+isolated function mockSmscPendingSubmitCount(int mockId, int connectionId) returns int|error = @java:Method {
     'class: "io.ballerinax.smpp.test.MockSmscBridge",
     name: "pendingSubmitCount"
 } external;
