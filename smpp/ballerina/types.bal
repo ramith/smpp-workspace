@@ -307,8 +307,8 @@ public enum Encoding {
     # Latin-1 — `data_coding 0x03`. The default: covers English, Afrikaans and most
     # Western European text. Note some carriers/aggregators accept only `0x00`
     # (their provisioned default) and `0x08`, and may reject or transcode `0x03`; for
-    # pure-ASCII text, `ASCII` produces byte-identical payloads under `data_coding
-    # 0x01` — a zero-cost switch if your SMSC dislikes `0x03`.
+    # pure-ASCII text, `ASCII` produces byte-identical payloads under
+    # `data_coding 0x01` — a zero-cost switch if your SMSC dislikes `0x03`.
     LATIN1,
     # UCS-2 big-endian — `data_coding 0x08`. Any script, at half the characters per PDU.
     UCS2
