@@ -22,6 +22,16 @@ wait_for() {
     return 1
 }
 
+# wait_for_count <pattern> <min-count> <file> <seconds>
+wait_for_count() {
+    local i=0
+    while [ "$i" -lt "$4" ]; do
+        [ "$(grep -c "$1" "$3" 2>/dev/null || true)" -ge "$2" ] && return 0
+        sleep 1; i=$((i + 1))
+    done
+    return 1
+}
+
 # stop_group <pid>: terminate a backgrounded job and its whole process group.
 stop_group() {
     kill -TERM -- "-$1" 2>/dev/null
@@ -35,9 +45,11 @@ for ex in receive-sms delivery-receipts two-way-sms resilient-listener tls-smsc;
     ( cd "$ex" && bal build ) > /dev/null || { echo "$ex build failed"; exit 1; }
 done
 
-# run_case <dir> <scenario> <port> <expected-log-substring>
+# run_case <dir> <scenario> <port> <expected-log-substring> [<pattern2> <min-count2>]
+# The optional pair asserts a second pattern occurs at least N times — used where one
+# occurrence of a string cannot prove the behavior under test (see resilient-listener).
 run_case() {
-    local name="$1" scenario="$2" port="$3" expect="$4"
+    local name="$1" scenario="$2" port="$3" expect="$4" expect2="${5:-}" count2="${6:-1}"
     local mlog="$LOGDIR/$name.mock.log" elog="$LOGDIR/$name.example.log"
     echo "== $name (scenario=$scenario port=$port) =="
 
@@ -52,12 +64,16 @@ run_case() {
     # Java 21 bytecode). The connection port is overridden with a config CLI arg.
     ( cd "$name" && exec bal run -- -Cport="$port" ) > "$elog" 2>&1 &
     local epid=$!
-    if wait_for "$expect" "$elog" 90; then
-        echo "  PASS: saw \"$expect\""
-    else
+    if ! wait_for "$expect" "$elog" 90; then
         echo "  FAIL: \"$expect\" not seen within 90s"
         echo "  ---- example log ----"; sed 's/^/    /' "$elog"
         FAILED=1
+    elif [ -n "$expect2" ] && ! wait_for_count "$expect2" "$count2" "$elog" 90; then
+        echo "  FAIL: \"$expect2\" not seen >= $count2 times within 90s"
+        echo "  ---- example log ----"; sed 's/^/    /' "$elog"
+        FAILED=1
+    else
+        echo "  PASS: saw \"$expect\"${expect2:+ and ${count2}x \"$expect2\"}"
     fi
 
     stop_group "$epid"
@@ -67,8 +83,14 @@ run_case() {
 
 run_case receive-sms        steady 2775 "inbound SMS received"
 run_case delivery-receipts  steady 2776 "message DELIVERED"
-run_case two-way-sms        steady 2777 "OPT-OUT"
-run_case resilient-listener flaky  2778 "session dropped"
+# two-way's assertion is the deepest in the suite: MO in -> keyword classified ->
+# caller->submit out -> submit_sm_resp message_id -> correlated DLR back in. Seeing
+# it proves the whole 1.1.0 reply path, not just the bind.
+run_case two-way-sms        steady 2777 "opt-out confirmation DELIVERED"
+# "session dropped" alone proves only the onError notification. The flaky mock
+# pushes exactly 3 MOs per bind then hard-drops, so a 4th "inbound message" line
+# can only come from a successful REBIND — assert both.
+run_case resilient-listener flaky  2778 "session dropped" "inbound message" 4
 run_case tls-smsc           tls    3550 "inbound message over TLS"
 
 rm -rf "$LOGDIR"

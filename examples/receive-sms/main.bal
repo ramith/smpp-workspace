@@ -27,10 +27,12 @@ service on smsListener {
     // from a delivery receipt (DLR) for something you previously submitted.
     remote function onDeliverSm(smpp:Sms sms) returns error? {
         if sms.deliveryReceipt {
+            // `receiptedMessageId` is the guaranteed correlation key back to a
+            // submit's message_id (the body's `receipt?.id` is vendor-specific).
             log:printInfo("delivery receipt received",
                     'from = sms.sourceAddr,
                     status = sms.receipt?.finalStatus,
-                    id = sms.receipt?.id);
+                    id = sms.receiptedMessageId ?: sms.receipt?.id);
         } else {
             log:printInfo("inbound SMS received",
                     'from = sms.sourceAddr,

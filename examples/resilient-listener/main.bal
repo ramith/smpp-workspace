@@ -27,7 +27,11 @@ listener smpp:Listener smsListener = check new ({
         initialRebindDelay: 1,  // wait 1s before the first reconnect attempt
         maxRebindDelay: 30,     // ...backing off 1s, 2s, 4s, 8s, ... capped at 30s
         backOffMultiplier: 2.0,
-        maxRebindAttempts: -1   // retry forever (default); use 0 to disable rebinding
+        // Retry forever (default); 0 disables rebinding. A positive cap counts
+        // CONSECUTIVE failures — and a bind that drops again before ~60s of stable
+        // uptime counts as one — so a flapping link exhausts it too. On give-up the
+        // listener latches dead (submits fail with LINK_ABANDONED) until replaced.
+        maxRebindAttempts: -1
     }
 });
 
@@ -37,9 +41,10 @@ service on smsListener {
         log:printInfo("inbound message", 'from = sms.sourceAddr, text = sms.shortMessage);
     }
 
-    // Called once for the initial unexpected drop and again for every failed rebind
-    // attempt — so during an extended outage this fires repeatedly. It is NOT called
-    // for a deliberate gracefulStop/immediateStop. Wire your alerting here.
+    // Called once for the initial unexpected drop, again for every failed rebind
+    // attempt, and once more if a capped policy gives up — so during an extended
+    // outage this fires repeatedly. It is NOT called for a deliberate
+    // gracefulStop/immediateStop. Wire your alerting here.
     remote function onError(error err) returns error? {
         log:printError("SMSC session dropped — connector is rebinding with backoff", 'error = err);
     }

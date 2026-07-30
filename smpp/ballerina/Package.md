@@ -62,7 +62,9 @@ needed:
 - [delivery-receipts](https://github.com/ramith/smpp-workspace/tree/main/examples/delivery-receipts)
   — parse DLRs, correlate by `receiptedMessageId`, and branch on `finalStatus`.
 - [two-way-sms](https://github.com/ramith/smpp-workspace/tree/main/examples/two-way-sms)
-  — route mobile-originated messages by keyword, including `STOP` opt-out.
+  — reply on the same session via `smpp:Caller` (`TRANSCEIVER` + `ASYNC`): route
+  mobile-originated messages by keyword and confirm `STOP` opt-outs with a receipted,
+  receipt-correlated reply.
 - [resilient-listener](https://github.com/ramith/smpp-workspace/tree/main/examples/resilient-listener)
   — tune `rebindPolicy` and surface unexpected drops via `onError`.
 - [tls-smsc](https://github.com/ramith/smpp-workspace/tree/main/examples/tls-smsc)

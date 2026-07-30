@@ -23,7 +23,7 @@ Expected output:
 message="inbound SMS received" from="447700900001" to="12345" text="Hello from the mock SMSC #0"
 message="inbound SMS received" from="447700900002" to="12345" text="WIN"
 message="inbound SMS received" from="447700900002" to="12345" text="STOP"
-message="delivery receipt received" from="12345" status="DELIVRD" id="0123456789"
+message="delivery receipt received" from="447700900001" status="DELIVRD" id="0123456789"
 ```
 
 ## Against a real SMSC
