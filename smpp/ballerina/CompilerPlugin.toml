@@ -3,4 +3,4 @@ id = "smpp-compiler-plugin"
 class = "io.ballerinax.smpp.compiler.SmppCompilerPlugin"
 
 [[dependency]]
-path = "../compiler-plugin/build/libs/smpp-compiler-plugin-1.1.0.jar"
+path = "../compiler-plugin/build/libs/smpp-compiler-plugin-1.1.1.jar"
